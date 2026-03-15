@@ -30,7 +30,7 @@ pub const Engine = struct {
     roster_userdata: ?*anyopaque,
     config_cb: ?*const fn (?*anyopaque) callconv(.c) void,
     config_cb_userdata: ?*anyopaque,
-    msg_cb: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) void,
+    msg_cb: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int,
     msg_cb_userdata: ?*anyopaque,
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
@@ -303,7 +303,7 @@ export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0
     b.broadcast(0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8), &e.roster) catch { e.setError("message broadcast failed") catch {}; return 8; };
     return 0;
 }
-export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
+export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int, userdata: ?*anyopaque) u32 {
     const e = engine orelse return 0;
     e.msg_cb = callback; e.msg_cb_userdata = userdata;
     if (e.message_bus) |*b| b.subscribe(callback, userdata);

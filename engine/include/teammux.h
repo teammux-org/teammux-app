@@ -140,7 +140,7 @@ typedef struct {
 // Callers must dispatch to the main thread for UI updates.
 // -----------------------------------------------------------------
 
-typedef void (*tm_message_cb)(const tm_message_t* message, void* userdata);
+typedef tm_result_t (*tm_message_cb)(const tm_message_t* message, void* userdata);
 typedef void (*tm_roster_changed_cb)(const tm_roster_t* roster, void* userdata);
 typedef void (*tm_config_changed_cb)(void* userdata);
 typedef void (*tm_github_event_cb)(const char* event_type, const char* payload_json, void* userdata);

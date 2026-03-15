@@ -50,8 +50,13 @@ pub const MessageBus = struct {
     log_file: ?std.fs.File,
     log_path: []const u8,
     project_root: []const u8,
-    subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) void,
+    subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
     subscriber_userdata: ?*anyopaque,
+    retry_delays_ns: [3]u64 = .{
+        1 * std.time.ns_per_s,
+        2 * std.time.ns_per_s,
+        4 * std.time.ns_per_s,
+    },
 
     pub fn init(allocator: std.mem.Allocator, log_dir: []const u8, session_id: []const u8, project_root: []const u8) !MessageBus {
         // Ensure log directory exists
@@ -114,14 +119,27 @@ pub const MessageBus = struct {
         // 4. Persist to log BEFORE delivery (guarantees log even if callback fails)
         try self.appendLog(msg);
 
-        // 5. Fire callback to Swift for delivery.
-        // v0.1: single fire-and-forget call. Callback is void-returning per teammux.h,
-        // so there is no mechanism to detect delivery failure at this layer.
-        // v0.2: callback should return bool for retry support (3 retries, exponential backoff).
+        // 5. Fire callback to Swift for delivery with retry on failure.
+        // Initial attempt + up to 3 retries with exponential backoff (1s, 2s, 4s).
+        // On 4th failure: append FAILED line to JSONL log.
         if (self.subscriber_cb) |cb| {
             var c_msg = try self.toCMessage(msg);
             defer self.freeCMessage(c_msg);
-            cb(&c_msg, self.subscriber_userdata);
+
+            const result = cb(&c_msg, self.subscriber_userdata);
+            if (result == 0) return; // TM_OK — delivered
+
+            // Initial attempt failed — retry up to 3 times
+            for (self.retry_delays_ns) |delay| {
+                std.log.info("[teammux] message seq={d} delivery failed (rc={d}), retrying in {d}s", .{ seq, result, delay / std.time.ns_per_s });
+                std.Thread.sleep(delay);
+                const retry_result = cb(&c_msg, self.subscriber_userdata);
+                if (retry_result == 0) return; // TM_OK — delivered on retry
+            }
+
+            // All retries exhausted — append FAILED audit line to log
+            std.log.info("[teammux] message seq={d} delivery FAILED after 4 attempts", .{seq});
+            self.appendFailedLog(seq, 3) catch {};
         } else {
             std.log.info("[teammux] message seq={d} logged but no subscriber (undelivered)", .{seq});
         }
@@ -148,7 +166,7 @@ pub const MessageBus = struct {
 
     pub fn subscribe(
         self: *MessageBus,
-        callback: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) void,
+        callback: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
         userdata: ?*anyopaque,
     ) void {
         self.subscriber_cb = callback;
@@ -161,6 +179,21 @@ pub const MessageBus = struct {
 
         const file = self.log_file orelse return error.LogFileUnavailable;
         const line = try self.formatJsonLine(msg);
+        defer self.allocator.free(line);
+        try file.writeAll(line);
+        try file.writeAll("\n");
+    }
+
+    /// Append a delivery failure audit line to the JSONL log.
+    fn appendFailedLog(self: *MessageBus, seq_num: u64, retries: u32) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const file = self.log_file orelse return error.LogFileUnavailable;
+        const ts: u64 = @intCast(std.time.timestamp());
+        const line = try std.fmt.allocPrint(self.allocator,
+            \\{{"seq":{d},"delivery_status":"FAILED","retries":{d},"timestamp":{d}}}
+        , .{ seq_num, retries, ts });
         defer self.allocator.free(line);
         try file.writeAll(line);
         try file.writeAll("\n");
@@ -450,11 +483,12 @@ test "bus - subscriber callback is fired" {
     };
 
     const callback = struct {
-        fn cb(msg: ?*const CMessage, _: ?*anyopaque) callconv(.c) void {
+        fn cb(msg: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
             if (msg) |m| {
                 CallbackState.received = true;
                 CallbackState.received_seq = m.seq;
             }
+            return 0; // TM_OK
         }
     }.cb;
 
@@ -605,4 +639,82 @@ test "bus - git_commit is null in non-git directory" {
     defer alloc.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":null") != null);
+}
+
+test "bus - retry delivers on transient failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "retryok1", log_dir);
+    defer b.deinit();
+    b.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var call_count: u32 = 0;
+    };
+    State.call_count = 0;
+
+    const callback = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            State.call_count += 1;
+            // Fail first 2 times, succeed on 3rd (retry 2)
+            return if (State.call_count <= 2) 8 else 0; // TM_ERR_BUS then TM_OK
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    try b.send(1, 0, .task, "\"retry test\"");
+
+    // 1 initial + 2 retries = 3 calls before success
+    try std.testing.expect(State.call_count == 3);
+
+    // No FAILED line should be in the log
+    b.log_file.?.close();
+    b.log_file = null;
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_status\":\"FAILED\"") == null);
+}
+
+test "bus - retry exhaustion logs FAILED" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "retryfai", log_dir);
+    defer b.deinit();
+    b.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var call_count: u32 = 0;
+    };
+    State.call_count = 0;
+
+    const callback = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            State.call_count += 1;
+            return 8; // TM_ERR_BUS — always fail
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    try b.send(1, 0, .task, "\"will fail\"");
+
+    // 1 initial + 3 retries = 4 total calls
+    try std.testing.expect(State.call_count == 4);
+
+    // FAILED audit line should be in the log
+    b.log_file.?.close();
+    b.log_file = null;
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_status\":\"FAILED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"retries\":3") != null);
 }
