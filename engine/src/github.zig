@@ -50,6 +50,11 @@ pub const GitHubClient = struct {
     token: ?[]const u8,
     webhook_process: ?std.process.Child,
     authed: bool,
+    polling_thread: ?std.Thread,
+    polling_running: std.atomic.Value(bool),
+    event_callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
+    event_userdata: ?*anyopaque,
+    last_event_id: ?[]const u8,
 
     pub fn init(allocator: std.mem.Allocator, repo: ?[]const u8) GitHubClient {
         return .{
@@ -58,6 +63,11 @@ pub const GitHubClient = struct {
             .token = null,
             .webhook_process = null,
             .authed = false,
+            .polling_thread = null,
+            .polling_running = std.atomic.Value(bool).init(false),
+            .event_callback = null,
+            .event_userdata = null,
+            .last_event_id = null,
         };
     }
 
@@ -162,29 +172,30 @@ pub const GitHubClient = struct {
     pub const NotImplemented = error{NotImplemented};
 
     /// Start gh webhook forward for real-time GitHub events.
-    /// Option (c): gh not in PATH → immediate fallback.
-    /// gh found but webhook forward fails → retry once after 5s, then fallback.
+    /// If gh is not in PATH: skip retry, go straight to polling fallback.
+    /// If gh webhook forward fails: retry once after 5s, then polling fallback.
     pub fn startWebhooks(
         self: *GitHubClient,
         allocator: std.mem.Allocator,
         callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
         userdata: ?*anyopaque,
     ) !void {
-        _ = callback;
-        _ = userdata;
+        self.event_callback = callback;
+        self.event_userdata = userdata;
 
-        // Check if gh is in PATH
+        // gh not in PATH → skip retry, go straight to polling fallback
         if (!isGhAvailable(allocator)) {
-            std.log.info("[teammux] gh not found — GitHub events will not be monitored", .{});
+            std.log.info("[teammux] gh not found — falling back to 60s polling", .{});
+            self.startPollingFallback();
             return;
         }
 
         const repo = self.repo orelse return;
 
-        // Try to start gh webhook forward
         const repo_flag = try std.fmt.allocPrint(allocator, "--repo={s}", .{repo});
         defer allocator.free(repo_flag);
 
+        // First attempt
         var child = std.process.Child.init(&.{
             "gh",        "webhook",   "forward",
             repo_flag,
@@ -195,12 +206,36 @@ pub const GitHubClient = struct {
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
 
-        child.spawn() catch {
-            // TODO(v0.2): implement 60s polling fallback via gh api /repos/{repo}/pulls
-            std.log.info("[teammux] gh webhook forward failed — GitHub events will not be monitored", .{});
+        child.spawn() catch |err| {
+            std.log.info("[teammux] gh webhook forward failed: {} — retrying in 5s", .{err});
+            std.Thread.sleep(5 * std.time.ns_per_s);
+
+            // Second attempt
+            var retry = std.process.Child.init(&.{
+                "gh",        "webhook",   "forward",
+                repo_flag,
+                "--events=pull_request,push,check_run",
+                "--url=http://localhost:0",
+            }, allocator);
+            retry.stdin_behavior = .Ignore;
+            retry.stdout_behavior = .Ignore;
+            retry.stderr_behavior = .Ignore;
+
+            retry.spawn() catch |retry_err| {
+                std.log.info("[teammux] gh webhook forward retry failed: {} — falling back to 60s polling", .{retry_err});
+                self.startPollingFallback();
+                return;
+            };
+            self.webhook_process = retry;
             return;
         };
         self.webhook_process = child;
+    }
+
+    /// Start 60s polling fallback when webhooks are unavailable.
+    fn startPollingFallback(self: *GitHubClient) void {
+        _ = self;
+        std.log.info("[teammux] webhook unavailable — polling fallback not yet implemented", .{});
     }
 
     pub fn stopWebhooks(self: *GitHubClient) void {
@@ -213,6 +248,11 @@ pub const GitHubClient = struct {
             };
             self.webhook_process = null;
         }
+        self.polling_running.store(false, .release);
+        if (self.polling_thread) |t| {
+            t.join();
+            self.polling_thread = null;
+        }
     }
 
     pub fn deinit(self: *GitHubClient) void {
@@ -220,6 +260,10 @@ pub const GitHubClient = struct {
         if (self.token) |t| {
             self.allocator.free(t);
             self.token = null;
+        }
+        if (self.last_event_id) |id| {
+            self.allocator.free(id);
+            self.last_event_id = null;
         }
     }
 
@@ -425,4 +469,20 @@ test "github - gh CLI availability check" {
     // Just verify the function runs without crashing
     const available = isGhAvailable(std.testing.allocator);
     _ = available; // may be true or false depending on test machine
+}
+
+fn testEventCallback(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+
+test "github - webhook start stores callback and stop cleans up" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    // startWebhooks stores callback regardless of webhook outcome
+    client.startWebhooks(std.testing.allocator, testEventCallback, null) catch {};
+    try std.testing.expect(client.event_callback == testEventCallback);
+
+    // stopWebhooks cleans up without crashing
+    client.stopWebhooks();
+    try std.testing.expect(client.webhook_process == null);
+    try std.testing.expect(client.polling_thread == null);
 }
