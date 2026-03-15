@@ -1,0 +1,48 @@
+*~
+.*.swp
+.swp
+*.log
+.DS_Store
+.vscode/
+.direnv/
+.envrc.local
+.flatpak-builder/
+zig-cache/
+.zig-cache/
+zig-out/
+/build.zig.zon.bak
+/result*
+/.nixos-test-history
+example/*.wasm
+test/ghostty
+test/cases/**/*.actual.png
+flatpak/builddir/
+flatpak/repo/
+
+glad.zip
+/Box_test.ppm
+/Box_test_diff.ppm
+/ghostty.qcow2
+
+vgcore.*
+
+# Teammux
+macos/Resources/libteammux.a
+macos/build/
+macos/macos/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.xcworkspace/xcuserdata/
+
+# Teammux project artifacts (written per user project, not this repo)
+.teammux/worker-*/
+.teammux/config.local.toml
+.teammux/commands/
+.teammux/logs/
+
+# Secrets
+*.pem
+*.key
