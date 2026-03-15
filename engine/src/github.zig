@@ -234,8 +234,100 @@ pub const GitHubClient = struct {
 
     /// Start 60s polling fallback when webhooks are unavailable.
     fn startPollingFallback(self: *GitHubClient) void {
-        _ = self;
-        std.log.info("[teammux] webhook unavailable — polling fallback not yet implemented", .{});
+        if (self.polling_running.load(.acquire)) return;
+        std.log.info("[teammux] webhook unavailable — falling back to 60s polling", .{});
+        self.polling_running.store(true, .release);
+        self.polling_thread = std.Thread.spawn(.{}, pollingLoop, .{self}) catch |err| {
+            std.log.warn("[teammux] failed to start polling thread: {}", .{err});
+            self.polling_running.store(false, .release);
+            return;
+        };
+    }
+
+    fn pollingLoop(self: *GitHubClient) void {
+        while (self.polling_running.load(.acquire)) {
+            var elapsed: usize = 0;
+            while (elapsed < 60) : (elapsed += 1) {
+                if (!self.polling_running.load(.acquire)) return;
+                std.Thread.sleep(1 * std.time.ns_per_s);
+            }
+            self.pollEvents();
+        }
+    }
+
+    fn pollEvents(self: *GitHubClient) void {
+        const repo = self.repo orelse return;
+        const allocator = self.allocator;
+
+        const endpoint = std.fmt.allocPrint(allocator, "repos/{s}/events", .{repo}) catch return;
+        defer allocator.free(endpoint);
+
+        const result = runGhCommand(allocator, &.{ "api", endpoint }) catch |err| {
+            std.log.warn("[teammux] poll failed: {}", .{err});
+            return;
+        };
+        defer allocator.free(result);
+
+        self.processEvents(result) catch |err| {
+            std.log.warn("[teammux] event processing failed: {}", .{err});
+        };
+    }
+
+    fn processEvents(self: *GitHubClient, json_data: []const u8) !void {
+        const allocator = self.allocator;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_data, .{});
+        defer parsed.deinit();
+
+        const events = switch (parsed.value) {
+            .array => |arr| arr,
+            else => return,
+        };
+
+        var new_last_id: ?[]const u8 = null;
+
+        for (events.items) |event| {
+            const obj = switch (event) {
+                .object => |o| o,
+                else => continue,
+            };
+
+            const id_str = switch (obj.get("id") orelse continue) {
+                .string => |s| s,
+                else => continue,
+            };
+
+            if (new_last_id == null) new_last_id = id_str;
+
+            if (self.last_event_id) |last_id| {
+                if (std.mem.eql(u8, id_str, last_id)) break;
+            }
+
+            const event_type = switch (obj.get("type") orelse continue) {
+                .string => |s| s,
+                else => continue,
+            };
+
+            const branch = extractBranch(event, event_type) orelse continue;
+            if (!isTeammuxBranch(branch)) continue;
+
+            const mapped_type = mapEventType(event_type) orelse continue;
+
+            const callback = self.event_callback orelse continue;
+            const type_z = allocator.dupeZ(u8, mapped_type) catch continue;
+            defer allocator.free(type_z);
+
+            const json_str = std.json.Stringify.valueAlloc(allocator, event, .{}) catch continue;
+            defer allocator.free(json_str);
+            const json_z = allocator.dupeZ(u8, json_str) catch continue;
+            defer allocator.free(json_z);
+
+            callback(type_z.ptr, json_z.ptr, self.event_userdata);
+        }
+
+        if (new_last_id) |nid| {
+            if (self.last_event_id) |old| allocator.free(old);
+            self.last_event_id = allocator.dupe(u8, nid) catch null;
+        }
     }
 
     pub fn stopWebhooks(self: *GitHubClient) void {
@@ -382,6 +474,48 @@ fn runGhCommand(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
 
 pub const GhCommandFailed = error{GhCommandFailed};
 
+fn extractBranch(event: std.json.Value, event_type: []const u8) ?[]const u8 {
+    const obj = switch (event) {
+        .object => |o| o,
+        else => return null,
+    };
+    const payload = switch (obj.get("payload") orelse return null) {
+        .object => |o| o,
+        else => return null,
+    };
+    if (std.mem.eql(u8, event_type, "PushEvent")) {
+        return switch (payload.get("ref") orelse return null) {
+            .string => |s| s,
+            else => null,
+        };
+    } else if (std.mem.eql(u8, event_type, "PullRequestEvent")) {
+        const pr = switch (payload.get("pull_request") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        const head = switch (pr.get("head") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        return switch (head.get("ref") orelse return null) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+    return null;
+}
+
+fn isTeammuxBranch(ref: []const u8) bool {
+    return std.mem.startsWith(u8, ref, "refs/heads/teammux/") or
+        std.mem.startsWith(u8, ref, "teammux/");
+}
+
+fn mapEventType(github_type: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, github_type, "PushEvent")) return "push";
+    if (std.mem.eql(u8, github_type, "PullRequestEvent")) return "pull_request";
+    return null;
+}
+
 fn isGhAvailable(allocator: std.mem.Allocator) bool {
     var child = std.process.Child.init(&.{ "which", "gh" }, allocator);
     child.stdin_behavior = .Ignore;
@@ -485,4 +619,118 @@ test "github - webhook start stores callback and stop cleans up" {
     client.stopWebhooks();
     try std.testing.expect(client.webhook_process == null);
     try std.testing.expect(client.polling_thread == null);
+}
+
+test "github - polling thread starts and stops cleanly" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    client.startPollingFallback();
+    try std.testing.expect(client.polling_running.load(.acquire));
+    try std.testing.expect(client.polling_thread != null);
+
+    client.stopWebhooks();
+    try std.testing.expect(!client.polling_running.load(.acquire));
+    try std.testing.expect(client.polling_thread == null);
+}
+
+const TestCallbackData = struct {
+    callback_count: u32 = 0,
+    push_count: u32 = 0,
+    pr_count: u32 = 0,
+};
+
+fn testPollCallback(event_type: ?[*:0]const u8, _: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
+    if (userdata) |ud| {
+        const data: *TestCallbackData = @ptrCast(@alignCast(ud));
+        data.callback_count += 1;
+        if (event_type) |et| {
+            const span = std.mem.span(et);
+            if (std.mem.eql(u8, span, "push")) data.push_count += 1;
+            if (std.mem.eql(u8, span, "pull_request")) data.pr_count += 1;
+        }
+    }
+}
+
+test "github - processEvents fires callback for push on teammux branch" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"100","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(test_data.callback_count == 1);
+    try std.testing.expect(test_data.push_count == 1);
+}
+
+test "github - processEvents fires callback for PR on teammux branch" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"200","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"head":{"ref":"teammux/worker-2"}}}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(test_data.callback_count == 1);
+    try std.testing.expect(test_data.pr_count == 1);
+}
+
+test "github - processEvents ignores non-teammux branches" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"300","type":"PushEvent","payload":{"ref":"refs/heads/main"}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(test_data.callback_count == 0);
+}
+
+test "github - processEvents deduplicates by event ID" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"400","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(test_data.callback_count == 1);
+
+    // Same event ID — should not fire again
+    try client.processEvents(json);
+    try std.testing.expect(test_data.callback_count == 1);
+}
+
+test "github - isTeammuxBranch matches correct patterns" {
+    try std.testing.expect(isTeammuxBranch("refs/heads/teammux/worker-1"));
+    try std.testing.expect(isTeammuxBranch("teammux/worker-2"));
+    try std.testing.expect(!isTeammuxBranch("refs/heads/main"));
+    try std.testing.expect(!isTeammuxBranch("feature/something"));
+}
+
+test "github - mapEventType maps correctly" {
+    try std.testing.expectEqualStrings("push", mapEventType("PushEvent").?);
+    try std.testing.expectEqualStrings("pull_request", mapEventType("PullRequestEvent").?);
+    try std.testing.expect(mapEventType("WatchEvent") == null);
 }
