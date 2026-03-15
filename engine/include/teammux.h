@@ -81,6 +81,14 @@ typedef enum {
     TM_DIFF_RENAMED  = 3,
 } tm_diff_status_t;
 
+typedef enum {
+    TM_MERGE_PENDING     = 0,
+    TM_MERGE_IN_PROGRESS = 1,
+    TM_MERGE_SUCCESS     = 2,
+    TM_MERGE_CONFLICT    = 3,
+    TM_MERGE_REJECTED    = 4,
+} tm_merge_status_e;
+
 typedef struct {
     tm_worker_id_t     id;
     const char*        name;
@@ -132,6 +140,13 @@ typedef struct {
     int32_t            total_additions;
     int32_t            total_deletions;
 } tm_diff_t;
+
+typedef struct {
+    const char*        file_path;
+    const char*        conflict_type;
+    const char*        ours;
+    const char*        theirs;
+} tm_conflict_t;
 
 // -----------------------------------------------------------------
 // Callbacks
@@ -260,6 +275,33 @@ void       tm_diff_free(tm_diff_t* diff);
 
 tm_subscription_t tm_github_webhooks_start(tm_engine_t* engine, tm_github_event_cb callback, void* userdata);
 void              tm_github_webhooks_stop(tm_engine_t* engine, tm_subscription_t sub);
+
+// -----------------------------------------------------------------
+// Merge coordinator
+// -----------------------------------------------------------------
+
+// Approve merge of a worker's branch into main. strategy is "merge", "squash", or "rebase".
+// Returns TM_OK on success or conflict (check tm_merge_get_status for outcome).
+// Returns TM_ERR_INVALID_WORKER if worker not found, TM_ERR_WORKTREE if HEAD is not on main.
+tm_result_t tm_merge_approve(tm_engine_t* engine, uint32_t worker_id,
+                              const char* strategy);
+
+// Reject a worker's merge: abort any in-progress merge, remove worktree, delete branch.
+// Worker remains in roster with status complete (dismissed).
+tm_result_t tm_merge_reject(tm_engine_t* engine, uint32_t worker_id);
+
+// Get current merge status for a worker. Returns TM_MERGE_PENDING if no merge attempted.
+tm_merge_status_e tm_merge_get_status(tm_engine_t* engine,
+                                       uint32_t worker_id);
+
+// Get list of conflicts for a worker after a conflicted merge.
+// Returns NULL if no conflicts. Caller must call tm_merge_conflicts_free().
+tm_conflict_t** tm_merge_conflicts_get(tm_engine_t* engine,
+                                        uint32_t worker_id,
+                                        uint32_t* count);
+
+// Free conflict list returned by tm_merge_conflicts_get.
+void tm_merge_conflicts_free(tm_conflict_t** conflicts, uint32_t count);
 
 // -----------------------------------------------------------------
 // /teammux-* command interception
