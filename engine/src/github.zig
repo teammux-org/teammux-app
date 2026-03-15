@@ -746,3 +746,87 @@ test "github - mapEventType maps correctly" {
     try std.testing.expectEqualStrings("pull_request", mapEventType("PullRequestEvent").?);
     try std.testing.expect(mapEventType("WatchEvent") == null);
 }
+
+test "github - processEvents handles empty array" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    try client.processEvents("[]");
+    try std.testing.expect(test_data.callback_count == 0);
+}
+
+test "github - processEvents handles non-array JSON" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    try client.processEvents("{}");
+    try std.testing.expect(test_data.callback_count == 0);
+}
+
+test "github - processEvents skips events with missing fields" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    // Missing "id" field
+    try client.processEvents(
+        \\[{"type":"PushEvent","payload":{"ref":"refs/heads/teammux/w1"}}]
+    );
+    try std.testing.expect(test_data.callback_count == 0);
+
+    // Missing "type" field
+    try client.processEvents(
+        \\[{"id":"500","payload":{"ref":"refs/heads/teammux/w1"}}]
+    );
+    try std.testing.expect(test_data.callback_count == 0);
+
+    // Missing "payload" field
+    try client.processEvents(
+        \\[{"id":"501","type":"PushEvent"}]
+    );
+    try std.testing.expect(test_data.callback_count == 0);
+}
+
+test "github - processEvents handles multi-event batch with dedup" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    // Batch: 2 teammux branches + 1 main (newest first)
+    const json =
+        \\[{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-3"}},
+        \\{"id":"602","type":"PushEvent","payload":{"ref":"refs/heads/main"}},
+        \\{"id":"601","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(test_data.callback_count == 2);
+    try std.testing.expect(test_data.push_count == 2);
+    try std.testing.expectEqualStrings("603", client.last_event_id.?);
+
+    // Second poll: only event 604 is new (603 already seen)
+    test_data.callback_count = 0;
+    test_data.push_count = 0;
+    const json2 =
+        \\[{"id":"604","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-4"}},
+        \\{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-3"}}]
+    ;
+
+    try client.processEvents(json2);
+    try std.testing.expect(test_data.callback_count == 1);
+    try std.testing.expectEqualStrings("604", client.last_event_id.?);
+}
