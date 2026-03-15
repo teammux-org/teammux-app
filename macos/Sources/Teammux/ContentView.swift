@@ -22,25 +22,4 @@ struct ContentView: View {
     }
 }
 
-// MARK: - WorkspaceView (placeholder)
-
-/// Placeholder for the three-pane workspace layout.
-/// Will be replaced by Task 5 (Stream 3).
-struct WorkspaceView: View {
-    @EnvironmentObject var projectManager: ProjectManager
-
-    var body: some View {
-        VStack {
-            if let project = projectManager.activeProject {
-                Text("Workspace — \(project.name)")
-                    .font(.title2)
-                    .foregroundColor(.secondary)
-            } else {
-                Text("Workspace — coming soon")
-                    .font(.title2)
-                    .foregroundColor(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
+// NOTE: WorkspaceView is now defined in Workspace/WorkspaceView.swift

@@ -1,0 +1,161 @@
+import SwiftUI
+
+// MARK: - LiveFeedView
+
+/// Right-pane tab showing the real-time message bus feed.
+///
+/// Displays all TeamMessages from the engine with auto-scroll to the
+/// latest entry. Each row shows a timestamp, message type dot, sender/receiver
+/// identifiers, and payload text.
+struct LiveFeedView: View {
+    @ObservedObject var engine: EngineClient
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            feedHeader
+
+            Divider()
+
+            // Feed content
+            if engine.messages.isEmpty {
+                emptyState
+            } else {
+                feedList
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Header
+
+    private var feedHeader: some View {
+        HStack {
+            Text("Live Feed")
+                .font(.headline)
+
+            Spacer()
+
+            Text("\(engine.messages.count) events")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.12))
+                .cornerRadius(4)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Empty state
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .font(.system(size: 32))
+                .foregroundColor(.secondary)
+
+            Text("No activity yet")
+                .font(.headline)
+                .foregroundColor(.secondary)
+
+            Text("Messages between the Team Lead and workers will appear here.")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+
+    // MARK: - Feed list
+
+    private var feedList: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(engine.messages) { message in
+                        LiveFeedRow(message: message, engine: engine)
+                            .id(message.id)
+                    }
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 8)
+            }
+            .onChange(of: engine.messages.count) { _ in
+                // Auto-scroll to the latest message
+                if let lastMessage = engine.messages.last {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - LiveFeedRow
+
+/// A single row in the Live Feed showing one message from the bus.
+struct LiveFeedRow: View {
+    let message: TeamMessage
+    let engine: EngineClient
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            // Timestamp
+            Text(Self.timeFormatter.string(from: message.timestamp))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 56, alignment: .leading)
+
+            // Message type dot
+            Circle()
+                .fill(message.type.color)
+                .frame(width: 6, height: 6)
+                .padding(.top, 4)
+
+            // Sender -> Receiver
+            Text(routeLabel)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.primary)
+                .frame(minWidth: 80, alignment: .leading)
+
+            // Payload
+            Text(message.payload)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+                .truncationMode(.tail)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 4)
+    }
+
+    // MARK: - Route label
+
+    /// Formats the sender->receiver display string.
+    /// Worker ID 0 is the Team Lead; otherwise lookup the worker name.
+    private var routeLabel: String {
+        let sender = nameForId(message.from)
+        let receiver = nameForId(message.to)
+        return "\(sender) -> \(receiver)"
+    }
+
+    private func nameForId(_ id: UInt32) -> String {
+        if id == 0 {
+            return "Lead"
+        }
+        if let worker = engine.roster.first(where: { $0.id == id }) {
+            return worker.name
+        }
+        return "#\(id)"
+    }
+}
