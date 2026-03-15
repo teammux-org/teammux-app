@@ -26,3 +26,23 @@ glad.zip
 
 vgcore.*
 
+# Teammux
+macos/Resources/libteammux.a
+macos/build/
+macos/macos/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.xcworkspace/xcuserdata/
+
+# Teammux project artifacts (written per user project, not this repo)
+.teammux/worker-*/
+.teammux/config.local.toml
+.teammux/commands/
+.teammux/logs/
+
+# Secrets
+*.pem
+*.key
