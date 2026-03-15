@@ -16,8 +16,9 @@ typedef struct tm_engine tm_engine_t;
 typedef uint32_t tm_worker_id_t;
 typedef uint32_t tm_subscription_t;
 
-#define TM_WORKER_TEAM_LEAD 0
-#define TM_WORKER_INVALID   UINT32_MAX
+#define TM_WORKER_TEAM_LEAD      0
+#define TM_WORKER_INVALID        UINT32_MAX
+#define TM_SUBSCRIPTION_INVALID  0
 
 typedef enum {
     TM_OK                   = 0,
@@ -27,7 +28,7 @@ typedef enum {
     TM_ERR_NO_AGENT         = 4,
     TM_ERR_WORKTREE         = 5,
     TM_ERR_PTY              = 6,
-    TM_ERR_CONFIG            = 7,
+    TM_ERR_CONFIG           = 7,
     TM_ERR_BUS              = 8,
     TM_ERR_GITHUB           = 9,
     TM_ERR_NOT_IMPLEMENTED  = 10,
@@ -58,6 +59,7 @@ typedef enum {
     TM_MSG_STATUS_RPT  = 4,
     TM_MSG_COMPLETION  = 5,
     TM_MSG_ERROR       = 6,
+    TM_MSG_BROADCAST   = 7,
 } tm_message_type_t;
 
 typedef enum {
@@ -140,7 +142,7 @@ typedef struct {
 
 typedef void (*tm_message_cb)(const tm_message_t* message, void* userdata);
 typedef void (*tm_roster_changed_cb)(const tm_roster_t* roster, void* userdata);
-typedef void (*tm_config_changed_cb)(const tm_engine_t* engine, void* userdata);
+typedef void (*tm_config_changed_cb)(void* userdata);
 typedef void (*tm_github_event_cb)(const char* event_type, const char* payload_json, void* userdata);
 typedef void (*tm_command_cb)(const char* command, const char* args_json, void* userdata);
 
@@ -165,6 +167,7 @@ const char*  tm_engine_last_error(tm_engine_t* engine);
 // -----------------------------------------------------------------
 
 tm_result_t      tm_config_reload(tm_engine_t* engine);
+// Returns TM_SUBSCRIPTION_INVALID (0) on failure.
 tm_subscription_t tm_config_watch(tm_engine_t* engine, tm_config_changed_cb callback, void* userdata);
 void              tm_config_unwatch(tm_engine_t* engine, tm_subscription_t sub);
 
@@ -186,8 +189,12 @@ tm_worker_id_t tm_worker_spawn(
 );
 
 tm_result_t       tm_worker_dismiss(tm_engine_t* engine, tm_worker_id_t worker_id);
+
+// Get current roster snapshot. Returns NULL on failure. Caller must call tm_roster_free().
 tm_roster_t*      tm_roster_get(tm_engine_t* engine);
 void              tm_roster_free(tm_roster_t* roster);
+
+// Get info for a specific worker. Returns NULL if not found. Caller must call tm_worker_info_free().
 tm_worker_info_t* tm_worker_get(tm_engine_t* engine, tm_worker_id_t worker_id);
 void              tm_worker_info_free(tm_worker_info_t* info);
 tm_subscription_t tm_roster_watch(tm_engine_t* engine, tm_roster_changed_cb callback, void* userdata);
@@ -198,6 +205,9 @@ void              tm_roster_unwatch(tm_engine_t* engine, tm_subscription_t sub);
 // -----------------------------------------------------------------
 
 tm_result_t tm_pty_send(tm_engine_t* engine, tm_worker_id_t worker_id, const char* text);
+
+// Get the PTY file descriptor for a worker (used by Ghostty SurfaceView).
+// Returns -1 on failure or if worker not found.
 int         tm_pty_fd(tm_engine_t* engine, tm_worker_id_t worker_id);
 
 // -----------------------------------------------------------------
@@ -227,6 +237,8 @@ void              tm_message_unsubscribe(tm_engine_t* engine, tm_subscription_t 
 tm_result_t tm_github_auth(tm_engine_t* engine);
 bool        tm_github_is_authed(tm_engine_t* engine);
 
+// Create a GitHub PR. Returns heap-allocated tm_pr_t on success, NULL on failure.
+// Caller must call tm_pr_free().
 tm_pr_t* tm_github_create_pr(
     tm_engine_t*   engine,
     tm_worker_id_t worker_id,
@@ -241,6 +253,8 @@ tm_result_t tm_github_merge_pr(
     tm_merge_strategy_t strategy
 );
 
+// Get diff for a worker's branch vs main. Returns NULL on failure.
+// Caller must call tm_diff_free().
 tm_diff_t* tm_github_get_diff(tm_engine_t* engine, tm_worker_id_t worker_id);
 void       tm_diff_free(tm_diff_t* diff);
 
@@ -258,9 +272,14 @@ void              tm_commands_unwatch(tm_engine_t* engine, tm_subscription_t sub
 // Utility
 // -----------------------------------------------------------------
 
+// Resolve agent binary path. Returns NULL if not found.
+// Returns heap-allocated string. Caller must call tm_free_string().
 const char* tm_agent_resolve(const char* agent_name);
 void        tm_free_string(const char* str);
 const char* tm_version(void);
+
+// tm_result_to_string — converts tm_result_t to human-readable string.
+// Will be implemented in Stream 2.
 
 #ifdef __cplusplus
 }

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 command -v zig >/dev/null 2>&1 || { echo "ERROR: 'zig' not found. Install from https://ziglang.org/download/"; exit 1; }
+command -v lipo >/dev/null 2>&1 || { echo "ERROR: 'lipo' not found. Run: xcode-select --install"; exit 1; }
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Teammux build"

@@ -20,7 +20,8 @@ const Engine = struct {
     project_root: [*c]const u8,
 };
 
-// Thread-local last error for tm_engine_create failure reporting
+// Global last error for tm_engine_create failure reporting.
+// STUB: Stream 2 must store per-engine last error, not just creation error.
 var last_create_error: [*c]const u8 = "engine not yet implemented (stub)";
 
 // ------------------------------------------------------------------

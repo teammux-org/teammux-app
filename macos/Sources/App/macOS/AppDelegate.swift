@@ -1069,6 +1069,7 @@ class AppDelegate: NSObject,
 
     @objc private func teammuxWindowWillClose(_ notification: Notification) {
         Self.logger.info("Teammux workspace window closing")
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: notification.object)
         teammuxWindowOpen = false
         teammuxWindow = nil
     }
