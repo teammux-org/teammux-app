@@ -99,7 +99,8 @@ class AppDelegate: NSObject,
     private var workspaceWindowController: WorkspaceWindowController?
 
     /// Manages saved/recent projects for the setup flow.
-    private let projectManager = ProjectManager()
+    /// Initialized in applicationDidFinishLaunching because ProjectManager is @MainActor.
+    private var projectManager: ProjectManager?
 
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
@@ -214,6 +215,9 @@ class AppDelegate: NSObject,
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Initialize ProjectManager on the main thread
+        projectManager = ProjectManager()
+
         // System settings overrides
         UserDefaults.ghostty.register(defaults: [
             // Disable this so that repeated key events make it through to our terminal views.
@@ -1049,6 +1053,10 @@ class AppDelegate: NSObject,
 
     private func openTeammuxWindow() {
         Self.logger.info("Opening Teammux workspace window")
+        guard let projectManager else {
+            Self.logger.error("ProjectManager not initialized")
+            return
+        }
         let controller = WorkspaceWindowController(
             ghosttyApp: ghostty,
             projectManager: projectManager
