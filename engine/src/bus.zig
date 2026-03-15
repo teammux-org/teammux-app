@@ -1,1 +1,2 @@
-// Message bus (TCP-style guaranteed delivery) — implemented in Stream 2
+// Message bus with guaranteed delivery — implemented in commit 5
+// Delivery fires tm_message_cb callback to Swift (Ghostty owns PTY).

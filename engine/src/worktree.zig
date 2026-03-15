@@ -1,1 +1,1 @@
-// Git worktree lifecycle — implemented in Stream 2
+// Git worktree lifecycle — implemented in commit 3

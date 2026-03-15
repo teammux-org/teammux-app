@@ -1,1 +1,1 @@
-// /teammux-* command watcher — implemented in Stream 2
+// /teammux-* command file watcher via kqueue — implemented in commit 6

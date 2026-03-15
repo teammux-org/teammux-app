@@ -1,1 +1,1 @@
-// GitHub API integration — implemented in Stream 2
+// GitHub API integration via gh CLI — implemented in commit 7

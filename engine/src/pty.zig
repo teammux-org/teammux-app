@@ -1,1 +1,2 @@
-// PTY ownership and scoping — implemented in Stream 2
+// PTY stub — Ghostty owns PTY via SurfaceView, engine provides metadata only.
+// tm_pty_send() and tm_pty_fd() are no-op exports.
