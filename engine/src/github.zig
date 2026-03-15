@@ -183,14 +183,16 @@ pub const GitHubClient = struct {
         self.event_callback = callback;
         self.event_userdata = userdata;
 
-        // gh not in PATH → skip retry, go straight to polling fallback
+        const repo = self.repo orelse {
+            std.log.warn("[teammux] no repo configured — GitHub event monitoring disabled", .{});
+            return;
+        };
+
         if (!isGhAvailable(allocator)) {
             std.log.info("[teammux] gh not found — falling back to 60s polling", .{});
             self.startPollingFallback();
             return;
         }
-
-        const repo = self.repo orelse return;
 
         const repo_flag = try std.fmt.allocPrint(allocator, "--repo={s}", .{repo});
         defer allocator.free(repo_flag);
@@ -233,9 +235,9 @@ pub const GitHubClient = struct {
     }
 
     /// Start 60s polling fallback when webhooks are unavailable.
+    /// Callers log the specific reason before calling this.
     fn startPollingFallback(self: *GitHubClient) void {
         if (self.polling_running.load(.acquire)) return;
-        std.log.info("[teammux] webhook unavailable — falling back to 60s polling", .{});
         self.polling_running.store(true, .release);
         self.polling_thread = std.Thread.spawn(.{}, pollingLoop, .{self}) catch |err| {
             std.log.warn("[teammux] failed to start polling thread: {}", .{err});
@@ -244,6 +246,7 @@ pub const GitHubClient = struct {
         };
     }
 
+    /// Poll every 60s. Sleeps in 1s increments to allow responsive shutdown (max 1s stop latency).
     fn pollingLoop(self: *GitHubClient) void {
         while (self.polling_running.load(.acquire)) {
             var elapsed: usize = 0;
@@ -255,6 +258,7 @@ pub const GitHubClient = struct {
         }
     }
 
+    /// Fetch recent events from GitHub Events API (repos/{owner}/{repo}/events).
     fn pollEvents(self: *GitHubClient) void {
         const repo = self.repo orelse return;
         const allocator = self.allocator;
@@ -273,6 +277,9 @@ pub const GitHubClient = struct {
         };
     }
 
+    /// Parse GitHub Events API JSON array (newest-first order).
+    /// Deduplicates by comparing event IDs against last_event_id.
+    /// Only teammux/* branch events are forwarded to the callback.
     fn processEvents(self: *GitHubClient, json_data: []const u8) !void {
         const allocator = self.allocator;
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_data, .{});
@@ -475,6 +482,8 @@ fn runGhCommand(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
 
 pub const GhCommandFailed = error{GhCommandFailed};
 
+/// Extract branch ref from a GitHub event.
+/// PushEvent -> payload.ref, PullRequestEvent -> payload.pull_request.head.ref.
 fn extractBranch(event: std.json.Value, event_type: []const u8) ?[]const u8 {
     const obj = switch (event) {
         .object => |o| o,
@@ -506,6 +515,8 @@ fn extractBranch(event: std.json.Value, event_type: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Match teammux branches. PushEvent refs include "refs/heads/" prefix;
+/// PullRequestEvent head.ref does not.
 fn isTeammuxBranch(ref: []const u8) bool {
     return std.mem.startsWith(u8, ref, "refs/heads/teammux/") or
         std.mem.startsWith(u8, ref, "teammux/");
