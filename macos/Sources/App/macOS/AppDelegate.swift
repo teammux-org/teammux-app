@@ -88,6 +88,10 @@ class AppDelegate: NSObject,
     /// This is only true before application has become active.
     private var applicationHasBecomeActive: Bool = false
 
+    /// Teammux: when true, the Teammux workspace window is open and
+    /// Ghostty's default terminal window creation is suppressed.
+    private var teammuxWindowOpen = false
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -348,15 +352,18 @@ class AppDelegate: NSObject,
         // If we're back manually then clear the hidden state because macOS handles it.
         self.hiddenState = nil
 
+        // Teammux: open workspace window on first activation
+        if !teammuxWindowOpen {
+            openTeammuxWindow()
+            teammuxWindowOpen = true
+        }
+
         // First launch stuff
         if !applicationHasBecomeActive {
             applicationHasBecomeActive = true
 
-            // Let's launch our first window. We only do this if we have no other windows. It
-            // is possible to have other windows in a few scenarios:
-            //   - if we're opening a URL since `application(_:openFile:)` is called before this.
-            //   - if we're restoring from persisted state
-            if TerminalController.all.isEmpty && derivedConfig.initialWindow {
+            // Ghostty default window creation — suppressed when Teammux window is open
+            if !teammuxWindowOpen && TerminalController.all.isEmpty && derivedConfig.initialWindow {
                 undoManager.disableUndoRegistration()
                 _ = TerminalController.newWindow(ghostty)
                 undoManager.enableUndoRegistration()
@@ -450,6 +457,9 @@ class AppDelegate: NSObject,
         // this because we're not ready. This happens sometimes in Xcode runs
         // but I haven't seen it happen in releases. I'm unsure why.
         guard applicationHasBecomeActive else { return true }
+
+        // Teammux: don't create Ghostty windows when Teammux is active
+        guard !teammuxWindowOpen else { return true }
 
         // No visible windows, open a new one.
         _ = TerminalController.newWindow(ghostty)
@@ -1023,6 +1033,23 @@ class AppDelegate: NSObject,
 
     @IBAction func redo(_ sender: Any?) {
         undoManager.redo()
+    }
+
+    // MARK: - Teammux
+
+    private func openTeammuxWindow() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1400, height: 900),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Teammux"
+        window.center()
+        window.contentViewController = NSHostingController(
+            rootView: Text("Teammux loading...").frame(maxWidth: .infinity, maxHeight: .infinity)
+        )
+        window.makeKeyAndOrderFront(nil)
     }
 
     private struct DerivedConfig {
