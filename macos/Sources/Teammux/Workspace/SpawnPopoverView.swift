@@ -1,0 +1,165 @@
+import SwiftUI
+
+// MARK: - SpawnPopoverView
+
+/// Popover form for spawning a new worker agent.
+/// Collects task description, agent type, and optional worker name,
+/// then calls engine.spawnWorker() on submit.
+struct SpawnPopoverView: View {
+    @ObservedObject var engine: EngineClient
+    @Binding var isPresented: Bool
+
+    @State private var taskDescription: String = ""
+    @State private var workerName: String = ""
+    @State private var selectedAgentType: AgentTypeOption = .claudeCode
+    @State private var customBinary: String = ""
+    @State private var isSpawning = false
+    @State private var spawnError: String?
+
+    /// Simplified agent type picker options.
+    enum AgentTypeOption: String, CaseIterable, Identifiable {
+        case claudeCode = "Claude Code"
+        case codexCli = "Codex CLI"
+        case custom = "Custom"
+
+        var id: String { rawValue }
+
+        func toAgentType(customBinary: String) -> AgentType {
+            switch self {
+            case .claudeCode: return .claudeCode
+            case .codexCli:   return .codexCli
+            case .custom:     return .custom(customBinary)
+            }
+        }
+
+        func resolvedBinary(customBinary: String) -> String {
+            switch self {
+            case .claudeCode: return "claude"
+            case .codexCli:   return "codex"
+            case .custom:     return customBinary
+            }
+        }
+    }
+
+    private var canSpawn: Bool {
+        let trimmed = taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if selectedAgentType == .custom {
+            return !customBinary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return true
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("New Worker")
+                .font(.headline)
+
+            // Task description
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Task")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+
+                TextField("Describe the task...", text: $taskDescription, axis: .vertical)
+                    .lineLimit(3...6)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            // Agent picker
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Agent")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+
+                Picker("Agent", selection: $selectedAgentType) {
+                    ForEach(AgentTypeOption.allCases) { option in
+                        Text(option.rawValue).tag(option)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+
+            // Custom binary field (only when Custom is selected)
+            if selectedAgentType == .custom {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Binary")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+
+                    TextField("e.g. my-agent", text: $customBinary)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+
+            // Name field
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Name (optional)")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+
+                TextField("Worker name", text: $workerName)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            // Spawn error
+            if let error = spawnError {
+                Text(error)
+                    .foregroundColor(.red)
+                    .font(.caption)
+            }
+
+            // Spawn button
+            HStack {
+                Spacer()
+
+                Button(action: spawnWorker) {
+                    if isSpawning {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.horizontal, 8)
+                    } else {
+                        Text("Initiate Teammate")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSpawn || isSpawning)
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+
+    // MARK: - Spawn action
+
+    private func spawnWorker() {
+        isSpawning = true
+        spawnError = nil
+
+        Task {
+            let name = workerName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedName = name.isEmpty
+                ? "Worker \(engine.roster.count + 1)"
+                : name
+
+            let agentType = selectedAgentType.toAgentType(customBinary: customBinary)
+            let binary = selectedAgentType.resolvedBinary(customBinary: customBinary)
+
+            let workerId = engine.spawnWorker(
+                agentBinary: binary,
+                agentType: agentType,
+                workerName: resolvedName,
+                taskDescription: taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+
+            isSpawning = false
+
+            if workerId == 0 {
+                spawnError = engine.lastError ?? "Failed to spawn worker"
+                return  // don't dismiss
+            }
+            isPresented = false
+        }
+    }
+}
