@@ -92,6 +92,12 @@ class AppDelegate: NSObject,
     /// Ghostty's default terminal window creation is suppressed.
     private var teammuxWindowOpen = false
 
+    /// Teammux window controller — retained to keep the window alive.
+    private var workspaceWindowController: WorkspaceWindowController?
+
+    /// Manages open projects (tabs) across the Teammux workspace.
+    private let projectManager = ProjectManager()
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -1038,18 +1044,13 @@ class AppDelegate: NSObject,
     // MARK: - Teammux
 
     private func openTeammuxWindow() {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1400, height: 900),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let controller = WorkspaceWindowController(
+            ghosttyApp: ghostty,
+            projectManager: projectManager
         )
-        window.title = "Teammux"
-        window.center()
-        window.contentViewController = NSHostingController(
-            rootView: Text("Teammux loading...").frame(maxWidth: .infinity, maxHeight: .infinity)
-        )
-        window.makeKeyAndOrderFront(nil)
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        workspaceWindowController = controller
     }
 
     private struct DerivedConfig {
