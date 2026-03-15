@@ -775,6 +775,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				ARCHS = arm64;
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../engine/include";
@@ -1174,6 +1175,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				ARCHS = arm64;
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../engine/include";
@@ -1231,6 +1233,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				ARCHS = arm64;
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../engine/include";

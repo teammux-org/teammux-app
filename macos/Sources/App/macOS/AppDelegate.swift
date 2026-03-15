@@ -92,6 +92,9 @@ class AppDelegate: NSObject,
     /// Ghostty's default terminal window creation is suppressed.
     private var teammuxWindowOpen = false
 
+    /// Strong reference to the Teammux workspace window.
+    private var teammuxWindow: NSWindow?
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -1038,6 +1041,7 @@ class AppDelegate: NSObject,
     // MARK: - Teammux
 
     private func openTeammuxWindow() {
+        Self.logger.info("Opening Teammux workspace window")
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1400, height: 900),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -1046,10 +1050,26 @@ class AppDelegate: NSObject,
         )
         window.title = "Teammux"
         window.center()
+        window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(
             rootView: Text("Teammux loading...").frame(maxWidth: .infinity, maxHeight: .infinity)
         )
         window.makeKeyAndOrderFront(nil)
+        self.teammuxWindow = window
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(teammuxWindowWillClose),
+            name: NSWindow.willCloseNotification,
+            object: window
+        )
+        Self.logger.info("Teammux workspace window opened")
+    }
+
+    @objc private func teammuxWindowWillClose(_ notification: Notification) {
+        Self.logger.info("Teammux workspace window closed")
+        teammuxWindowOpen = false
+        teammuxWindow = nil
     }
 
     private struct DerivedConfig {

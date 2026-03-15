@@ -1,5 +1,6 @@
 // Teammux coordination engine — entry point
 // All functions are stubs for Stream 1. Stream 2 implements the real logic.
+// Stubs return TM_ERR_NOT_IMPLEMENTED (100) to force callers to handle errors.
 
 const std = @import("std");
 
@@ -11,18 +12,29 @@ pub const config = @import("config.zig");
 pub const github = @import("github.zig");
 pub const commands = @import("commands.zig");
 
+// Error codes matching teammux.h
+const TM_ERR_NOT_IMPLEMENTED: c_int = 100;
+const TM_WORKER_INVALID: u32 = 0xFFFFFFFF; // UINT32_MAX
+
 // Opaque engine type
 const Engine = struct {
     project_root: [*c]const u8,
 };
 
+// Global last error for tm_engine_create failures
+var global_last_error: [*c]const u8 = "engine not yet implemented (stub)";
+
 // ------------------------------------------------------------------
 // Engine lifecycle
 // ------------------------------------------------------------------
 
-export fn tm_engine_create(project_root: [*c]const u8) ?*Engine {
+export fn tm_engine_create(project_root: [*c]const u8, out: ?*?*Engine) c_int {
     _ = project_root;
-    return null;
+    if (out) |p| {
+        p.* = null;
+    }
+    global_last_error = "engine not yet implemented (stub)";
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_engine_destroy(engine: ?*Engine) void {
@@ -31,7 +43,7 @@ export fn tm_engine_destroy(engine: ?*Engine) void {
 
 export fn tm_session_start(engine: ?*Engine) c_int {
     _ = engine;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_session_stop(engine: ?*Engine) void {
@@ -40,7 +52,7 @@ export fn tm_session_stop(engine: ?*Engine) void {
 
 export fn tm_engine_last_error(engine: ?*Engine) [*c]const u8 {
     _ = engine;
-    return null;
+    return global_last_error;
 }
 
 // ------------------------------------------------------------------
@@ -49,13 +61,19 @@ export fn tm_engine_last_error(engine: ?*Engine) [*c]const u8 {
 
 export fn tm_config_reload(engine: ?*Engine) c_int {
     _ = engine;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
-export fn tm_config_watch(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) void {
+export fn tm_config_watch(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) u32 {
     _ = engine;
     _ = callback;
     _ = userdata;
+    return 0;
+}
+
+export fn tm_config_unwatch(engine: ?*Engine, sub: u32) void {
+    _ = engine;
+    _ = sub;
 }
 
 export fn tm_config_get(engine: ?*Engine, key: [*c]const u8) [*c]const u8 {
@@ -80,13 +98,13 @@ export fn tm_worker_spawn(
     _ = agent_type;
     _ = worker_name;
     _ = task_description;
-    return 0;
+    return TM_WORKER_INVALID;
 }
 
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     _ = engine;
     _ = worker_id;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_roster_get(engine: ?*Engine) ?*anyopaque {
@@ -108,10 +126,16 @@ export fn tm_worker_info_free(info: ?*anyopaque) void {
     _ = info;
 }
 
-export fn tm_roster_watch(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) void {
+export fn tm_roster_watch(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) u32 {
     _ = engine;
     _ = callback;
     _ = userdata;
+    return 0;
+}
+
+export fn tm_roster_unwatch(engine: ?*Engine, sub: u32) void {
+    _ = engine;
+    _ = sub;
 }
 
 // ------------------------------------------------------------------
@@ -122,7 +146,7 @@ export fn tm_pty_send(engine: ?*Engine, worker_id: u32, text: [*c]const u8) c_in
     _ = engine;
     _ = worker_id;
     _ = text;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_pty_fd(engine: ?*Engine, worker_id: u32) c_int {
@@ -140,20 +164,26 @@ export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_i
     _ = target_worker_id;
     _ = msg_type;
     _ = payload;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: [*c]const u8) c_int {
     _ = engine;
     _ = msg_type;
     _ = payload;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
-export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) void {
+export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) u32 {
     _ = engine;
     _ = callback;
     _ = userdata;
+    return 0;
+}
+
+export fn tm_message_unsubscribe(engine: ?*Engine, sub: u32) void {
+    _ = engine;
+    _ = sub;
 }
 
 // ------------------------------------------------------------------
@@ -162,7 +192,7 @@ export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const anyopaque, us
 
 export fn tm_github_auth(engine: ?*Engine) c_int {
     _ = engine;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_github_is_authed(engine: ?*Engine) bool {
@@ -186,7 +216,7 @@ export fn tm_github_merge_pr(engine: ?*Engine, pr_number: u64, strategy: c_int) 
     _ = engine;
     _ = pr_number;
     _ = strategy;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_github_get_diff(engine: ?*Engine, worker_id: u32) ?*anyopaque {
@@ -203,7 +233,7 @@ export fn tm_github_webhooks_start(engine: ?*Engine, callback: ?*const anyopaque
     _ = engine;
     _ = callback;
     _ = userdata;
-    return 0;
+    return TM_ERR_NOT_IMPLEMENTED;
 }
 
 export fn tm_github_webhooks_stop(engine: ?*Engine) void {
@@ -214,11 +244,16 @@ export fn tm_github_webhooks_stop(engine: ?*Engine) void {
 // /teammux-* command interception
 // ------------------------------------------------------------------
 
-export fn tm_commands_watch(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) c_int {
+export fn tm_commands_watch(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) u32 {
     _ = engine;
     _ = callback;
     _ = userdata;
     return 0;
+}
+
+export fn tm_commands_unwatch(engine: ?*Engine, sub: u32) void {
+    _ = engine;
+    _ = sub;
 }
 
 // ------------------------------------------------------------------
@@ -236,4 +271,24 @@ export fn tm_free_string(str: [*c]const u8) void {
 
 export fn tm_version() [*c]const u8 {
     return "0.1.0";
+}
+
+export fn tm_result_to_string(result: c_int) [*c]const u8 {
+    return switch (result) {
+        0 => "TM_OK",
+        1 => "TM_ERR_NOT_GIT",
+        2 => "TM_ERR_NO_GH",
+        3 => "TM_ERR_GH_UNAUTH",
+        4 => "TM_ERR_NO_AGENT",
+        5 => "TM_ERR_WORKTREE",
+        6 => "TM_ERR_PTY",
+        7 => "TM_ERR_CONFIG",
+        8 => "TM_ERR_BUS",
+        9 => "TM_ERR_GITHUB",
+        10 => "TM_ERR_TIMEOUT",
+        11 => "TM_ERR_INVALID_WORKER",
+        99 => "TM_ERR_UNKNOWN",
+        100 => "TM_ERR_NOT_IMPLEMENTED",
+        else => "TM_ERR_UNKNOWN",
+    };
 }
