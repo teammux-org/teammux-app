@@ -4,10 +4,10 @@
 
 | ID  | Module     | Issue                              | Stream    | Breaking | Status | Notes                                                        |
 |-----|------------|------------------------------------|-----------|----------|--------|--------------------------------------------------------------|
-| TD1 | bus.zig    | Message retry not implemented      | stream-A1 | YES      | OPEN   | tm_message_cb is void — retry needs API change               |
+| TD1 | bus.zig    | Message retry not implemented      | stream-A1 | YES      | RESOLVED | tm_message_cb returns tm_result_t, retry 3x with backoff    |
 | TD2 | github.zig | Webhook retry after 5s not done    | stream-A2 | NO       | OPEN   | Single try + log. Intent documented at line 166.             |
 | TD3 | github.zig | 60s polling fallback not done      | stream-A2 | NO       | OPEN   | Webhook failure degrades silently. TODO at line 199.         |
-| TD4 | bus.zig    | git_commit always null in messages | stream-A1 | NO       | OPEN   | Field exists in log format, rev-parse HEAD call missing.     |
+| TD4 | bus.zig    | git_commit always null in messages | stream-A1 | NO       | RESOLVED | git -C rev-parse HEAD captured before each message log      |
 
 ## Stream 3 — MergeCoordinator + Team Lead Review
 

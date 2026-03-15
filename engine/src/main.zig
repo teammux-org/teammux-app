@@ -30,7 +30,7 @@ pub const Engine = struct {
     roster_userdata: ?*anyopaque,
     config_cb: ?*const fn (?*anyopaque) callconv(.c) void,
     config_cb_userdata: ?*anyopaque,
-    msg_cb: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) void,
+    msg_cb: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int,
     msg_cb_userdata: ?*anyopaque,
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
@@ -92,7 +92,7 @@ pub const Engine = struct {
         }
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
-        self.message_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id) catch |err| {
+        self.message_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id, self.project_root) catch |err| {
             self.setError("message bus init failed") catch {};
             return err;
         };
@@ -294,7 +294,10 @@ export fn tm_pty_fd(_: ?*Engine, _: u32) c_int {
 export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_int, payload: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
     var b = &(e.message_bus orelse return 8);
-    b.send(target_worker_id, 0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8)) catch { e.setError("message send failed") catch {}; return 8; };
+    b.send(target_worker_id, 0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8)) catch |err| {
+        e.setError(if (err == error.DeliveryFailed) "message delivery failed after 4 attempts" else "message send failed") catch {};
+        return 8;
+    };
     return 0;
 }
 export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0]const u8) c_int {
@@ -303,7 +306,7 @@ export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0
     b.broadcast(0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8), &e.roster) catch { e.setError("message broadcast failed") catch {}; return 8; };
     return 0;
 }
-export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
+export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int, userdata: ?*anyopaque) u32 {
     const e = engine orelse return 0;
     e.msg_cb = callback; e.msg_cb_userdata = userdata;
     if (e.message_bus) |*b| b.subscribe(callback, userdata);

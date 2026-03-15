@@ -49,10 +49,16 @@ pub const MessageBus = struct {
     seq_counter: std.atomic.Value(u64),
     log_file: ?std.fs.File,
     log_path: []const u8,
-    subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) void,
+    project_root: []const u8,
+    subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
     subscriber_userdata: ?*anyopaque,
+    retry_delays_ns: [3]u64 = .{
+        1 * std.time.ns_per_s,
+        2 * std.time.ns_per_s,
+        4 * std.time.ns_per_s,
+    },
 
-    pub fn init(allocator: std.mem.Allocator, log_dir: []const u8, session_id: []const u8) !MessageBus {
+    pub fn init(allocator: std.mem.Allocator, log_dir: []const u8, session_id: []const u8, project_root: []const u8) !MessageBus {
         // Ensure log directory exists
         std.fs.makeDirAbsolute(log_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -76,13 +82,16 @@ pub const MessageBus = struct {
             .seq_counter = std.atomic.Value(u64).init(0),
             .log_file = file,
             .log_path = log_path,
+            .project_root = project_root,
             .subscriber_cb = null,
             .subscriber_userdata = null,
         };
     }
 
     /// Send a message to a specific worker.
-    /// Delivery: logs to JSONL, fires tm_message_cb callback to Swift.
+    /// Delivery: logs to JSONL, then fires tm_message_cb callback to Swift.
+    /// Returns error.DeliveryFailed if the callback fails after all retries.
+    /// The message is always persisted to JSONL regardless of delivery outcome.
     /// Swift is responsible for injecting text into the Ghostty SurfaceView.
     pub fn send(
         self: *MessageBus,
@@ -94,7 +103,11 @@ pub const MessageBus = struct {
         // 1. Assign sequence number atomically
         const seq = self.seq_counter.fetchAdd(1, .monotonic);
 
-        // 2. Build message
+        // 2. Capture git commit hash (TD4)
+        const git_commit = self.captureGitCommit();
+        defer if (git_commit) |c| self.allocator.free(c);
+
+        // 3. Build message
         const msg = Message{
             .from = from,
             .to = to,
@@ -102,20 +115,36 @@ pub const MessageBus = struct {
             .payload = payload,
             .timestamp = @intCast(std.time.timestamp()),
             .seq = seq,
-            .git_commit = null,
+            .git_commit = git_commit,
         };
 
-        // 3. Persist to log BEFORE delivery (guarantees log even if callback fails)
+        // 4. Persist to log BEFORE delivery (guarantees log even if callback fails)
         try self.appendLog(msg);
 
-        // 4. Fire callback to Swift for delivery.
-        // v0.1: single fire-and-forget call. Callback is void-returning per teammux.h,
-        // so there is no mechanism to detect delivery failure at this layer.
-        // v0.2: callback should return bool for retry support (3 retries, exponential backoff).
+        // 5. Fire callback to Swift for delivery with retry on failure.
+        // Initial attempt + up to 3 retries with exponential backoff (1s, 2s, 4s).
+        // On 4th failure: append FAILED line to JSONL log and return error.
         if (self.subscriber_cb) |cb| {
             var c_msg = try self.toCMessage(msg);
             defer self.freeCMessage(c_msg);
-            cb(&c_msg, self.subscriber_userdata);
+
+            var last_rc = cb(&c_msg, self.subscriber_userdata);
+            if (last_rc == 0) return; // TM_OK — delivered
+
+            // Initial attempt failed — retry up to 3 times
+            for (self.retry_delays_ns) |delay| {
+                std.log.info("[teammux] message seq={d} delivery failed (rc={d}), retrying in {d}s", .{ seq, last_rc, delay / std.time.ns_per_s });
+                std.Thread.sleep(delay);
+                last_rc = cb(&c_msg, self.subscriber_userdata);
+                if (last_rc == 0) return; // TM_OK — delivered on retry
+            }
+
+            // All retries exhausted — append FAILED audit line to log
+            std.log.info("[teammux] message seq={d} delivery FAILED after 4 attempts (last rc={d})", .{ seq, last_rc });
+            self.appendFailedLog(seq, 3) catch |err| {
+                std.log.info("[teammux] message seq={d} FAILED audit log also failed: {s}", .{ seq, @errorName(err) });
+            };
+            return error.DeliveryFailed;
         } else {
             std.log.info("[teammux] message seq={d} logged but no subscriber (undelivered)", .{seq});
         }
@@ -136,13 +165,16 @@ pub const MessageBus = struct {
         var it = roster.workers.iterator();
         while (it.next()) |entry| {
             const worker_id = entry.key_ptr.*;
-            try self.send(worker_id, from, msg_type, payload);
+            self.send(worker_id, from, msg_type, payload) catch |err| {
+                if (err == error.DeliveryFailed) continue; // per-worker failure, try others
+                return err;
+            };
         }
     }
 
     pub fn subscribe(
         self: *MessageBus,
-        callback: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) void,
+        callback: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
         userdata: ?*anyopaque,
     ) void {
         self.subscriber_cb = callback;
@@ -155,6 +187,21 @@ pub const MessageBus = struct {
 
         const file = self.log_file orelse return error.LogFileUnavailable;
         const line = try self.formatJsonLine(msg);
+        defer self.allocator.free(line);
+        try file.writeAll(line);
+        try file.writeAll("\n");
+    }
+
+    /// Append a delivery failure audit line to the JSONL log.
+    fn appendFailedLog(self: *MessageBus, seq_num: u64, retries: u32) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const file = self.log_file orelse return error.LogFileUnavailable;
+        const ts: u64 = @intCast(std.time.timestamp());
+        const line = try std.fmt.allocPrint(self.allocator,
+            \\{{"seq":{d},"delivery_status":"FAILED","retries":{d},"timestamp":{d}}}
+        , .{ seq_num, retries, ts });
         defer self.allocator.free(line);
         try file.writeAll(line);
         try file.writeAll("\n");
@@ -199,8 +246,73 @@ pub const MessageBus = struct {
     // C-compatible message struct for callbacks
     // ─────────────────────────────────────────────────────
 
+    /// Run `git -C {project_root} rev-parse HEAD` and return the commit hash.
+    /// Returns null if the command fails (not a git repo, no commits, etc.).
+    fn captureGitCommit(self: *MessageBus) ?[]const u8 {
+        var child = std.process.Child.init(
+            &.{ "git", "-C", self.project_root, "rev-parse", "HEAD" },
+            self.allocator,
+        );
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        child.spawn() catch |err| {
+            std.log.debug("[teammux] git rev-parse spawn failed: {s}", .{@errorName(err)});
+            return null;
+        };
+        const stdout = child.stdout.?;
+        const result = stdout.readToEndAlloc(self.allocator, 256) catch |err| {
+            std.log.debug("[teammux] git rev-parse stdout read failed: {s}", .{@errorName(err)});
+            _ = child.wait() catch |werr| {
+                std.log.debug("[teammux] git rev-parse cleanup failed: {s}", .{@errorName(werr)});
+            };
+            return null;
+        };
+        const term = child.wait() catch |err| {
+            std.log.debug("[teammux] git rev-parse wait failed: {s}", .{@errorName(err)});
+            self.allocator.free(result);
+            return null;
+        };
+
+        if (term != .Exited or term.Exited != 0 or result.len == 0) {
+            // Log stderr for diagnostics on failure
+            if (child.stderr) |stderr_stream| {
+                const stderr_out = stderr_stream.readToEndAlloc(self.allocator, 256) catch null;
+                if (stderr_out) |se| {
+                    defer self.allocator.free(se);
+                    const trimmed_err = std.mem.trim(u8, se, &[_]u8{ '\n', '\r', ' ' });
+                    if (trimmed_err.len > 0) {
+                        std.log.debug("[teammux] git rev-parse failed: {s}", .{trimmed_err});
+                    }
+                }
+            }
+            self.allocator.free(result);
+            return null;
+        }
+
+        const trimmed = std.mem.trim(u8, result, &[_]u8{ '\n', '\r', ' ' });
+        if (trimmed.len == 0) {
+            self.allocator.free(result);
+            return null;
+        }
+
+        const commit = self.allocator.dupe(u8, trimmed) catch |err| {
+            std.log.debug("[teammux] git rev-parse alloc failed: {s}", .{@errorName(err)});
+            self.allocator.free(result);
+            return null;
+        };
+        self.allocator.free(result);
+        return commit;
+    }
+
     fn toCMessage(self: *MessageBus, msg: Message) !CMessage {
         const payload_z = try self.allocator.dupeZ(u8, msg.payload);
+        errdefer self.allocator.free(payload_z);
+        const commit_z: ?[*:0]const u8 = if (msg.git_commit) |c| blk: {
+            const z = try self.allocator.dupeZ(u8, c);
+            break :blk z.ptr;
+        } else null;
         return .{
             .from = msg.from,
             .to = msg.to,
@@ -210,18 +322,21 @@ pub const MessageBus = struct {
             .payload = payload_z.ptr,
             .timestamp = msg.timestamp,
             .seq = msg.seq,
-            .git_commit = null,
+            .git_commit = commit_z,
         };
     }
 
     fn freeCMessage(self: *MessageBus, c_msg: CMessage) void {
         if (c_msg.payload) |p| {
-            const slice = std.mem.span(p);
-            self.allocator.free(slice);
+            self.allocator.free(std.mem.span(p));
+        }
+        if (c_msg.git_commit) |c| {
+            self.allocator.free(std.mem.span(c));
         }
     }
 
     pub const LogFileUnavailable = error{LogFileUnavailable};
+    pub const DeliveryFailed = error{DeliveryFailed};
 };
 
 /// C-compatible message struct matching tm_message_t in teammux.h.
@@ -283,7 +398,7 @@ test "bus - messages get monotonically increasing seq numbers" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "test1234");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "test1234", log_dir);
     defer b.deinit();
 
     try b.send(1, 0, .task, "\"first\"");
@@ -299,7 +414,7 @@ test "bus - log file is created and contains valid JSONL" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "jsonltest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "jsonltest", log_dir);
     defer b.deinit();
 
     try b.send(1, 0, .task, "\"hello world\"");
@@ -331,7 +446,7 @@ test "bus - log file name contains date" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "datetest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "datetest", log_dir);
     defer b.deinit();
 
     // Log path should contain a date pattern like YYYY-MM-DD
@@ -345,7 +460,7 @@ test "bus - broadcast sends to all active workers" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "bcasttest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "bcasttest", log_dir);
     defer b.deinit();
 
     var roster = worktree.Roster.init(std.testing.allocator);
@@ -387,7 +502,7 @@ test "bus - subscriber callback is fired" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "cbtest12");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "cbtest12", log_dir);
     defer b.deinit();
 
     const CallbackState = struct {
@@ -396,11 +511,12 @@ test "bus - subscriber callback is fired" {
     };
 
     const callback = struct {
-        fn cb(msg: ?*const CMessage, _: ?*anyopaque) callconv(.c) void {
+        fn cb(msg: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
             if (msg) |m| {
                 CallbackState.received = true;
                 CallbackState.received_seq = m.seq;
             }
+            return 0; // TM_OK
         }
     }.cb;
 
@@ -417,7 +533,7 @@ test "bus - delivery failure is logged not silently dropped" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "failtest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "failtest", log_dir);
     defer b.deinit();
 
     // No subscriber registered — send should still succeed (logs message)
@@ -460,4 +576,246 @@ test "bus - getDateString produces YYYY-MM-DD format" {
     try std.testing.expect(buf[0] == '2');
     try std.testing.expect(buf[4] == '-');
     try std.testing.expect(buf[7] == '-');
+}
+
+test "bus - git_commit is populated in a git repo" {
+    const alloc = std.testing.allocator;
+
+    // Set up a temp git repo with an initial commit
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    worktree.runGit(alloc, project_root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.name", "Test" }) catch return;
+
+    // Create a file and commit
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{project_root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, project_root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "commit", "-m", "initial" }) catch return;
+
+    // Create log dir inside the temp directory
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{project_root});
+    defer alloc.free(log_dir);
+
+    var b = try MessageBus.init(alloc, log_dir, "gitcommit", project_root);
+    defer b.deinit();
+
+    try b.send(1, 0, .task, "\"test message\"");
+
+    // Read the log and verify git_commit is a 40-char hex string
+    b.log_file.?.close();
+    b.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    // Should contain git_commit with a quoted hex value, not null
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":null") == null);
+    const commit_prefix = "\"git_commit\":\"";
+    const commit_start = std.mem.indexOf(u8, content, commit_prefix) orelse return error.TestUnexpectedResult;
+    const hash_start = commit_start + commit_prefix.len;
+    // Verify the git_commit value is exactly 40 hex characters followed by a quote
+    try std.testing.expect(content.len >= hash_start + 41); // 40 hex + closing quote
+    for (content[hash_start .. hash_start + 40]) |c| {
+        try std.testing.expect(std.ascii.isHex(c));
+    }
+    try std.testing.expect(content[hash_start + 40] == '"');
+}
+
+test "bus - subscriber callback receives git_commit via CMessage" {
+    const alloc = std.testing.allocator;
+
+    // Set up a temp git repo with an initial commit
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    worktree.runGit(alloc, project_root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.name", "Test" }) catch return;
+
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{project_root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, project_root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{project_root});
+    defer alloc.free(log_dir);
+
+    var b = try MessageBus.init(alloc, log_dir, "cbcommit", project_root);
+    defer b.deinit();
+
+    const State = struct {
+        var commit_received: bool = false;
+        var commit_is_hex: bool = false;
+    };
+    State.commit_received = false;
+    State.commit_is_hex = false;
+
+    const callback = struct {
+        fn cb(msg: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                if (m.git_commit) |commit_ptr| {
+                    State.commit_received = true;
+                    // Verify it looks like a hex hash
+                    const commit = std.mem.span(commit_ptr);
+                    if (commit.len >= 40) {
+                        State.commit_is_hex = true;
+                        for (commit[0..40]) |c| {
+                            if (!std.ascii.isHex(c)) {
+                                State.commit_is_hex = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return 0; // TM_OK
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    try b.send(1, 0, .task, "\"commit callback test\"");
+
+    try std.testing.expect(State.commit_received);
+    try std.testing.expect(State.commit_is_hex);
+}
+
+test "bus - git_commit is null in non-git directory" {
+    const alloc = std.testing.allocator;
+
+    // Create a temp directory under /tmp — guaranteed outside any git repo.
+    // std.testing.tmpDir creates inside .zig-cache which is inside the project
+    // git repo, so git -C would traverse upward and find the parent repo.
+    var rand_buf: [4]u8 = undefined;
+    std.crypto.random.bytes(&rand_buf);
+    var name_buf: [8]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (0..4) |i| {
+        name_buf[i * 2] = hex_chars[rand_buf[i] >> 4];
+        name_buf[i * 2 + 1] = hex_chars[rand_buf[i] & 0xf];
+    }
+    const dir_name = try std.fmt.allocPrint(alloc, "teammux-nogit-{s}", .{&name_buf});
+    defer alloc.free(dir_name);
+    const project_root = try std.fmt.allocPrint(alloc, "/tmp/{s}", .{dir_name});
+    defer alloc.free(project_root);
+
+    std.fs.makeDirAbsolute(project_root) catch return; // skip if /tmp not writable
+    defer {
+        var parent = std.fs.openDirAbsolute("/tmp", .{}) catch unreachable;
+        defer parent.close();
+        parent.deleteTree(dir_name) catch {};
+    }
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{project_root});
+    defer alloc.free(log_dir);
+
+    var b = try MessageBus.init(alloc, log_dir, "nogitcmt", project_root);
+    defer b.deinit();
+
+    try b.send(1, 0, .task, "\"no git\"");
+
+    // Read the log and verify git_commit is null
+    b.log_file.?.close();
+    b.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":null") != null);
+}
+
+test "bus - retry delivers on transient failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "retryok1", log_dir);
+    defer b.deinit();
+    b.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var call_count: u32 = 0;
+    };
+    State.call_count = 0;
+
+    const callback = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            State.call_count += 1;
+            // Fail first 2 times, succeed on 3rd (retry 2)
+            return if (State.call_count <= 2) 8 else 0; // TM_ERR_BUS then TM_OK
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    try b.send(1, 0, .task, "\"retry test\"");
+
+    // 1 initial + 2 retries = 3 calls before success
+    try std.testing.expect(State.call_count == 3);
+
+    // No FAILED line should be in the log
+    b.log_file.?.close();
+    b.log_file = null;
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_status\":\"FAILED\"") == null);
+}
+
+test "bus - retry exhaustion logs FAILED" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "retryfai", log_dir);
+    defer b.deinit();
+    b.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var call_count: u32 = 0;
+    };
+    State.call_count = 0;
+
+    const callback = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            State.call_count += 1;
+            return 8; // TM_ERR_BUS — always fail
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    try std.testing.expectError(error.DeliveryFailed, b.send(1, 0, .task, "\"will fail\""));
+
+    // 1 initial + 3 retries = 4 total calls
+    try std.testing.expect(State.call_count == 4);
+
+    // FAILED audit line should be in the log with correct seq
+    b.log_file.?.close();
+    b.log_file = null;
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_status\":\"FAILED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"retries\":3") != null);
+    // Verify seq in FAILED line matches the original message's seq (0)
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"seq\":0,\"delivery_status\":\"FAILED\"") != null);
 }
