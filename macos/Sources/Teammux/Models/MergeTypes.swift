@@ -3,8 +3,7 @@ import os
 
 // MARK: - MergeStatus
 
-/// Maps to `tm_merge_status_e` in teammux.h.
-/// PENDING=0, IN_PROGRESS=1, SUCCESS=2, CONFLICT=3, REJECTED=4
+/// Maps to `tm_merge_status_e` in teammux.h. Raw values mirror the C enum ordinals.
 enum MergeStatus: Int, CaseIterable, Sendable {
     case pending    = 0
     case inProgress = 1
@@ -51,7 +50,7 @@ enum MergeStatus: Int, CaseIterable, Sendable {
 // MARK: - ConflictInfo
 
 /// Mirrors `tm_conflict_t` in teammux.h.
-/// `ours` and `theirs` are nullable (nil for add/delete conflicts).
+/// `ours` and `theirs` are nullable — the engine may set them to NULL for certain conflict types.
 struct ConflictInfo: Identifiable, Equatable, Sendable {
     let id: UUID
     let filePath: String

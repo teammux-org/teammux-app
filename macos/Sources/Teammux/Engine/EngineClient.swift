@@ -5,15 +5,15 @@ import os
 // MARK: - MergeStrategy
 
 /// Maps to `tm_merge_strategy_t` in teammux.h.
-/// SQUASH=0, REBASE=1, MERGE=2
 enum MergeStrategy: Int, Sendable {
     case squash = 0
     case rebase = 1
     case merge  = 2
 
+    /// Integer value for `tm_github_merge_pr()` (`tm_merge_strategy_t`).
     var cValue: Int32 { Int32(rawValue) }
 
-    /// String value expected by `tm_merge_approve()`.
+    /// String value for `tm_merge_approve()` (local merge coordinator).
     var strategyString: String {
         switch self {
         case .squash: return "squash"
@@ -211,9 +211,9 @@ final class EngineClient: ObservableObject {
         roster.removeAll()
         messages.removeAll()
         worktreeReadyQueue.removeAll()
+        stopMergePolling()
         mergeStatuses.removeAll()
         pendingConflicts.removeAll()
-        stopMergePolling()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -554,8 +554,9 @@ final class EngineClient: ObservableObject {
     // MARK: - Merge Coordinator
 
     /// Approve merge of a worker's branch into main.
-    /// Wraps `tm_merge_approve()`.
-    /// Returns `true` on `TM_OK`.
+    /// Wraps `tm_merge_approve()`. Returns `true` if the engine accepted the request.
+    /// `true` does not mean the merge succeeded — check `getMergeStatus()` for the
+    /// outcome, which may be `.inProgress`, `.success`, or `.conflict`.
     func approveMerge(workerId: UInt32, strategy: MergeStrategy) -> Bool {
         guard let engine else {
             lastError = "Engine not created"
@@ -574,14 +575,16 @@ final class EngineClient: ObservableObject {
             return false
         }
 
-        mergeStatuses[workerId] = getMergeStatus(workerId: workerId)
+        let initialStatus = getMergeStatus(workerId: workerId)
+        mergeStatuses[workerId] = initialStatus
+        Self.logger.info("approveMerge: worker \(workerId) initial status: \(initialStatus.label)")
         startMergePolling()
         return true
     }
 
     /// Reject a worker's merge: abort in-progress merge, remove worktree, delete branch.
-    /// Wraps `tm_merge_reject()`.
-    /// Returns `true` on `TM_OK`.
+    /// The worker remains in the roster with a completed/dismissed status.
+    /// Wraps `tm_merge_reject()`. Returns `true` on `TM_OK`.
     func rejectMerge(workerId: UInt32) -> Bool {
         guard let engine else {
             lastError = "Engine not created"
@@ -605,8 +608,11 @@ final class EngineClient: ObservableObject {
 
     /// Get current merge status for a worker.
     /// Wraps `tm_merge_get_status()`.
+    /// Returns `.pending` if the engine is not initialized.
     func getMergeStatus(workerId: UInt32) -> MergeStatus {
         guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("getMergeStatus: engine not created")
             return .pending
         }
         let raw = tm_merge_get_status(engine, workerId)
@@ -624,6 +630,10 @@ final class EngineClient: ObservableObject {
 
         var count: UInt32 = 0
         guard let conflictsPtr = tm_merge_conflicts_get(engine, workerId, &count) else {
+            if let msg = lastEngineError() {
+                lastError = msg
+                Self.logger.error("getConflicts failed: \(msg)")
+            }
             return []
         }
 
@@ -974,7 +984,7 @@ final class EngineClient: ObservableObject {
             withTimeInterval: 2.0,
             repeats: true
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            Task { @MainActor in
                 self?.pollMergeStatuses()
             }
         }
@@ -986,8 +996,9 @@ final class EngineClient: ObservableObject {
         mergeStatusTimer = nil
     }
 
-    /// Poll merge status for all tracked workers. Updates @Published properties.
-    /// Stops the timer when no workers are in-progress.
+    /// Polls `tm_merge_get_status()` for all workers tracked in `mergeStatuses`.
+    /// Updates `mergeStatuses` and `pendingConflicts` @Published properties.
+    /// Stops the timer when no tracked worker has `.inProgress` status.
     private func pollMergeStatuses() {
         guard engine != nil else {
             stopMergePolling()
@@ -995,7 +1006,8 @@ final class EngineClient: ObservableObject {
         }
 
         var hasInProgress = false
-        for workerId in mergeStatuses.keys {
+        let trackedWorkers = Array(mergeStatuses.keys)
+        for workerId in trackedWorkers {
             let status = getMergeStatus(workerId: workerId)
             mergeStatuses[workerId] = status
 

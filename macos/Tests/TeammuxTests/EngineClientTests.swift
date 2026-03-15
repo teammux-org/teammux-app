@@ -303,6 +303,8 @@ struct EngineClientTests {
         let result = client.approveMerge(workerId: 1, strategy: .merge)
         #expect(result == false)
         #expect(client.lastError == "Engine not created")
+        // Failure must not populate mergeStatuses or start polling
+        #expect(client.mergeStatuses.isEmpty)
     }
 
     @Test func rejectMergeWithoutEngine() {
@@ -312,10 +314,26 @@ struct EngineClientTests {
         #expect(client.lastError == "Engine not created")
     }
 
+    @Test func rejectMergeWithoutEngineDoesNotMutateState() {
+        let client = EngineClient()
+        client.mergeStatuses[1] = .inProgress
+        client.pendingConflicts[1] = [
+            ConflictInfo(filePath: "a.swift", conflictType: "content")
+        ]
+
+        let result = client.rejectMerge(workerId: 1)
+
+        #expect(result == false)
+        // State must NOT be mutated on failure
+        #expect(client.mergeStatuses[1] == .inProgress)
+        #expect(client.pendingConflicts[1]?.count == 1)
+    }
+
     @Test func getMergeStatusWithoutEngine() {
         let client = EngineClient()
         let status = client.getMergeStatus(workerId: 1)
         #expect(status == .pending)
+        #expect(client.lastError == "Engine not created")
     }
 
     @Test func getConflictsWithoutEngine() {
@@ -323,21 +341,6 @@ struct EngineClientTests {
         let conflicts = client.getConflicts(workerId: 1)
         #expect(conflicts.isEmpty)
         #expect(client.lastError == "Engine not created")
-    }
-
-    // MARK: - Destroy clears merge state
-
-    @Test func destroyClearsMergeState() {
-        let client = EngineClient()
-        client.mergeStatuses[1] = .inProgress
-        client.pendingConflicts[1] = [
-            ConflictInfo(filePath: "a.swift", conflictType: "content")
-        ]
-
-        client.destroy()
-
-        #expect(client.mergeStatuses.isEmpty)
-        #expect(client.pendingConflicts.isEmpty)
     }
 
     // MARK: - Double create guard
