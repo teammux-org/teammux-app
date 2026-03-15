@@ -325,8 +325,9 @@ pub const GitHubClient = struct {
         }
 
         if (new_last_id) |nid| {
+            const new_id = allocator.dupe(u8, nid) catch return;
             if (self.last_event_id) |old| allocator.free(old);
-            self.last_event_id = allocator.dupe(u8, nid) catch null;
+            self.last_event_id = new_id;
         }
     }
 
