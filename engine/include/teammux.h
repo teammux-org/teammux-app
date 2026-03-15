@@ -277,9 +277,7 @@ void              tm_commands_unwatch(tm_engine_t* engine, tm_subscription_t sub
 const char* tm_agent_resolve(const char* agent_name);
 void        tm_free_string(const char* str);
 const char* tm_version(void);
-
-// tm_result_to_string — converts tm_result_t to human-readable string.
-// Will be implemented in Stream 2.
+const char* tm_result_to_string(tm_result_t result);
 
 #ifdef __cplusplus
 }
