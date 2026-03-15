@@ -170,7 +170,12 @@ final class EngineClient: ObservableObject {
     /// Stop the session (tears down background threads).
     /// Wraps `tm_session_stop()`.
     func sessionStop() {
-        guard let engine else { return }
+        guard let engine else {
+            #if DEBUG
+            Self.logger.debug("sessionStop called with nil engine — no-op")
+            #endif
+            return
+        }
         teardownCallbacks()
         tm_session_stop(engine)
     }
@@ -303,7 +308,10 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_roster_get()` + `tm_roster_free()`.
     func refreshRoster() {
         guard let engine else { return }
-        guard let rosterPtr = tm_roster_get(engine) else { return }
+        guard let rosterPtr = tm_roster_get(engine) else {
+            Self.logger.warning("tm_roster_get returned nil — roster may be stale")
+            return
+        }
 
         var newRoster: [WorkerInfo] = []
         let count = Int(rosterPtr.pointee.count)
@@ -781,12 +789,14 @@ final class EngineClient: ObservableObject {
         switch eventType {
         case "pull_request":
             // Refresh auth status in case a PR event indicates changes
-            if let engine {
-                if tm_github_is_authed(engine) {
-                    githubStatus = .connected("engine")
-                } else {
-                    githubStatus = .disconnected
-                }
+            guard let engine else {
+                Self.logger.warning("handleGitHubEvent: engine is nil during pull_request event")
+                return
+            }
+            if tm_github_is_authed(engine) {
+                githubStatus = .connected("engine")
+            } else {
+                githubStatus = .disconnected
             }
         default:
             Self.logger.debug("Unhandled GitHub event type: \(eventType)")

@@ -36,10 +36,10 @@ struct RosterView: View {
                                     activeWorkerId = worker.id
                                 },
                                 onDismiss: {
-                                    if activeWorkerId == worker.id {
+                                    let success = engine.dismissWorker(worker.id)
+                                    if success, activeWorkerId == worker.id {
                                         activeWorkerId = nil
                                     }
-                                    _ = engine.dismissWorker(worker.id)
                                 }
                             )
                         }

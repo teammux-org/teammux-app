@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 // MARK: - MessageType
 
@@ -14,6 +15,8 @@ enum MessageType: Int, CaseIterable, Sendable {
     case completion  = 5
     case error       = 6
     case broadcast   = 7
+
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "MessageType")
 
     /// Semantic color for Live Feed badges and message type indicators.
     var color: Color {
@@ -56,6 +59,7 @@ enum MessageType: Int, CaseIterable, Sendable {
             #if DEBUG
             assertionFailure("Unknown MessageType C value: \(value)")
             #endif
+            Self.logger.warning("Unknown MessageType C value: \(value), defaulting to .task")
             self = .task
         }
     }
@@ -169,9 +173,19 @@ enum DiffStatus: Int, Sendable {
     case deleted = 2
     case renamed = 3
 
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "DiffStatus")
+
     /// Initialise from the C enum raw value (`tm_diff_status_t`).
     init(fromCValue value: UInt32) {
-        self = DiffStatus(rawValue: Int(value)) ?? .modified
+        if let known = DiffStatus(rawValue: Int(value)) {
+            self = known
+        } else {
+            #if DEBUG
+            assertionFailure("Unknown DiffStatus C value: \(value)")
+            #endif
+            Self.logger.warning("Unknown DiffStatus C value: \(value), defaulting to .modified")
+            self = .modified
+        }
     }
 
     var label: String {

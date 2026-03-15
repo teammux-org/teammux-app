@@ -12,6 +12,7 @@ struct DiffView: View {
     @State private var selectedWorkerId: UInt32? = nil
     @State private var diffFiles: [DiffFile] = []
     @State private var isLoading = false
+    @State private var diffError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -65,6 +66,8 @@ struct DiffView: View {
             selectWorkerState
         } else if isLoading {
             loadingState
+        } else if let error = diffError {
+            diffErrorState(error)
         } else if diffFiles.isEmpty {
             noChangesState
         } else {
@@ -105,6 +108,25 @@ struct DiffView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private func diffErrorState(_ error: String) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 32))
+                .foregroundColor(.red)
+
+            Text("Failed to load diff")
+                .font(.headline)
+                .foregroundColor(.primary)
+
+            Text(error)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+
     private var noChangesState: some View {
         VStack(spacing: 12) {
             Image(systemName: "checkmark.circle")
@@ -142,12 +164,20 @@ struct DiffView: View {
     private func loadDiff(for workerId: UInt32?) {
         guard let workerId else {
             diffFiles = []
+            diffError = nil
             return
         }
 
         isLoading = true
+        diffError = nil
         Task {
-            diffFiles = engine.getDiff(for: workerId)
+            let result = engine.getDiff(for: workerId)
+            diffFiles = result
+            // If result is empty and engine reported an error, it was an API failure
+            // rather than genuinely no changes.
+            if result.isEmpty, let engineError = engine.lastError {
+                diffError = engineError
+            }
             isLoading = false
         }
     }

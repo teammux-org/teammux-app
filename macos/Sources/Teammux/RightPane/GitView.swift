@@ -84,55 +84,78 @@ struct GitWorkerRow: View {
     @ObservedObject var engine: EngineClient
 
     @State private var isCreatingPR = false
+    @State private var prError: String?
+    @State private var lastCreatedPR: GitHubPR?
 
     var body: some View {
-        HStack(spacing: 8) {
-            // Status dot
-            Circle()
-                .fill(worker.status.color)
-                .frame(width: 8, height: 8)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                // Status dot
+                Circle()
+                    .fill(worker.status.color)
+                    .frame(width: 8, height: 8)
 
-            // Branch name
-            VStack(alignment: .leading, spacing: 2) {
-                Text(worker.branchName)
-                    .font(.system(size: 12, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                // Branch name
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(worker.branchName)
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
 
-                Text(worker.name)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-            }
+                    Text(worker.name)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
 
-            Spacer()
+                Spacer()
 
-            // Open PR button
-            Button(action: {
-                createPR(for: worker)
-            }) {
-                if isCreatingPR {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Text("Open PR")
+                if let pr = lastCreatedPR {
+                    Text("PR #\(pr.number)")
                         .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.green)
+                } else {
+                    // Open PR button
+                    Button(action: {
+                        createPR(for: worker)
+                    }) {
+                        if isCreatingPR {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Open PR")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isCreatingPR)
                 }
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(isCreatingPR)
+
+            if let error = prError {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+                    .lineLimit(2)
+            }
         }
     }
 
     private func createPR(for worker: WorkerInfo) {
         isCreatingPR = true
+        prError = nil
         Task {
             let title = "\(worker.name): \(worker.taskDescription)"
-            _ = engine.createPR(
+            let pr = engine.createPR(
                 for: worker.id,
                 title: String(title.prefix(72)),
                 body: "Automated PR from Teammux worker.\n\nTask: \(worker.taskDescription)"
             )
+            if let pr {
+                lastCreatedPR = pr
+            } else {
+                prError = engine.lastError ?? "Failed to create pull request"
+            }
             isCreatingPR = false
         }
     }

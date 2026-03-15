@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 // MARK: - WorkerStatus
 
@@ -10,6 +11,8 @@ enum WorkerStatus: Int, CaseIterable, Sendable {
     case complete = 2
     case blocked  = 3
     case error    = 4
+
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "WorkerStatus")
 
     /// Semantic color for roster status dots and badges.
     var color: Color {
@@ -41,6 +44,7 @@ enum WorkerStatus: Int, CaseIterable, Sendable {
             #if DEBUG
             assertionFailure("Unknown WorkerStatus C value: \(value)")
             #endif
+            Self.logger.warning("Unknown WorkerStatus C value: \(value), defaulting to .idle")
             self = .idle
         }
     }

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import os
 
 // MARK: - ProjectManager
 
@@ -9,6 +10,10 @@ import SwiftUI
 /// The active project determines which pane content is shown.
 @MainActor
 final class ProjectManager: ObservableObject {
+
+    // MARK: - Logger
+
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "ProjectManager")
 
     // MARK: - Published state
 
@@ -101,7 +106,13 @@ final class ProjectManager: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             let gitDir = url.appendingPathComponent(".git")
             guard FileManager.default.fileExists(atPath: gitDir.path) else {
-                // Cannot show error from here — just don't add
+                Self.logger.warning("openNewProject: \(url.path) is not a git repository")
+                let alert = NSAlert()
+                alert.messageText = "Not a Git Repository"
+                alert.informativeText = "\(url.lastPathComponent) does not appear to be a git repository. Teammux requires a git repo to manage agent worktrees."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
                 return
             }
             _ = addProject(name: url.lastPathComponent, path: url)

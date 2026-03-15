@@ -179,7 +179,12 @@ struct InitiateView: View {
                 errorMessage = engine.lastError ?? "Failed to create engine"
                 projectManager.closeProject(project.id)
                 // Clean up .teammux directory
-                try? fm.removeItem(at: teammuxDir)
+                do {
+                    try fm.removeItem(at: teammuxDir)
+                } catch {
+                    // Log but don't block — the primary error is already reported
+                    print("[Teammux] Warning: failed to clean up .teammux after engine failure: \(error.localizedDescription)")
+                }
                 isInitiating = false
                 return
             }
@@ -187,7 +192,12 @@ struct InitiateView: View {
             if !engine.sessionStart() {
                 errorMessage = engine.lastError ?? "Failed to start session"
                 projectManager.closeProject(project.id)
-                try? fm.removeItem(at: teammuxDir)
+                do {
+                    try fm.removeItem(at: teammuxDir)
+                } catch {
+                    // Log but don't block — the primary error is already reported
+                    print("[Teammux] Warning: failed to clean up .teammux after session failure: \(error.localizedDescription)")
+                }
                 isInitiating = false
                 return
             }

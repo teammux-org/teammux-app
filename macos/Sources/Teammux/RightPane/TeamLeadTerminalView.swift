@@ -1,5 +1,6 @@
 import SwiftUI
 import GhosttyKit
+import os
 
 // MARK: - TeamLeadTerminalView
 
@@ -51,11 +52,14 @@ struct TeamLeadTerminalView: View {
 /// NSViewRepresentable that creates a Ghostty.SurfaceView for the Team Lead.
 /// Configured to run `claude` in the project root directory.
 struct TeamLeadSurfaceRepresentable: NSViewRepresentable {
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "TeamLeadSurfaceRepresentable")
+
     let ghosttyApp: Ghostty.App
     let projectRoot: String?
 
     func makeNSView(context: Context) -> NSView {
         guard let app = ghosttyApp.app else {
+            Self.logger.error("Ghostty app instance is nil — cannot create Team Lead terminal surface")
             return makeFallbackView()
         }
 
@@ -74,11 +78,29 @@ struct TeamLeadSurfaceRepresentable: NSViewRepresentable {
         // SurfaceView manages its own lifecycle. No update needed.
     }
 
-    /// Returns a plain black NSView as fallback when the Ghostty app is unavailable.
+    /// Returns an error NSView when the Ghostty app is unavailable,
+    /// with a centered label explaining the issue.
     private func makeFallbackView() -> NSView {
         let view = NSView()
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.black.cgColor
+        view.layer?.backgroundColor = NSColor(white: 0.1, alpha: 1.0).cgColor
+
+        let label = NSTextField(labelWithString: "Terminal unavailable — Ghostty has not initialized.")
+        label.isEditable = false
+        label.isBordered = false
+        label.drawsBackground = false
+        label.textColor = .secondaryLabelColor
+        label.alignment = .center
+        label.font = .systemFont(ofSize: 13)
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -32),
+        ])
+
         return view
     }
 }
