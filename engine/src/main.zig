@@ -1,6 +1,6 @@
 // Teammux coordination engine — entry point
 // All functions are stubs for Stream 1. Stream 2 implements the real logic.
-// Stubs return TM_ERR_NOT_IMPLEMENTED (100) to force callers to handle errors.
+// Stubs return TM_ERR_NOT_IMPLEMENTED (10) to force callers to handle errors.
 
 const std = @import("std");
 
@@ -13,16 +13,16 @@ pub const github = @import("github.zig");
 pub const commands = @import("commands.zig");
 
 // Error codes matching teammux.h
-const TM_ERR_NOT_IMPLEMENTED: c_int = 100;
-const TM_WORKER_INVALID: u32 = 0xFFFFFFFF; // UINT32_MAX
+const TM_ERR_NOT_IMPLEMENTED: c_int = 10;
 
 // Opaque engine type
 const Engine = struct {
     project_root: [*c]const u8,
 };
 
-// Global last error for tm_engine_create failures
-var global_last_error: [*c]const u8 = "engine not yet implemented (stub)";
+// Global last error for tm_engine_create failure reporting.
+// STUB: Stream 2 must store per-engine last error, not just creation error.
+var last_create_error: [*c]const u8 = "engine not yet implemented (stub)";
 
 // ------------------------------------------------------------------
 // Engine lifecycle
@@ -33,7 +33,7 @@ export fn tm_engine_create(project_root: [*c]const u8, out: ?*?*Engine) c_int {
     if (out) |p| {
         p.* = null;
     }
-    global_last_error = "engine not yet implemented (stub)";
+    last_create_error = "engine not yet implemented (stub)";
     return TM_ERR_NOT_IMPLEMENTED;
 }
 
@@ -52,7 +52,7 @@ export fn tm_session_stop(engine: ?*Engine) void {
 
 export fn tm_engine_last_error(engine: ?*Engine) [*c]const u8 {
     _ = engine;
-    return global_last_error;
+    return last_create_error;
 }
 
 // ------------------------------------------------------------------
@@ -98,7 +98,7 @@ export fn tm_worker_spawn(
     _ = agent_type;
     _ = worker_name;
     _ = task_description;
-    return TM_WORKER_INVALID;
+    return 0xFFFFFFFF; // TM_WORKER_INVALID
 }
 
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
@@ -229,15 +229,16 @@ export fn tm_diff_free(diff: ?*anyopaque) void {
     _ = diff;
 }
 
-export fn tm_github_webhooks_start(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) c_int {
+export fn tm_github_webhooks_start(engine: ?*Engine, callback: ?*const anyopaque, userdata: ?*anyopaque) u32 {
     _ = engine;
     _ = callback;
     _ = userdata;
-    return TM_ERR_NOT_IMPLEMENTED;
+    return 0;
 }
 
-export fn tm_github_webhooks_stop(engine: ?*Engine) void {
+export fn tm_github_webhooks_stop(engine: ?*Engine, sub: u32) void {
     _ = engine;
+    _ = sub;
 }
 
 // ------------------------------------------------------------------
@@ -273,7 +274,7 @@ export fn tm_version() [*c]const u8 {
     return "0.1.0";
 }
 
-export fn tm_result_to_string(result: c_int) [*c]const u8 {
+export fn tm_result_to_string(result: c_int) [*:0]const u8 {
     return switch (result) {
         0 => "TM_OK",
         1 => "TM_ERR_NOT_GIT",
@@ -285,10 +286,9 @@ export fn tm_result_to_string(result: c_int) [*c]const u8 {
         7 => "TM_ERR_CONFIG",
         8 => "TM_ERR_BUS",
         9 => "TM_ERR_GITHUB",
-        10 => "TM_ERR_TIMEOUT",
-        11 => "TM_ERR_INVALID_WORKER",
-        99 => "TM_ERR_UNKNOWN",
-        100 => "TM_ERR_NOT_IMPLEMENTED",
+        10 => "TM_ERR_NOT_IMPLEMENTED",
+        11 => "TM_ERR_TIMEOUT",
+        12 => "TM_ERR_INVALID_WORKER",
         else => "TM_ERR_UNKNOWN",
     };
 }
