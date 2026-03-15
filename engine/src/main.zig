@@ -7,6 +7,7 @@ pub const pty_mod = @import("pty.zig");
 pub const bus = @import("bus.zig");
 pub const github = @import("github.zig");
 pub const commands = @import("commands.zig");
+pub const merge = @import("merge.zig");
 
 // ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
@@ -468,4 +469,4 @@ test "tm_pty_send returns TM_ERR_NOT_IMPLEMENTED" { try std.testing.expect(tm_pt
 test "tm_pty_fd returns -1" { try std.testing.expect(tm_pty_fd(null, 0) == -1); }
 test "tm_worker_spawn returns TM_WORKER_INVALID on null engine" { try std.testing.expect(tm_worker_spawn(null, null, 0, null, null) == 0xFFFFFFFF); }
 
-test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; }
+test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; }
