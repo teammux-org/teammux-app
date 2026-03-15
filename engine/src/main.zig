@@ -92,7 +92,7 @@ pub const Engine = struct {
         }
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
-        self.message_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id) catch |err| {
+        self.message_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id, self.project_root) catch |err| {
             self.setError("message bus init failed") catch {};
             return err;
         };

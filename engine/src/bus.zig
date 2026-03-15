@@ -49,10 +49,11 @@ pub const MessageBus = struct {
     seq_counter: std.atomic.Value(u64),
     log_file: ?std.fs.File,
     log_path: []const u8,
+    project_root: []const u8,
     subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) void,
     subscriber_userdata: ?*anyopaque,
 
-    pub fn init(allocator: std.mem.Allocator, log_dir: []const u8, session_id: []const u8) !MessageBus {
+    pub fn init(allocator: std.mem.Allocator, log_dir: []const u8, session_id: []const u8, project_root: []const u8) !MessageBus {
         // Ensure log directory exists
         std.fs.makeDirAbsolute(log_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -76,6 +77,7 @@ pub const MessageBus = struct {
             .seq_counter = std.atomic.Value(u64).init(0),
             .log_file = file,
             .log_path = log_path,
+            .project_root = project_root,
             .subscriber_cb = null,
             .subscriber_userdata = null,
         };
@@ -94,7 +96,11 @@ pub const MessageBus = struct {
         // 1. Assign sequence number atomically
         const seq = self.seq_counter.fetchAdd(1, .monotonic);
 
-        // 2. Build message
+        // 2. Capture git commit hash (TD4)
+        const git_commit = self.captureGitCommit();
+        defer if (git_commit) |c| self.allocator.free(c);
+
+        // 3. Build message
         const msg = Message{
             .from = from,
             .to = to,
@@ -102,13 +108,13 @@ pub const MessageBus = struct {
             .payload = payload,
             .timestamp = @intCast(std.time.timestamp()),
             .seq = seq,
-            .git_commit = null,
+            .git_commit = git_commit,
         };
 
-        // 3. Persist to log BEFORE delivery (guarantees log even if callback fails)
+        // 4. Persist to log BEFORE delivery (guarantees log even if callback fails)
         try self.appendLog(msg);
 
-        // 4. Fire callback to Swift for delivery.
+        // 5. Fire callback to Swift for delivery.
         // v0.1: single fire-and-forget call. Callback is void-returning per teammux.h,
         // so there is no mechanism to detect delivery failure at this layer.
         // v0.2: callback should return bool for retry support (3 retries, exponential backoff).
@@ -199,8 +205,54 @@ pub const MessageBus = struct {
     // C-compatible message struct for callbacks
     // ─────────────────────────────────────────────────────
 
+    /// Run `git -C {project_root} rev-parse HEAD` and return the commit hash.
+    /// Returns null if the command fails (not a git repo, no commits, etc.).
+    fn captureGitCommit(self: *MessageBus) ?[]const u8 {
+        var child = std.process.Child.init(
+            &.{ "git", "-C", self.project_root, "rev-parse", "HEAD" },
+            self.allocator,
+        );
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch return null;
+        const stdout = child.stdout.?;
+        const result = stdout.readToEndAlloc(self.allocator, 256) catch {
+            _ = child.wait() catch {};
+            return null;
+        };
+        const term = child.wait() catch {
+            self.allocator.free(result);
+            return null;
+        };
+
+        if (term != .Exited or term.Exited != 0 or result.len == 0) {
+            self.allocator.free(result);
+            return null;
+        }
+
+        const trimmed = std.mem.trim(u8, result, &[_]u8{ '\n', '\r', ' ' });
+        if (trimmed.len == 0) {
+            self.allocator.free(result);
+            return null;
+        }
+
+        const commit = self.allocator.dupe(u8, trimmed) catch {
+            self.allocator.free(result);
+            return null;
+        };
+        self.allocator.free(result);
+        return commit;
+    }
+
     fn toCMessage(self: *MessageBus, msg: Message) !CMessage {
         const payload_z = try self.allocator.dupeZ(u8, msg.payload);
+        errdefer self.allocator.free(payload_z);
+        const commit_z: ?[*:0]const u8 = if (msg.git_commit) |c| blk: {
+            const z = try self.allocator.dupeZ(u8, c);
+            break :blk z.ptr;
+        } else null;
         return .{
             .from = msg.from,
             .to = msg.to,
@@ -210,14 +262,16 @@ pub const MessageBus = struct {
             .payload = payload_z.ptr,
             .timestamp = msg.timestamp,
             .seq = msg.seq,
-            .git_commit = null,
+            .git_commit = commit_z,
         };
     }
 
     fn freeCMessage(self: *MessageBus, c_msg: CMessage) void {
         if (c_msg.payload) |p| {
-            const slice = std.mem.span(p);
-            self.allocator.free(slice);
+            self.allocator.free(std.mem.span(p));
+        }
+        if (c_msg.git_commit) |c| {
+            self.allocator.free(std.mem.span(c));
         }
     }
 
@@ -283,7 +337,7 @@ test "bus - messages get monotonically increasing seq numbers" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "test1234");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "test1234", log_dir);
     defer b.deinit();
 
     try b.send(1, 0, .task, "\"first\"");
@@ -299,7 +353,7 @@ test "bus - log file is created and contains valid JSONL" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "jsonltest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "jsonltest", log_dir);
     defer b.deinit();
 
     try b.send(1, 0, .task, "\"hello world\"");
@@ -331,7 +385,7 @@ test "bus - log file name contains date" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "datetest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "datetest", log_dir);
     defer b.deinit();
 
     // Log path should contain a date pattern like YYYY-MM-DD
@@ -345,7 +399,7 @@ test "bus - broadcast sends to all active workers" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "bcasttest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "bcasttest", log_dir);
     defer b.deinit();
 
     var roster = worktree.Roster.init(std.testing.allocator);
@@ -387,7 +441,7 @@ test "bus - subscriber callback is fired" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "cbtest12");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "cbtest12", log_dir);
     defer b.deinit();
 
     const CallbackState = struct {
@@ -417,7 +471,7 @@ test "bus - delivery failure is logged not silently dropped" {
     const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(log_dir);
 
-    var b = try MessageBus.init(std.testing.allocator, log_dir, "failtest");
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "failtest", log_dir);
     defer b.deinit();
 
     // No subscriber registered — send should still succeed (logs message)
@@ -460,4 +514,95 @@ test "bus - getDateString produces YYYY-MM-DD format" {
     try std.testing.expect(buf[0] == '2');
     try std.testing.expect(buf[4] == '-');
     try std.testing.expect(buf[7] == '-');
+}
+
+test "bus - git_commit is populated in a git repo" {
+    const alloc = std.testing.allocator;
+
+    // Set up a temp git repo with an initial commit
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    worktree.runGit(alloc, project_root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.name", "Test" }) catch return;
+
+    // Create a file and commit
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{project_root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, project_root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "commit", "-m", "initial" }) catch return;
+
+    // Create log dir inside the temp directory
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{project_root});
+    defer alloc.free(log_dir);
+
+    var b = try MessageBus.init(alloc, log_dir, "gitcommit", project_root);
+    defer b.deinit();
+
+    try b.send(1, 0, .task, "\"test message\"");
+
+    // Read the log and verify git_commit is a 40-char hex string
+    b.log_file.?.close();
+    b.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    // Should contain git_commit with a quoted hex value, not null
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":\"") != null);
+}
+
+test "bus - git_commit is null in non-git directory" {
+    const alloc = std.testing.allocator;
+
+    // Create a temp directory under /tmp — guaranteed outside any git repo.
+    // std.testing.tmpDir creates inside .zig-cache which is inside the project
+    // git repo, so git -C would traverse upward and find the parent repo.
+    var rand_buf: [4]u8 = undefined;
+    std.crypto.random.bytes(&rand_buf);
+    var name_buf: [8]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (0..4) |i| {
+        name_buf[i * 2] = hex_chars[rand_buf[i] >> 4];
+        name_buf[i * 2 + 1] = hex_chars[rand_buf[i] & 0xf];
+    }
+    const dir_name = try std.fmt.allocPrint(alloc, "teammux-nogit-{s}", .{&name_buf});
+    defer alloc.free(dir_name);
+    const project_root = try std.fmt.allocPrint(alloc, "/tmp/{s}", .{dir_name});
+    defer alloc.free(project_root);
+
+    std.fs.makeDirAbsolute(project_root) catch return; // skip if /tmp not writable
+    defer {
+        var parent = std.fs.openDirAbsolute("/tmp", .{}) catch unreachable;
+        defer parent.close();
+        parent.deleteTree(dir_name) catch {};
+    }
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{project_root});
+    defer alloc.free(log_dir);
+
+    var b = try MessageBus.init(alloc, log_dir, "nogitcmt", project_root);
+    defer b.deinit();
+
+    try b.send(1, 0, .task, "\"no git\"");
+
+    // Read the log and verify git_commit is null
+    b.log_file.?.close();
+    b.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(b.log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":null") != null);
 }
