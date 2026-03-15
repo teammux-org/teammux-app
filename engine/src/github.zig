@@ -151,22 +151,15 @@ pub const GitHubClient = struct {
         allocator: std.mem.Allocator,
         branch: []const u8,
     ) !Diff {
-        const repo = self.repo orelse return error.NoRepo;
-
-        const endpoint = try std.fmt.allocPrint(allocator, "/repos/{s}/compare/main...{s}", .{ repo, branch });
-        defer allocator.free(endpoint);
-
-        const result = try runGhCommand(allocator, &.{ "api", endpoint });
-        defer allocator.free(result);
-
-        // TODO(v0.2): parse the JSON response for file changes
-        // For v0.1, return empty diff — the data is fetched but not yet parsed
-        return .{
-            .files = &.{},
-            .total_additions = 0,
-            .total_deletions = 0,
-        };
+        _ = self;
+        _ = allocator;
+        _ = branch;
+        // TODO(v0.2): fetch and parse the GitHub compare API response.
+        // For v0.1, diff parsing is not implemented.
+        return error.NotImplemented;
     }
+
+    pub const NotImplemented = error{NotImplemented};
 
     /// Start gh webhook forward for real-time GitHub events.
     /// Option (c): gh not in PATH → immediate fallback.
@@ -244,9 +237,18 @@ pub fn readGhCliToken(allocator: std.mem.Allocator) !?[]const u8 {
     const path = try std.fmt.allocPrint(allocator, "{s}/.config/gh/hosts.yml", .{home});
     defer allocator.free(path);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null, // gh not installed — expected, silent
+        else => {
+            std.log.warn("[teammux] cannot read gh CLI token at {s}: {}", .{ path, err });
+            return null;
+        },
+    };
     defer file.close();
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
+    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        std.log.warn("[teammux] cannot read gh CLI token file: {}", .{err});
+        return null;
+    };
     defer allocator.free(content);
 
     // Simple YAML parsing: find "oauth_token: " value

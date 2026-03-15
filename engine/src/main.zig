@@ -145,6 +145,15 @@ const CDiff = extern struct {
     files: ?[*]CDiffFile, count: u32, total_additions: i32, total_deletions: i32,
 };
 
+// Comptime ABI safety: verify extern struct sizes match expected C layout.
+// If a field is added/removed in teammux.h without updating Zig, this fails at build time.
+comptime {
+    // CWorkerInfo: u32(4) + pad(4) + 5 ptrs(40) + 2 c_int(8) + 2 ptrs(16) + u64(8) = 80... actual 72
+    if (@sizeOf(CWorkerInfo) != 72) @compileError("CWorkerInfo size mismatch with tm_worker_info_t");
+    // CMessage (bus.zig): u32 + u32 + c_int + ptr + u64 + u64 + ptr = 48 bytes on arm64
+    if (@sizeOf(bus.CMessage) != 48) @compileError("CMessage size mismatch with tm_message_t");
+}
+
 var last_create_error: [*:0]const u8 = "no error";
 
 // ─── Engine lifecycle ────────────────────────────────────
@@ -159,7 +168,12 @@ export fn tm_engine_create(project_root: ?[*:0]const u8, out: ?*?*Engine) c_int 
 export fn tm_engine_destroy(engine: ?*Engine) void { if (engine) |e| e.destroy(); }
 export fn tm_session_start(engine: ?*Engine) c_int {
     const e = engine orelse return 99;
-    e.sessionStart() catch { return 99; };
+    // sessionStart sets last_error with specific message before returning
+    e.sessionStart() catch |err| return switch (err) {
+        error.FileNotFound => 7, // TM_ERR_CONFIG — config file missing
+        error.OutOfMemory => 99,
+        else => 99,
+    };
     return 0;
 }
 export fn tm_session_stop(engine: ?*Engine) void { if (engine) |e| e.sessionStop(); }
@@ -268,8 +282,12 @@ export fn tm_roster_unwatch(engine: ?*Engine, sub: u32) void {
 
 // ─── PTY (deprecated — Ghostty owns PTY) ─────────────────
 
-export fn tm_pty_send(_: ?*Engine, _: u32, _: ?[*:0]const u8) c_int { return 99; }
-export fn tm_pty_fd(_: ?*Engine, _: u32) c_int { return -1; }
+export fn tm_pty_send(_: ?*Engine, _: u32, _: ?[*:0]const u8) c_int {
+    return 10; // TM_ERR_NOT_IMPLEMENTED — PTY owned by Ghostty SurfaceView
+}
+export fn tm_pty_fd(_: ?*Engine, _: u32) c_int {
+    return -1; // PTY owned by Ghostty SurfaceView
+}
 
 // ─── Message bus ─────────────────────────────────────────
 
@@ -301,15 +319,24 @@ export fn tm_message_unsubscribe(engine: ?*Engine, sub: u32) void {
 
 export fn tm_github_auth(engine: ?*Engine) c_int {
     const e = engine orelse return 99;
-    e.github_client.auth(if (e.cfg) |cfg| cfg.github_token else null) catch return 3;
+    e.github_client.auth(if (e.cfg) |cfg| cfg.github_token else null) catch {
+        e.setError("GitHub auth failed: run `gh auth login` or set [github] token in config.toml") catch {};
+        return 3; // TM_ERR_GH_UNAUTH
+    };
     return 0;
 }
 export fn tm_github_is_authed(engine: ?*Engine) bool { return if (engine) |e| e.github_client.isAuthed() else false; }
 export fn tm_github_create_pr(engine: ?*Engine, worker_id: u32, title: ?[*:0]const u8, body: ?[*:0]const u8) ?*CPr {
     const e = engine orelse return null;
-    const w = e.roster.getWorker(worker_id) orelse return null;
+    const w = e.roster.getWorker(worker_id) orelse {
+        e.setError("PR creation failed: worker not found") catch {};
+        return null;
+    };
     const alloc = e.allocator;
-    const pr = e.github_client.createPr(alloc, w.branch_name, std.mem.span(title orelse return null), std.mem.span(body orelse return null)) catch return null;
+    const pr = e.github_client.createPr(alloc, w.branch_name, std.mem.span(title orelse return null), std.mem.span(body orelse return null)) catch {
+        e.setError("PR creation failed: gh CLI error") catch {};
+        return null;
+    };
     const c_pr = alloc.create(CPr) catch return null;
     const url_z = alloc.dupeZ(u8, pr.url) catch { alloc.destroy(c_pr); return null; };
     const title_z = alloc.dupeZ(u8, pr.title) catch { alloc.free(url_z); alloc.destroy(c_pr); return null; };
@@ -323,21 +350,32 @@ export fn tm_pr_free(pr: ?*CPr) void {
 }
 export fn tm_github_merge_pr(engine: ?*Engine, pr_number: u64, strategy: c_int) c_int {
     const e = engine orelse return 99;
-    e.github_client.mergePr(e.allocator, pr_number, @enumFromInt(strategy)) catch return 9;
+    e.github_client.mergePr(e.allocator, pr_number, @enumFromInt(strategy)) catch {
+        e.setError("PR merge failed: gh CLI error") catch {};
+        return 9; // TM_ERR_GITHUB
+    };
     return 0;
 }
 export fn tm_github_get_diff(engine: ?*Engine, worker_id: u32) ?*CDiff {
     const e = engine orelse return null;
-    const w = e.roster.getWorker(worker_id) orelse return null;
-    const diff = e.github_client.getDiff(e.allocator, w.branch_name) catch return null;
-    const c_diff = e.allocator.create(CDiff) catch return null;
-    c_diff.* = .{ .files = null, .count = @intCast(diff.files.len), .total_additions = diff.total_additions, .total_deletions = diff.total_deletions };
-    return c_diff;
+    const w = e.roster.getWorker(worker_id) orelse {
+        e.setError("diff failed: worker not found") catch {};
+        return null;
+    };
+    _ = e.github_client.getDiff(e.allocator, w.branch_name) catch {
+        // getDiff returns NotImplemented in v0.1 — this is expected
+        e.setError("diff view not yet available (v0.2)") catch {};
+        return null;
+    };
+    unreachable; // getDiff always returns error.NotImplemented in v0.1
 }
 export fn tm_diff_free(diff: ?*CDiff) void { if (diff) |d| std.heap.c_allocator.destroy(d); }
 export fn tm_github_webhooks_start(engine: ?*Engine, callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
     const e = engine orelse return 0;
-    e.github_client.startWebhooks(e.allocator, callback, userdata) catch return 0;
+    e.github_client.startWebhooks(e.allocator, callback, userdata) catch {
+        e.setError("webhook forward failed") catch {};
+        return 0;
+    };
     return e.nextSubId();
 }
 export fn tm_github_webhooks_stop(engine: ?*Engine, sub: u32) void { _ = sub; if (engine) |e| e.github_client.stopWebhooks(); }
@@ -423,7 +461,7 @@ test "engine create with null returns error" {
     try std.testing.expect(engine_ptr == null);
 }
 
-test "tm_pty_send returns TM_ERR_UNKNOWN" { try std.testing.expect(tm_pty_send(null, 0, null) == 99); }
+test "tm_pty_send returns TM_ERR_NOT_IMPLEMENTED" { try std.testing.expect(tm_pty_send(null, 0, null) == 10); }
 test "tm_pty_fd returns -1" { try std.testing.expect(tm_pty_fd(null, 0) == -1); }
 test "tm_worker_spawn returns TM_WORKER_INVALID on null engine" { try std.testing.expect(tm_worker_spawn(null, null, 0, null, null) == 0xFFFFFFFF); }
 

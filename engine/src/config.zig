@@ -159,6 +159,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
             } else if (std.mem.eql(u8, section_name, "bus")) {
                 current_section = .bus;
             } else {
+                std.log.warn("[teammux] config: unknown section [{s}], keys will be ignored", .{section_name});
                 current_section = .none;
             }
             continue;
@@ -695,6 +696,39 @@ test "config - local override merges correctly" {
     try std.testing.expectEqualStrings("claude-sonnet-4-6", cfg.team_lead.model);
     // Non-overridden values kept from base
     try std.testing.expectEqualStrings("full", cfg.team_lead.permissions);
+}
+
+test "config - override back to default value works" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Base config has non-default model
+    const base =
+        \\[project]
+        \\name = "default-override"
+        \\
+        \\[team_lead]
+        \\model = "gpt-5"
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "config.toml", .data = base });
+
+    // Override sets model back to the default value
+    const override =
+        \\[team_lead]
+        \\model = "claude-opus-4-6"
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "config.local.toml", .data = override });
+
+    const base_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "config.toml");
+    defer std.testing.allocator.free(base_path);
+    const override_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "config.local.toml");
+    defer std.testing.allocator.free(override_path);
+
+    var cfg = try loadWithOverrides(std.testing.allocator, base_path, override_path);
+    defer cfg.deinit(std.testing.allocator);
+
+    // Override to default value must be applied (not ignored)
+    try std.testing.expectEqualStrings("claude-opus-4-6", cfg.team_lead.model);
 }
 
 test "config - load with missing override file" {

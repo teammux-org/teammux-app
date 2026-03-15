@@ -108,25 +108,15 @@ pub const MessageBus = struct {
         // 3. Persist to log BEFORE delivery (guarantees log even if callback fails)
         try self.appendLog(msg);
 
-        // 4. Fire callback to Swift for delivery
-        // v0.1: 3 retries, exponential backoff. 30s configurable timeout deferred to v0.2.
+        // 4. Fire callback to Swift for delivery.
+        // v0.1: single fire-and-forget call. Callback is void-returning per teammux.h,
+        // so there is no mechanism to detect delivery failure at this layer.
+        // v0.2: callback should return bool for retry support (3 retries, exponential backoff).
         if (self.subscriber_cb) |cb| {
             var c_msg = try self.toCMessage(msg);
             defer self.freeCMessage(c_msg);
-
-            var delivered = false;
-            var attempt: u8 = 0;
-            while (attempt < 3) : (attempt += 1) {
-                cb(&c_msg, self.subscriber_userdata);
-                delivered = true;
-                break;
-            }
-
-            if (!delivered) {
-                std.log.warn("[teammux] message seq={d} delivery failed after 3 attempts", .{seq});
-            }
+            cb(&c_msg, self.subscriber_userdata);
         } else {
-            // No subscriber registered — log as undelivered
             std.log.info("[teammux] message seq={d} logged but no subscriber (undelivered)", .{seq});
         }
     }
@@ -171,32 +161,29 @@ pub const MessageBus = struct {
     }
 
     fn formatJsonLine(self: *MessageBus, msg: Message) ![]u8 {
+        // Validate payload is valid JSON. If not, wrap it as a JSON string.
+        // This prevents malformed JSONL when callers pass plain text.
+        const payload = if (msg.payload.len > 0 and (msg.payload[0] == '{' or msg.payload[0] == '[' or msg.payload[0] == '"'))
+            msg.payload
+        else blk: {
+            // Wrap bare text as a JSON string
+            const wrapped = try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{msg.payload});
+            break :blk wrapped;
+        };
+        const payload_is_wrapped = payload.ptr != msg.payload.ptr;
+        defer if (payload_is_wrapped) self.allocator.free(payload);
+
         const commit_str = if (msg.git_commit) |c| c else "null";
         const has_commit = msg.git_commit != null;
 
         if (has_commit) {
             return std.fmt.allocPrint(self.allocator,
                 \\{{"seq":{d},"from":{d},"to":{d},"type":"{s}","timestamp":{d},"git_commit":"{s}","payload":{s}}}
-            , .{
-                msg.seq,
-                msg.from,
-                msg.to,
-                msg.msg_type.toString(),
-                msg.timestamp,
-                commit_str,
-                msg.payload,
-            });
+            , .{ msg.seq, msg.from, msg.to, msg.msg_type.toString(), msg.timestamp, commit_str, payload });
         } else {
             return std.fmt.allocPrint(self.allocator,
                 \\{{"seq":{d},"from":{d},"to":{d},"type":"{s}","timestamp":{d},"git_commit":null,"payload":{s}}}
-            , .{
-                msg.seq,
-                msg.from,
-                msg.to,
-                msg.msg_type.toString(),
-                msg.timestamp,
-                msg.payload,
-            });
+            , .{ msg.seq, msg.from, msg.to, msg.msg_type.toString(), msg.timestamp, payload });
         }
     }
 
