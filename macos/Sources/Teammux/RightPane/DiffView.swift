@@ -163,6 +163,14 @@ struct DiffFileView: View {
         VStack(alignment: .leading, spacing: 4) {
             // File header
             HStack {
+                Text(file.status.label)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(file.status.color)
+                    .cornerRadius(3)
+
                 Text(file.filePath)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .lineLimit(1)

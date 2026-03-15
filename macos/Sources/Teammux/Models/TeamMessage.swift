@@ -102,12 +102,29 @@ struct TeamMessage: Identifiable, Equatable, Sendable {
 // MARK: - PRState
 
 /// Type-safe representation of a GitHub PR's state.
-enum PRState: String, Sendable {
+/// Maps to `tm_pr_state_t` in teammux.h: TM_PR_OPEN=0, TM_PR_CLOSED=1, TM_PR_MERGED=2
+enum PRState: Sendable {
     case open, closed, merged
     case unknown
 
+    /// Initialise from the C enum raw value (`tm_pr_state_t`).
+    init(fromCValue value: UInt32) {
+        switch value {
+        case 0: self = .open
+        case 1: self = .closed
+        case 2: self = .merged
+        default: self = .unknown
+        }
+    }
+
+    /// Legacy initialiser from string (used in tests / fallback).
     init(from string: String) {
-        self = PRState(rawValue: string.lowercased()) ?? .unknown
+        switch string.lowercased() {
+        case "open":   self = .open
+        case "closed": self = .closed
+        case "merged": self = .merged
+        default:       self = .unknown
+        }
     }
 
     var label: String {
@@ -135,9 +152,45 @@ struct GitHubPR: Identifiable, Sendable {
     let url: String
     let title: String
     let state: PRState
+    let diffUrl: String
+    let workerId: UInt32
 
     /// `Identifiable` conformance keyed on PR number.
     var id: UInt64 { number }
+}
+
+// MARK: - DiffStatus
+
+/// Maps to `tm_diff_status_t` in teammux.h.
+/// TM_DIFF_ADDED=0, TM_DIFF_MODIFIED=1, TM_DIFF_DELETED=2, TM_DIFF_RENAMED=3
+enum DiffStatus: Int, Sendable {
+    case added = 0
+    case modified = 1
+    case deleted = 2
+    case renamed = 3
+
+    /// Initialise from the C enum raw value (`tm_diff_status_t`).
+    init(fromCValue value: UInt32) {
+        self = DiffStatus(rawValue: Int(value)) ?? .modified
+    }
+
+    var label: String {
+        switch self {
+        case .added: return "Added"
+        case .modified: return "Modified"
+        case .deleted: return "Deleted"
+        case .renamed: return "Renamed"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .added: return .green
+        case .modified: return .orange
+        case .deleted: return .red
+        case .renamed: return .blue
+        }
+    }
 }
 
 // MARK: - DiffFile
@@ -146,6 +199,7 @@ struct GitHubPR: Identifiable, Sendable {
 struct DiffFile: Identifiable, Equatable, Sendable {
     let id: UUID
     let filePath: String
+    let status: DiffStatus
     let additions: Int
     let deletions: Int
     let patch: String
@@ -153,12 +207,14 @@ struct DiffFile: Identifiable, Equatable, Sendable {
     init(
         id: UUID = UUID(),
         filePath: String,
+        status: DiffStatus = .modified,
         additions: Int,
         deletions: Int,
         patch: String
     ) {
         self.id = id
         self.filePath = filePath
+        self.status = status
         self.additions = additions
         self.deletions = deletions
         self.patch = patch

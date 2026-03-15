@@ -115,6 +115,7 @@ struct WorkerInfoTests {
             status: status,
             agentType: .claudeCode,
             agentBinary: "claude",
+            model: "claude-sonnet-4-6",
             spawnedAt: Date()
         )
     }
@@ -122,10 +123,12 @@ struct WorkerInfoTests {
     @Test func workerInfoEqualityByAllFields() {
         let w1 = WorkerInfo(id: 1, name: "A", taskDescription: "t", branchName: "b",
                            worktreePath: "/p", status: .idle, agentType: .claudeCode,
-                           agentBinary: "claude", spawnedAt: Date(timeIntervalSince1970: 0))
+                           agentBinary: "claude", model: "claude-sonnet-4-6",
+                           spawnedAt: Date(timeIntervalSince1970: 0))
         let w2 = WorkerInfo(id: 1, name: "B", taskDescription: "t2", branchName: "b2",
                            worktreePath: "/p2", status: .working, agentType: .codexCli,
-                           agentBinary: "codex", spawnedAt: Date(timeIntervalSince1970: 100))
+                           agentBinary: "codex", model: "gpt-4",
+                           spawnedAt: Date(timeIntervalSince1970: 100))
         // Now that we use synthesized Equatable, different fields = not equal
         #expect(w1 != w2)
     }
@@ -134,10 +137,12 @@ struct WorkerInfoTests {
         let date = Date(timeIntervalSince1970: 1000)
         let w1 = WorkerInfo(id: 1, name: "A", taskDescription: "t", branchName: "b",
                            worktreePath: "/p", status: .idle, agentType: .claudeCode,
-                           agentBinary: "claude", spawnedAt: date)
+                           agentBinary: "claude", model: "claude-sonnet-4-6",
+                           spawnedAt: date)
         let w2 = WorkerInfo(id: 1, name: "A", taskDescription: "t", branchName: "b",
                            worktreePath: "/p", status: .idle, agentType: .claudeCode,
-                           agentBinary: "claude", spawnedAt: date)
+                           agentBinary: "claude", model: "claude-sonnet-4-6",
+                           spawnedAt: date)
         #expect(w1 == w2)
     }
 
@@ -265,7 +270,9 @@ struct GitHubPRTests {
             number: 42,
             url: "https://github.com/org/repo/pull/42",
             title: "Add feature",
-            state: .open
+            state: .open,
+            diffUrl: "https://github.com/org/repo/pull/42.diff",
+            workerId: 1
         )
         #expect(pr.id == 42)
         #expect(pr.number == 42)
@@ -276,11 +283,15 @@ struct GitHubPRTests {
             number: 100,
             url: "https://github.com/org/repo/pull/100",
             title: "Fix bug",
-            state: .closed
+            state: .closed,
+            diffUrl: "https://github.com/org/repo/pull/100.diff",
+            workerId: 3
         )
         #expect(pr.url == "https://github.com/org/repo/pull/100")
         #expect(pr.title == "Fix bug")
         #expect(pr.state == .closed)
+        #expect(pr.diffUrl == "https://github.com/org/repo/pull/100.diff")
+        #expect(pr.workerId == 3)
     }
 }
 
@@ -292,12 +303,14 @@ struct DiffFileTests {
     @Test func diffFileUniqueId() {
         let d1 = DiffFile(
             filePath: "src/main.swift",
+            status: .modified,
             additions: 10,
             deletions: 5,
             patch: "@@ -1,5 +1,10 @@"
         )
         let d2 = DiffFile(
             filePath: "src/main.swift",
+            status: .modified,
             additions: 10,
             deletions: 5,
             patch: "@@ -1,5 +1,10 @@"
@@ -309,14 +322,53 @@ struct DiffFileTests {
     @Test func diffFileFieldAccess() {
         let d = DiffFile(
             filePath: "README.md",
+            status: .added,
             additions: 3,
             deletions: 1,
             patch: "patch content"
         )
         #expect(d.filePath == "README.md")
+        #expect(d.status == .added)
         #expect(d.additions == 3)
         #expect(d.deletions == 1)
         #expect(d.patch == "patch content")
+    }
+
+    @Test func diffFileDefaultStatus() {
+        // status defaults to .modified when not specified
+        let d = DiffFile(
+            filePath: "test.swift",
+            additions: 0,
+            deletions: 0,
+            patch: ""
+        )
+        #expect(d.status == .modified)
+    }
+}
+
+// MARK: - DiffStatus Tests
+
+@Suite
+struct DiffStatusTests {
+
+    @Test func diffStatusFromCValue() {
+        #expect(DiffStatus(fromCValue: 0) == .added)
+        #expect(DiffStatus(fromCValue: 1) == .modified)
+        #expect(DiffStatus(fromCValue: 2) == .deleted)
+        #expect(DiffStatus(fromCValue: 3) == .renamed)
+    }
+
+    @Test func diffStatusFromCValueUnknown() {
+        // Unknown values should fall back to .modified
+        #expect(DiffStatus(fromCValue: 4) == .modified)
+        #expect(DiffStatus(fromCValue: 99) == .modified)
+    }
+
+    @Test func diffStatusLabels() {
+        #expect(DiffStatus.added.label == "Added")
+        #expect(DiffStatus.modified.label == "Modified")
+        #expect(DiffStatus.deleted.label == "Deleted")
+        #expect(DiffStatus.renamed.label == "Renamed")
     }
 }
 
@@ -594,5 +646,16 @@ struct PRStateTests {
         #expect(PRState(from: "merged") == .merged)
         #expect(PRState(from: "OPEN") == .open)  // case insensitive
         #expect(PRState(from: "banana") == .unknown)
+    }
+
+    @Test func prStateFromCValue() {
+        #expect(PRState(fromCValue: 0) == .open)
+        #expect(PRState(fromCValue: 1) == .closed)
+        #expect(PRState(fromCValue: 2) == .merged)
+    }
+
+    @Test func prStateFromCValueUnknown() {
+        #expect(PRState(fromCValue: 3) == .unknown)
+        #expect(PRState(fromCValue: 99) == .unknown)
     }
 }

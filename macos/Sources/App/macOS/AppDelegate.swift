@@ -95,6 +95,12 @@ class AppDelegate: NSObject,
     /// Strong reference to the Teammux workspace window.
     private var teammuxWindow: NSWindow?
 
+    /// The workspace window controller (owns the window lifecycle).
+    private var workspaceWindowController: WorkspaceWindowController?
+
+    /// Manages saved/recent projects for the setup flow.
+    private let projectManager = ProjectManager()
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -1043,26 +1049,19 @@ class AppDelegate: NSObject,
 
     private func openTeammuxWindow() {
         Self.logger.info("Opening Teammux workspace window")
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1400, height: 900),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
+        let controller = WorkspaceWindowController(
+            ghosttyApp: ghostty,
+            projectManager: projectManager
         )
-        window.title = "Teammux"
-        window.isReleasedWhenClosed = false
-        window.center()
-        window.contentViewController = NSHostingController(
-            rootView: Text("Teammux loading...").frame(maxWidth: .infinity, maxHeight: .infinity)
-        )
-        window.makeKeyAndOrderFront(nil)
-        self.teammuxWindow = window
+        controller.showWindow(nil)
+        workspaceWindowController = controller
+        teammuxWindow = controller.window
 
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(teammuxWindowWillClose(_:)),
             name: NSWindow.willCloseNotification,
-            object: window
+            object: controller.window
         )
         Self.logger.info("Teammux workspace window opened")
     }
@@ -1072,6 +1071,7 @@ class AppDelegate: NSObject,
         NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: notification.object)
         teammuxWindowOpen = false
         teammuxWindow = nil
+        workspaceWindowController = nil
     }
 
     private struct DerivedConfig {

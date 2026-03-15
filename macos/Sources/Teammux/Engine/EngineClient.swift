@@ -61,6 +61,14 @@ final class EngineClient: ObservableObject {
     /// to avoid coupling this file to Ghostty types).
     private var surfaceViews: [UInt32: AnyObject] = [:]
 
+    /// Subscription handles returned by watch/subscribe calls.
+    /// Stored so we can unwatch/unsubscribe in teardownCallbacks().
+    private var rosterSubscription: UInt32 = 0
+    private var messageSubscription: UInt32 = 0
+    private var commandSubscription: UInt32 = 0
+    private var githubSubscription: UInt32 = 0
+    private var configSubscription: UInt32 = 0
+
     // MARK: - Surface registry
 
     /// Register a SurfaceView for a given worker so the message bus
@@ -112,7 +120,7 @@ final class EngineClient: ObservableObject {
     // MARK: - Engine lifecycle
 
     /// Create the engine for a given project root directory.
-    /// Wraps `tm_engine_create()`.
+    /// Wraps `tm_engine_create()` which uses an out-param pattern.
     /// Returns `true` on success, `false` if creation fails.
     func create(projectRoot: String) -> Bool {
         guard engine == nil else {
@@ -121,17 +129,18 @@ final class EngineClient: ObservableObject {
             return false
         }
 
-        let ptr = projectRoot.withCString { cRoot in
-            tm_engine_create(cRoot)
+        var ptr: OpaquePointer?
+        let result = projectRoot.withCString { cRoot in
+            tm_engine_create(cRoot, &ptr)
         }
 
-        guard let ptr else {
-            lastError = "tm_engine_create returned nil"
-            Self.logger.error("tm_engine_create returned nil")
+        guard result == TM_OK, let enginePtr = ptr else {
+            lastError = lastEngineError() ?? "tm_engine_create failed (\(result.rawValue))"
+            Self.logger.error("tm_engine_create failed: \(self.lastError ?? "unknown")")
             return false
         }
 
-        engine = ptr
+        engine = enginePtr
         self.projectRoot = projectRoot
         return true
     }
@@ -162,6 +171,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_session_stop()`.
     func sessionStop() {
         guard let engine else { return }
+        teardownCallbacks()
         tm_session_stop(engine)
     }
 
@@ -233,11 +243,11 @@ final class EngineClient: ObservableObject {
             }
         }
 
-        if workerId == 0 {
+        if workerId == UInt32.max {  // TM_WORKER_INVALID
             let msg = lastEngineError() ?? "tm_worker_spawn failed"
             lastError = msg
             Self.logger.error("spawnWorker failed: \(msg)")
-            return 0
+            return 0  // Return 0 to callers as "failed"
         }
 
         // Query the fresh worker info to get the worktree path
@@ -312,6 +322,7 @@ final class EngineClient: ObservableObject {
                     binaryName: String(cString: w.agent_binary)
                 ),
                 agentBinary: String(cString: w.agent_binary),
+                model: String(cString: w.model),
                 spawnedAt: Date(timeIntervalSince1970: TimeInterval(w.spawned_at))
             )
             newRoster.append(info)
@@ -440,7 +451,9 @@ final class EngineClient: ObservableObject {
             number: prPtr.pointee.pr_number,
             url: String(cString: prPtr.pointee.pr_url),
             title: String(cString: prPtr.pointee.title),
-            state: PRState(from: String(cString: prPtr.pointee.state))
+            state: PRState(fromCValue: prPtr.pointee.state.rawValue),
+            diffUrl: String(cString: prPtr.pointee.diff_url),
+            workerId: prPtr.pointee.worker_id
         )
 
         tm_pr_free(prPtr)
@@ -497,6 +510,7 @@ final class EngineClient: ObservableObject {
             let f = diffPtr.pointee.files[i]
             let file = DiffFile(
                 filePath: String(cString: f.file_path),
+                status: DiffStatus(fromCValue: f.status.rawValue),
                 additions: Int(f.additions),
                 deletions: Int(f.deletions),
                 patch: String(cString: f.patch)
@@ -523,7 +537,7 @@ final class EngineClient: ObservableObject {
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         // --- Roster changes ---
-        tm_roster_watch(engine, { rosterPtr, userdata in
+        rosterSubscription = tm_roster_watch(engine, { rosterPtr, userdata in
             guard let userdata else {
                 Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("roster_watch: nil userdata")
                 return
@@ -550,6 +564,7 @@ final class EngineClient: ObservableObject {
                         binaryName: String(cString: w.agent_binary)
                     ),
                     agentBinary: String(cString: w.agent_binary),
+                    model: String(cString: w.model),
                     spawnedAt: Date(timeIntervalSince1970: TimeInterval(w.spawned_at))
                 )
                 workers.append(info)
@@ -562,7 +577,7 @@ final class EngineClient: ObservableObject {
         }, selfPtr)
 
         // --- Message subscription ---
-        tm_message_subscribe(engine, { messagePtr, userdata in
+        messageSubscription = tm_message_subscribe(engine, { messagePtr, userdata in
             guard let userdata else {
                 Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("message_subscribe: nil userdata")
                 return
@@ -601,7 +616,7 @@ final class EngineClient: ObservableObject {
         }, selfPtr)
 
         // --- Command interception (/teammux-*) ---
-        tm_commands_watch(engine, { commandPtr, argsPtr, userdata in
+        commandSubscription = tm_commands_watch(engine, { commandPtr, argsPtr, userdata in
             guard let userdata else {
                 Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("commands_watch: nil userdata")
                 return
@@ -624,7 +639,7 @@ final class EngineClient: ObservableObject {
         }, selfPtr)
 
         // --- GitHub webhooks ---
-        tm_github_webhooks_start(engine, { eventTypePtr, payloadPtr, userdata in
+        githubSubscription = tm_github_webhooks_start(engine, { eventTypePtr, payloadPtr, userdata in
             guard let userdata else {
                 Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("github_webhooks: nil userdata")
                 return
@@ -646,7 +661,7 @@ final class EngineClient: ObservableObject {
         }, selfPtr)
 
         // --- Config watcher ---
-        tm_config_watch(engine, { userdata in
+        configSubscription = tm_config_watch(engine, { userdata in
             guard let userdata else {
                 Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("config_watch: nil userdata")
                 return
@@ -657,6 +672,31 @@ final class EngineClient: ObservableObject {
                 client.reloadConfig()
             }
         }, selfPtr)
+    }
+
+    /// Unsubscribe/unwatch all callbacks. Called before `tm_session_stop()`.
+    private func teardownCallbacks() {
+        guard let engine else { return }
+        if rosterSubscription != 0 {
+            tm_roster_unwatch(engine, rosterSubscription)
+            rosterSubscription = 0
+        }
+        if messageSubscription != 0 {
+            tm_message_unsubscribe(engine, messageSubscription)
+            messageSubscription = 0
+        }
+        if commandSubscription != 0 {
+            tm_commands_unwatch(engine, commandSubscription)
+            commandSubscription = 0
+        }
+        if githubSubscription != 0 {
+            tm_github_webhooks_stop(engine, githubSubscription)
+            githubSubscription = 0
+        }
+        if configSubscription != 0 {
+            tm_config_unwatch(engine, configSubscription)
+            configSubscription = 0
+        }
     }
 
     // MARK: - Private: Command handler

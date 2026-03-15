@@ -111,5 +111,6 @@ struct WorkerInfo: Identifiable, Equatable, Sendable {
     let status: WorkerStatus
     let agentType: AgentType
     let agentBinary: String
+    let model: String
     let spawnedAt: Date
 }

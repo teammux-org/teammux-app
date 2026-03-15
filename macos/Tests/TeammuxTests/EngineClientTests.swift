@@ -109,6 +109,7 @@ struct EngineClientTests {
                 status: .working,
                 agentType: .claudeCode,
                 agentBinary: "claude",
+                model: "claude-sonnet-4-6",
                 spawnedAt: Date()
             )
         ]
