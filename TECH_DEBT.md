@@ -14,7 +14,7 @@
 | ID  | Module          | Issue                            | Stream    | Breaking | Status |
 |-----|-----------------|----------------------------------|-----------|----------|--------|
 | TD5 | merge.zig       | MergeCoordinator not implemented | stream-B1 | YES      | RESOLVED |
-| TD6 | EngineClient    | tm_merge_* bridge missing        | stream-B2 | NO       | OPEN   |
+| TD6 | EngineClient    | tm_merge_* bridge missing        | stream-B2 | NO       | RESOLVED |
 | TD7 | GitView.swift   | Team Lead review UI not built    | stream-C1 | NO       | OPEN   |
 
 ## Notes

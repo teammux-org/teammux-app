@@ -125,6 +125,10 @@ struct EngineClientTests {
         ]
         client.githubStatus = .connected("test/repo")
         client.lastError = "some error"
+        client.mergeStatuses[1] = .conflict
+        client.pendingConflicts[1] = [
+            ConflictInfo(filePath: "f.swift", conflictType: "content")
+        ]
 
         // destroy() should not crash and should clear all state
         client.destroy()
@@ -132,6 +136,8 @@ struct EngineClientTests {
         #expect(client.roster.isEmpty)
         #expect(client.messages.isEmpty)
         #expect(client.worktreeReadyQueue.isEmpty)
+        #expect(client.mergeStatuses.isEmpty)
+        #expect(client.pendingConflicts.isEmpty)
         #expect(client.githubStatus == .disconnected)
         #expect(client.lastError == nil)
         #expect(client.projectRoot == nil)
@@ -276,6 +282,62 @@ struct EngineClientTests {
         #expect(ready.worktreePath == "/tmp/wt")
         #expect(ready.agentBinary == "claude")
         #expect(ready.taskDescription == "test task")
+    }
+
+    // MARK: - Merge initial state
+
+    @Test func mergeStatusesEmptyOnCreate() {
+        let client = EngineClient()
+        #expect(client.mergeStatuses.isEmpty)
+    }
+
+    @Test func pendingConflictsEmptyOnCreate() {
+        let client = EngineClient()
+        #expect(client.pendingConflicts.isEmpty)
+    }
+
+    // MARK: - Merge operations without engine
+
+    @Test func approveMergeWithoutEngine() {
+        let client = EngineClient()
+        let result = client.approveMerge(workerId: 1, strategy: .merge)
+        #expect(result == false)
+        #expect(client.lastError == "Engine not created")
+    }
+
+    @Test func rejectMergeWithoutEngine() {
+        let client = EngineClient()
+        let result = client.rejectMerge(workerId: 1)
+        #expect(result == false)
+        #expect(client.lastError == "Engine not created")
+    }
+
+    @Test func getMergeStatusWithoutEngine() {
+        let client = EngineClient()
+        let status = client.getMergeStatus(workerId: 1)
+        #expect(status == .pending)
+    }
+
+    @Test func getConflictsWithoutEngine() {
+        let client = EngineClient()
+        let conflicts = client.getConflicts(workerId: 1)
+        #expect(conflicts.isEmpty)
+        #expect(client.lastError == "Engine not created")
+    }
+
+    // MARK: - Destroy clears merge state
+
+    @Test func destroyClearsMergeState() {
+        let client = EngineClient()
+        client.mergeStatuses[1] = .inProgress
+        client.pendingConflicts[1] = [
+            ConflictInfo(filePath: "a.swift", conflictType: "content")
+        ]
+
+        client.destroy()
+
+        #expect(client.mergeStatuses.isEmpty)
+        #expect(client.pendingConflicts.isEmpty)
     }
 
     // MARK: - Double create guard
