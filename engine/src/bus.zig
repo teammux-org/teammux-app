@@ -89,7 +89,9 @@ pub const MessageBus = struct {
     }
 
     /// Send a message to a specific worker.
-    /// Delivery: logs to JSONL, fires tm_message_cb callback to Swift.
+    /// Delivery: logs to JSONL, then fires tm_message_cb callback to Swift.
+    /// Returns error.DeliveryFailed if the callback fails after all retries.
+    /// The message is always persisted to JSONL regardless of delivery outcome.
     /// Swift is responsible for injecting text into the Ghostty SurfaceView.
     pub fn send(
         self: *MessageBus,
@@ -121,25 +123,28 @@ pub const MessageBus = struct {
 
         // 5. Fire callback to Swift for delivery with retry on failure.
         // Initial attempt + up to 3 retries with exponential backoff (1s, 2s, 4s).
-        // On 4th failure: append FAILED line to JSONL log.
+        // On 4th failure: append FAILED line to JSONL log and return error.
         if (self.subscriber_cb) |cb| {
             var c_msg = try self.toCMessage(msg);
             defer self.freeCMessage(c_msg);
 
-            const result = cb(&c_msg, self.subscriber_userdata);
-            if (result == 0) return; // TM_OK — delivered
+            var last_rc = cb(&c_msg, self.subscriber_userdata);
+            if (last_rc == 0) return; // TM_OK — delivered
 
             // Initial attempt failed — retry up to 3 times
             for (self.retry_delays_ns) |delay| {
-                std.log.info("[teammux] message seq={d} delivery failed (rc={d}), retrying in {d}s", .{ seq, result, delay / std.time.ns_per_s });
+                std.log.info("[teammux] message seq={d} delivery failed (rc={d}), retrying in {d}s", .{ seq, last_rc, delay / std.time.ns_per_s });
                 std.Thread.sleep(delay);
-                const retry_result = cb(&c_msg, self.subscriber_userdata);
-                if (retry_result == 0) return; // TM_OK — delivered on retry
+                last_rc = cb(&c_msg, self.subscriber_userdata);
+                if (last_rc == 0) return; // TM_OK — delivered on retry
             }
 
             // All retries exhausted — append FAILED audit line to log
-            std.log.info("[teammux] message seq={d} delivery FAILED after 4 attempts", .{seq});
-            self.appendFailedLog(seq, 3) catch {};
+            std.log.info("[teammux] message seq={d} delivery FAILED after 4 attempts (last rc={d})", .{ seq, last_rc });
+            self.appendFailedLog(seq, 3) catch |err| {
+                std.log.info("[teammux] message seq={d} FAILED audit log also failed: {s}", .{ seq, @errorName(err) });
+            };
+            return error.DeliveryFailed;
         } else {
             std.log.info("[teammux] message seq={d} logged but no subscriber (undelivered)", .{seq});
         }
@@ -160,7 +165,10 @@ pub const MessageBus = struct {
         var it = roster.workers.iterator();
         while (it.next()) |entry| {
             const worker_id = entry.key_ptr.*;
-            try self.send(worker_id, from, msg_type, payload);
+            self.send(worker_id, from, msg_type, payload) catch |err| {
+                if (err == error.DeliveryFailed) continue; // per-worker failure, try others
+                return err;
+            };
         }
     }
 
@@ -309,6 +317,7 @@ pub const MessageBus = struct {
     }
 
     pub const LogFileUnavailable = error{LogFileUnavailable};
+    pub const DeliveryFailed = error{DeliveryFailed};
 };
 
 /// C-compatible message struct matching tm_message_t in teammux.h.
@@ -703,12 +712,12 @@ test "bus - retry exhaustion logs FAILED" {
     }.cb;
 
     b.subscribe(callback, null);
-    try b.send(1, 0, .task, "\"will fail\"");
+    try std.testing.expectError(error.DeliveryFailed, b.send(1, 0, .task, "\"will fail\""));
 
     // 1 initial + 3 retries = 4 total calls
     try std.testing.expect(State.call_count == 4);
 
-    // FAILED audit line should be in the log
+    // FAILED audit line should be in the log with correct seq
     b.log_file.?.close();
     b.log_file = null;
     const log_content = try std.fs.cwd().openFile(b.log_path, .{});
@@ -717,4 +726,6 @@ test "bus - retry exhaustion logs FAILED" {
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_status\":\"FAILED\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"retries\":3") != null);
+    // Verify seq in FAILED line matches the original message's seq (0)
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"seq\":0,\"delivery_status\":\"FAILED\"") != null);
 }

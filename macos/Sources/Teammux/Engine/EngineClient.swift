@@ -588,13 +588,15 @@ final class EngineClient: ObservableObject {
         // Callback returns tm_result_t: TM_OK (0) on success, non-zero on failure.
         // On failure the engine retries up to 3 times with exponential backoff.
         messageSubscription = tm_message_subscribe(engine, { messagePtr, userdata -> tm_result_t in
+            // Nil guards return TM_OK: these are permanent setup issues (not transient),
+            // so retrying would block the engine thread for 7s with no chance of recovery.
             guard let userdata else {
                 Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("message_subscribe: nil userdata")
-                return TM_ERR_BUS
+                return TM_OK
             }
             guard let messagePtr else {
                 Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("message_subscribe: nil messagePtr")
-                return TM_ERR_BUS
+                return TM_OK
             }
 
             // Copy all string data while on the callback thread.
