@@ -620,7 +620,78 @@ test "bus - git_commit is populated in a git repo" {
 
     // Should contain git_commit with a quoted hex value, not null
     try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":null") == null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"git_commit\":\"") != null);
+    const commit_prefix = "\"git_commit\":\"";
+    const commit_start = std.mem.indexOf(u8, content, commit_prefix) orelse return error.TestUnexpectedResult;
+    const hash_start = commit_start + commit_prefix.len;
+    // Verify the git_commit value is exactly 40 hex characters followed by a quote
+    try std.testing.expect(content.len >= hash_start + 41); // 40 hex + closing quote
+    for (content[hash_start .. hash_start + 40]) |c| {
+        try std.testing.expect(std.ascii.isHex(c));
+    }
+    try std.testing.expect(content[hash_start + 40] == '"');
+}
+
+test "bus - subscriber callback receives git_commit via CMessage" {
+    const alloc = std.testing.allocator;
+
+    // Set up a temp git repo with an initial commit
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    worktree.runGit(alloc, project_root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "config", "user.name", "Test" }) catch return;
+
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{project_root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, project_root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, project_root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{project_root});
+    defer alloc.free(log_dir);
+
+    var b = try MessageBus.init(alloc, log_dir, "cbcommit", project_root);
+    defer b.deinit();
+
+    const State = struct {
+        var commit_received: bool = false;
+        var commit_is_hex: bool = false;
+    };
+    State.commit_received = false;
+    State.commit_is_hex = false;
+
+    const callback = struct {
+        fn cb(msg: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                if (m.git_commit) |commit_ptr| {
+                    State.commit_received = true;
+                    // Verify it looks like a hex hash
+                    const commit = std.mem.span(commit_ptr);
+                    if (commit.len >= 40) {
+                        State.commit_is_hex = true;
+                        for (commit[0..40]) |c| {
+                            if (!std.ascii.isHex(c)) {
+                                State.commit_is_hex = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return 0; // TM_OK
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    try b.send(1, 0, .task, "\"commit callback test\"");
+
+    try std.testing.expect(State.commit_received);
+    try std.testing.expect(State.commit_is_hex);
 }
 
 test "bus - git_commit is null in non-git directory" {
