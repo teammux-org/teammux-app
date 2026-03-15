@@ -19,6 +19,7 @@ pub const Engine = struct {
     cfg: ?config.Config,
     config_watcher: ?config.ConfigWatcher,
     roster: worktree.Roster,
+    merge_coordinator: merge.MergeCoordinator,
     message_bus: ?bus.MessageBus,
     github_client: github.GitHubClient,
     commands_watcher: ?commands.CommandWatcher,
@@ -44,6 +45,7 @@ pub const Engine = struct {
             .cfg = null,
             .config_watcher = null,
             .roster = worktree.Roster.init(allocator),
+            .merge_coordinator = merge.MergeCoordinator.init(allocator),
             .message_bus = null,
             .github_client = github.GitHubClient.init(allocator, null),
             .commands_watcher = null,
@@ -67,6 +69,7 @@ pub const Engine = struct {
         if (self.config_watcher) |*w| w.deinit();
         if (self.message_bus) |*b| b.deinit();
         self.github_client.deinit();
+        self.merge_coordinator.deinit();
         self.roster.deinit();
         if (self.cfg) |*c| c.deinit(self.allocator);
         if (self.last_error) |e| self.allocator.free(e);
@@ -145,6 +148,10 @@ const CDiffFile = extern struct {
 const CDiff = extern struct {
     files: ?[*]CDiffFile, count: u32, total_additions: i32, total_deletions: i32,
 };
+const CConflict = extern struct {
+    file_path: ?[*:0]const u8, conflict_type: ?[*:0]const u8,
+    ours: ?[*:0]const u8, theirs: ?[*:0]const u8,
+};
 
 // Comptime ABI safety: verify extern struct sizes match expected C layout.
 // If a field is added/removed in teammux.h without updating Zig, this fails at build time.
@@ -153,6 +160,8 @@ comptime {
     if (@sizeOf(CWorkerInfo) != 72) @compileError("CWorkerInfo size mismatch with tm_worker_info_t");
     // CMessage (bus.zig): u32 + u32 + c_int + ptr + u64 + u64 + ptr = 48 bytes on arm64
     if (@sizeOf(bus.CMessage) != 48) @compileError("CMessage size mismatch with tm_message_t");
+    // CConflict: 4 ptrs = 32 bytes on arm64
+    if (@sizeOf(CConflict) != 32) @compileError("CConflict size mismatch with tm_conflict_t");
 }
 
 var last_create_error: [*:0]const u8 = "no error";
@@ -394,6 +403,71 @@ export fn tm_commands_watch(engine: ?*Engine, callback: ?*const fn (?[*:0]const 
 }
 export fn tm_commands_unwatch(engine: ?*Engine, sub: u32) void { _ = sub; if (engine) |e| { if (e.commands_watcher) |*w| w.stop(); } }
 
+// ─── Merge coordinator ───────────────────────────────────
+
+export fn tm_merge_approve(engine: ?*Engine, worker_id: u32, strategy: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const strat = std.mem.span(strategy orelse "merge");
+    _ = e.merge_coordinator.approve(&e.roster, e.project_root, worker_id, strat) catch |err| {
+        const code: c_int = switch (err) {
+            error.WorkerNotFound => 12, // TM_ERR_INVALID_WORKER
+            error.NotOnMain => 5, // TM_ERR_WORKTREE
+            error.MergeInProgress => 5,
+            else => 99,
+        };
+        e.setError(switch (err) {
+            error.WorkerNotFound => "merge approve failed: worker not found",
+            error.NotOnMain => "merge approve failed: HEAD is not on main",
+            error.MergeInProgress => "merge approve failed: another merge is in progress",
+            else => "merge approve failed",
+        }) catch {};
+        return code;
+    };
+    return 0;
+}
+export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
+        e.setError(if (err == error.WorkerNotFound) "merge reject failed: worker not found" else "merge reject failed") catch {};
+        return if (err == error.WorkerNotFound) 12 else 5;
+    };
+    return 0;
+}
+export fn tm_merge_get_status(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 0; // TM_MERGE_PENDING
+    return @intFromEnum(e.merge_coordinator.getStatus(worker_id));
+}
+export fn tm_merge_conflicts_get(engine: ?*Engine, worker_id: u32, count: ?*u32) ?[*]?*CConflict {
+    const e = engine orelse { if (count) |c| c.* = 0; return null; };
+    const conflicts = e.merge_coordinator.getConflicts(worker_id) orelse {
+        if (count) |c| c.* = 0;
+        return null;
+    };
+    if (conflicts.len == 0) { if (count) |c| c.* = 0; return null; }
+
+    const alloc = e.allocator;
+    const ptrs = alloc.alloc(?*CConflict, conflicts.len) catch { if (count) |c| c.* = 0; return null; };
+    for (conflicts, 0..) |conf, i| {
+        const cc = alloc.create(CConflict) catch {
+            for (0..i) |j| freeCConflict(ptrs[j]);
+            alloc.free(ptrs); if (count) |c| c.* = 0; return null;
+        };
+        cc.* = fillCConflict(alloc, conf) catch {
+            alloc.destroy(cc);
+            for (0..i) |j| freeCConflict(ptrs[j]);
+            alloc.free(ptrs); if (count) |c| c.* = 0; return null;
+        };
+        ptrs[i] = cc;
+    }
+    if (count) |c| c.* = @intCast(conflicts.len);
+    return ptrs.ptr;
+}
+export fn tm_merge_conflicts_free(conflicts: ?[*]?*CConflict, count: u32) void {
+    const ptrs = conflicts orelse return;
+    for (0..count) |i| freeCConflict(ptrs[i]);
+    std.heap.c_allocator.free(ptrs[0..count]);
+}
+
 // ─── Utility ─────────────────────────────────────────────
 
 export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
@@ -437,6 +511,21 @@ fn freeNullTerminated(ptr: ?[*:0]const u8) void {
     if (ptr) |p| std.heap.c_allocator.free(std.mem.span(p));
 }
 
+fn fillCConflict(alloc: std.mem.Allocator, c: merge.Conflict) !CConflict {
+    const fp = try alloc.dupeZ(u8, c.file_path); errdefer alloc.free(fp);
+    const ct = try alloc.dupeZ(u8, c.conflict_type); errdefer alloc.free(ct);
+    const ours = try alloc.dupeZ(u8, c.ours); errdefer alloc.free(ours);
+    const theirs = try alloc.dupeZ(u8, c.theirs);
+    return .{ .file_path = fp.ptr, .conflict_type = ct.ptr, .ours = ours.ptr, .theirs = theirs.ptr };
+}
+
+fn freeCConflict(ptr: ?*CConflict) void {
+    const cc = ptr orelse return;
+    freeNullTerminated(cc.file_path); freeNullTerminated(cc.conflict_type);
+    freeNullTerminated(cc.ours); freeNullTerminated(cc.theirs);
+    std.heap.c_allocator.destroy(cc);
+}
+
 // ─── Tests ───────────────────────────────────────────────
 
 test "version returns 0.1.0" { try std.testing.expectEqualStrings("0.1.0", std.mem.span(tm_version())); }
@@ -468,5 +557,15 @@ test "engine create with null returns error" {
 test "tm_pty_send returns TM_ERR_NOT_IMPLEMENTED" { try std.testing.expect(tm_pty_send(null, 0, null) == 10); }
 test "tm_pty_fd returns -1" { try std.testing.expect(tm_pty_fd(null, 0) == -1); }
 test "tm_worker_spawn returns TM_WORKER_INVALID on null engine" { try std.testing.expect(tm_worker_spawn(null, null, 0, null, null) == 0xFFFFFFFF); }
+
+test "tm_merge_approve null engine returns TM_ERR_UNKNOWN" { try std.testing.expect(tm_merge_approve(null, 0, null) == 99); }
+test "tm_merge_reject null engine returns TM_ERR_UNKNOWN" { try std.testing.expect(tm_merge_reject(null, 0) == 99); }
+test "tm_merge_get_status null engine returns PENDING" { try std.testing.expect(tm_merge_get_status(null, 0) == 0); }
+test "tm_merge_conflicts_get null returns null" {
+    var count: u32 = 42;
+    try std.testing.expect(tm_merge_conflicts_get(null, 0, &count) == null);
+    try std.testing.expect(count == 0);
+}
+test "tm_merge_conflicts_free handles null" { tm_merge_conflicts_free(null, 0); }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; }
