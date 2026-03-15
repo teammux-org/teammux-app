@@ -27,13 +27,13 @@ typedef enum {
     TM_ERR_NO_AGENT         = 4,
     TM_ERR_WORKTREE         = 5,
     TM_ERR_PTY              = 6,
-    TM_ERR_CONFIG           = 7,
+    TM_ERR_CONFIG            = 7,
     TM_ERR_BUS              = 8,
     TM_ERR_GITHUB           = 9,
-    TM_ERR_TIMEOUT          = 10,
-    TM_ERR_INVALID_WORKER   = 11,
+    TM_ERR_NOT_IMPLEMENTED  = 10,
+    TM_ERR_TIMEOUT          = 11,
+    TM_ERR_INVALID_WORKER   = 12,
     TM_ERR_UNKNOWN          = 99,
-    TM_ERR_NOT_IMPLEMENTED  = 100,
 } tm_result_t;
 
 typedef enum {
@@ -82,13 +82,13 @@ typedef enum {
 typedef struct {
     tm_worker_id_t     id;
     const char*        name;
-    const char*        model;
     const char*        task_description;
     const char*        branch_name;
     const char*        worktree_path;
     tm_worker_status_t status;
     tm_agent_type_t    agent_type;
     const char*        agent_binary;
+    const char*        model;
     uint64_t           spawned_at;
 } tm_worker_info_t;
 
@@ -118,10 +118,10 @@ typedef struct {
 
 typedef struct {
     const char*        file_path;
+    tm_diff_status_t   status;
     int32_t            additions;
     int32_t            deletions;
     const char*        patch;
-    tm_diff_status_t   status;
 } tm_diff_file_t;
 
 typedef struct {
@@ -134,17 +134,13 @@ typedef struct {
 // -----------------------------------------------------------------
 // Callbacks
 //
-// Threading: all callbacks are invoked on the engine's internal
-// thread. Callers MUST dispatch to the main thread for UI updates.
-//
-// Lifetime: callbacks remain registered until unsubscribed via the
-// returned tm_subscription_t, or until tm_engine_destroy. Callers
-// MUST unsubscribe before deallocating userdata.
+// All callbacks are invoked on the engine's internal thread.
+// Callers must dispatch to the main thread for UI updates.
 // -----------------------------------------------------------------
 
 typedef void (*tm_message_cb)(const tm_message_t* message, void* userdata);
 typedef void (*tm_roster_changed_cb)(const tm_roster_t* roster, void* userdata);
-typedef void (*tm_config_changed_cb)(tm_engine_t* engine, void* userdata);
+typedef void (*tm_config_changed_cb)(const tm_engine_t* engine, void* userdata);
 typedef void (*tm_github_event_cb)(const char* event_type, const char* payload_json, void* userdata);
 typedef void (*tm_command_cb)(const char* command, const char* args_json, void* userdata);
 
@@ -153,16 +149,15 @@ typedef void (*tm_command_cb)(const char* command, const char* args_json, void* 
 // -----------------------------------------------------------------
 
 // Create engine for a project. project_root must be an absolute path to a git repo.
-// On success, writes engine to *out and returns TM_OK.
+// On success, writes engine pointer to *out and returns TM_OK.
 // On failure, returns an error code and *out is set to NULL.
 tm_result_t  tm_engine_create(const char* project_root, tm_engine_t** out);
-
 void         tm_engine_destroy(tm_engine_t* engine);
 tm_result_t  tm_session_start(tm_engine_t* engine);
 void         tm_session_stop(tm_engine_t* engine);
 
 // Get last error message. Valid until next API call on the same engine.
-// Safe to call with NULL engine (returns global last error from tm_engine_create).
+// Can be called with NULL engine to get the last creation error.
 const char*  tm_engine_last_error(tm_engine_t* engine);
 
 // -----------------------------------------------------------------
@@ -171,11 +166,11 @@ const char*  tm_engine_last_error(tm_engine_t* engine);
 
 tm_result_t      tm_config_reload(tm_engine_t* engine);
 tm_subscription_t tm_config_watch(tm_engine_t* engine, tm_config_changed_cb callback, void* userdata);
-void             tm_config_unwatch(tm_engine_t* engine, tm_subscription_t sub);
+void              tm_config_unwatch(tm_engine_t* engine, tm_subscription_t sub);
 
-// Get a config value by dot-notation key (e.g. "project.name", "team_lead.model").
-// Returns NULL if key not found. Returned pointer is valid until next tm_config_reload.
-const char*      tm_config_get(tm_engine_t* engine, const char* key);
+// Get a config value by dot-notation key. Returns NULL if not found.
+// Returned pointer is valid until the next tm_config_reload. Caller must not free.
+const char* tm_config_get(tm_engine_t* engine, const char* key);
 
 // -----------------------------------------------------------------
 // Worktree and worker lifecycle
@@ -216,7 +211,6 @@ tm_result_t tm_message_send(
     const char*       payload
 );
 
-// Broadcast a message to all active workers. Uses the given message type.
 tm_result_t tm_message_broadcast(
     tm_engine_t*      engine,
     tm_message_type_t type,
@@ -250,8 +244,8 @@ tm_result_t tm_github_merge_pr(
 tm_diff_t* tm_github_get_diff(tm_engine_t* engine, tm_worker_id_t worker_id);
 void       tm_diff_free(tm_diff_t* diff);
 
-tm_result_t tm_github_webhooks_start(tm_engine_t* engine, tm_github_event_cb callback, void* userdata);
-void        tm_github_webhooks_stop(tm_engine_t* engine);
+tm_subscription_t tm_github_webhooks_start(tm_engine_t* engine, tm_github_event_cb callback, void* userdata);
+void              tm_github_webhooks_stop(tm_engine_t* engine, tm_subscription_t sub);
 
 // -----------------------------------------------------------------
 // /teammux-* command interception
@@ -267,7 +261,6 @@ void              tm_commands_unwatch(tm_engine_t* engine, tm_subscription_t sub
 const char* tm_agent_resolve(const char* agent_name);
 void        tm_free_string(const char* str);
 const char* tm_version(void);
-const char* tm_result_to_string(tm_result_t result);
 
 #ifdef __cplusplus
 }

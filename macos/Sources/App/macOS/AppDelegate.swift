@@ -355,8 +355,9 @@ class AppDelegate: NSObject,
         // If we're back manually then clear the hidden state because macOS handles it.
         self.hiddenState = nil
 
-        // Teammux: open workspace window on first activation
+        // Teammux: open workspace window
         if !teammuxWindowOpen {
+            Self.logger.info("First activation — launching Teammux window")
             openTeammuxWindow()
             teammuxWindowOpen = true
         }
@@ -1049,8 +1050,8 @@ class AppDelegate: NSObject,
             defer: false
         )
         window.title = "Teammux"
-        window.center()
         window.isReleasedWhenClosed = false
+        window.center()
         window.contentViewController = NSHostingController(
             rootView: Text("Teammux loading...").frame(maxWidth: .infinity, maxHeight: .infinity)
         )
@@ -1059,7 +1060,7 @@ class AppDelegate: NSObject,
 
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(teammuxWindowWillClose),
+            selector: #selector(teammuxWindowWillClose(_:)),
             name: NSWindow.willCloseNotification,
             object: window
         )
@@ -1067,7 +1068,7 @@ class AppDelegate: NSObject,
     }
 
     @objc private func teammuxWindowWillClose(_ notification: Notification) {
-        Self.logger.info("Teammux workspace window closed")
+        Self.logger.info("Teammux workspace window closing")
         teammuxWindowOpen = false
         teammuxWindow = nil
     }
