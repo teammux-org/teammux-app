@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-// Message bus with guaranteed delivery — implemented in commit 5
-// Delivery fires tm_message_cb callback to Swift (Ghostty owns PTY).
-=======
 const std = @import("std");
 const worktree = @import("worktree.zig");
 
@@ -465,4 +461,3 @@ test "bus - getDateString produces YYYY-MM-DD format" {
     try std.testing.expect(buf[4] == '-');
     try std.testing.expect(buf[7] == '-');
 }
->>>>>>> abfbb7bc5d35c3e5529ab15c7d9616a49aee0de6

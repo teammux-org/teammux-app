@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-// /teammux-* command file watcher via kqueue — implemented in commit 6
-=======
 const std = @import("std");
 
 // ─────────────────────────────────────────────────────────
@@ -355,4 +352,3 @@ test "commands - kqueue watcher detects file changes (integration)" {
     if (exists) |f| f.close();
     // File may or may not be deleted depending on timing — just verify detection
 }
->>>>>>> abfbb7bc5d35c3e5529ab15c7d9616a49aee0de6
