@@ -92,11 +92,8 @@ class AppDelegate: NSObject,
     /// Ghostty's default terminal window creation is suppressed.
     private var teammuxWindowOpen = false
 
-    /// Teammux window controller — retained to keep the window alive.
-    private var workspaceWindowController: WorkspaceWindowController?
-
-    /// Manages open projects (tabs) across the Teammux workspace.
-    private let projectManager = ProjectManager()
+    /// Strong reference to the Teammux workspace window.
+    private var teammuxWindow: NSWindow?
 
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
@@ -358,8 +355,9 @@ class AppDelegate: NSObject,
         // If we're back manually then clear the hidden state because macOS handles it.
         self.hiddenState = nil
 
-        // Teammux: open workspace window on first activation
+        // Teammux: open workspace window
         if !teammuxWindowOpen {
+            Self.logger.info("First activation — launching Teammux window")
             openTeammuxWindow()
             teammuxWindowOpen = true
         }
@@ -1044,13 +1042,36 @@ class AppDelegate: NSObject,
     // MARK: - Teammux
 
     private func openTeammuxWindow() {
-        let controller = WorkspaceWindowController(
-            ghosttyApp: ghostty,
-            projectManager: projectManager
+        Self.logger.info("Opening Teammux workspace window")
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1400, height: 900),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
         )
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
-        workspaceWindowController = controller
+        window.title = "Teammux"
+        window.isReleasedWhenClosed = false
+        window.center()
+        window.contentViewController = NSHostingController(
+            rootView: Text("Teammux loading...").frame(maxWidth: .infinity, maxHeight: .infinity)
+        )
+        window.makeKeyAndOrderFront(nil)
+        self.teammuxWindow = window
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(teammuxWindowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: window
+        )
+        Self.logger.info("Teammux workspace window opened")
+    }
+
+    @objc private func teammuxWindowWillClose(_ notification: Notification) {
+        Self.logger.info("Teammux workspace window closing")
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: notification.object)
+        teammuxWindowOpen = false
+        teammuxWindow = nil
     }
 
     private struct DerivedConfig {

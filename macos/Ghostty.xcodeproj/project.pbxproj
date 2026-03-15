@@ -252,6 +252,7 @@
 				Helpers/TabGroupCloseCoordinator.swift,
 				Helpers/TabTitleEditor.swift,
 				Helpers/VibrantLayer.m,
+				Teammux/Engine/EngineClient.swift,
 			);
 			target = A5D4499C2B53AE7B000F5B83 /* Ghostty-iOS */;
 		};
@@ -776,7 +777,9 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
-				"OTHER_LDFLAGS[arch=*]" = "-lstdc++";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../engine/include";
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/Resources";
+				"OTHER_LDFLAGS[arch=*]" = "-lstdc++ -lteammux";
 				PRODUCT_BUNDLE_IDENTIFIER = com.teammux.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -1148,7 +1151,7 @@
 				EXECUTABLE_NAME = ghostty;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Ghostty-Info.plist";
-				INFOPLIST_KEY_CFBundleDisplayName = "Teammux[DEBUG]";
+				INFOPLIST_KEY_CFBundleDisplayName = Teammux;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "A program running within Ghostty would like to use AppleScript.";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "A program running within Ghostty would like to use Bluetooth.";
@@ -1173,8 +1176,10 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
-				"OTHER_LDFLAGS[arch=*]" = "-lstdc++";
-				PRODUCT_BUNDLE_IDENTIFIER = com.mitchellh.ghostty.debug;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../engine/include";
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/Resources";
+				"OTHER_LDFLAGS[arch=*]" = "-lstdc++ -lteammux";
+				PRODUCT_BUNDLE_IDENTIFIER = com.teammux.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/App/macOS/ghostty-bridging-header.h";
@@ -1228,7 +1233,9 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 0.1.0;
-				"OTHER_LDFLAGS[arch=*]" = "-lstdc++";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../engine/include";
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/Resources";
+				"OTHER_LDFLAGS[arch=*]" = "-lstdc++ -lteammux";
 				PRODUCT_BUNDLE_IDENTIFIER = com.teammux.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;

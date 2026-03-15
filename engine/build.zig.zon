@@ -1,0 +1,6 @@
+.{
+    .name = .teammux,
+    .version = "0.1.0",
+    .fingerprint = 0xfcf5e8428868694c,
+    .paths = .{""},
+}

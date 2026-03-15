@@ -36,12 +36,20 @@ pub const ProjectConfig = struct {
     github_repo: ?[]const u8,
 };
 
+pub const FieldsSet = struct {
+    tl_model: bool = false,
+    tl_permissions: bool = false,
+    github_token: bool = false,
+    bus_delivery: bool = false,
+};
+
 pub const Config = struct {
     project: ProjectConfig,
     team_lead: TeamLeadConfig,
     workers: []WorkerConfig,
     github_token: ?[]const u8,
     bus_delivery: []const u8,
+    fields_set: FieldsSet = .{},
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.project.name);
@@ -76,7 +84,7 @@ pub const ParseError = error{
 /// Parse TOML content into a Config struct.
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Config {
     var current_section: Section = .none;
-    var workers = std.ArrayList(WorkerConfig).init(allocator);
+    var workers: std.ArrayList(WorkerConfig) = .{};
     errdefer {
         for (workers.items) |w| {
             allocator.free(w.id);
@@ -85,7 +93,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
             allocator.free(w.permissions);
             allocator.free(w.default_task);
         }
-        workers.deinit();
+        workers.deinit(allocator);
     }
 
     // Defaults
@@ -126,7 +134,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
             const section_name = std.mem.trim(u8, line[2..end], &[_]u8{ ' ', '\t' });
             if (std.mem.eql(u8, section_name, "workers")) {
                 current_section = .workers;
-                try workers.append(.{
+                try workers.append(allocator, .{
                     .id = try allocator.dupe(u8, ""),
                     .name = try allocator.dupe(u8, ""),
                     .agent = .claude_code,
@@ -151,6 +159,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
             } else if (std.mem.eql(u8, section_name, "bus")) {
                 current_section = .bus;
             } else {
+                std.log.warn("[teammux] config: unknown section [{s}], keys will be ignored", .{section_name});
                 current_section = .none;
             }
             continue;
@@ -237,9 +246,15 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
             .model = tl_model,
             .permissions = tl_permissions,
         },
-        .workers = try workers.toOwnedSlice(),
+        .workers = try workers.toOwnedSlice(allocator),
         .github_token = github_token,
         .bus_delivery = bus_delivery,
+        .fields_set = .{
+            .tl_model = replaced_tl_model,
+            .tl_permissions = replaced_tl_permissions,
+            .github_token = github_token != null,
+            .bus_delivery = replaced_bus_delivery,
+        },
     };
 }
 
@@ -275,7 +290,7 @@ pub const LoadError = ParseError || std.fs.File.OpenError || std.fs.File.ReadErr
 pub fn load(allocator: std.mem.Allocator, path: []const u8) LoadError!Config {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
-    const content = try file.reader().readAllAlloc(allocator, 1024 * 1024);
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(content);
     return parse(allocator, content);
 }
@@ -295,29 +310,26 @@ pub fn loadWithOverrides(
             else => return err,
         };
         defer override_file.close();
-        const override_content = try override_file.reader().readAllAlloc(allocator, 1024 * 1024);
+        const override_content = try override_file.readToEndAlloc(allocator, 1024 * 1024);
         defer allocator.free(override_content);
 
         var override_cfg = try parse(allocator, override_content);
         defer override_cfg.deinit(allocator);
 
-        // Merge: override values replace base values where present
-        if (override_cfg.github_token) |token| {
+        // Merge: override values replace base values where explicitly set
+        // Uses fields_set tracking (not default-value comparison) so overriding
+        // back to the default value works correctly.
+        if (override_cfg.fields_set.github_token) {
             if (cfg.github_token) |old| allocator.free(old);
-            cfg.github_token = try allocator.dupe(u8, token);
+            cfg.github_token = if (override_cfg.github_token) |t| try allocator.dupe(u8, t) else null;
         }
-        if (!std.mem.eql(u8, override_cfg.team_lead.model, "claude-opus-4-6") or
-            !std.mem.eql(u8, override_cfg.team_lead.permissions, "full"))
-        {
-            // Override has non-default team_lead values
-            if (!std.mem.eql(u8, override_cfg.team_lead.model, "claude-opus-4-6")) {
-                allocator.free(cfg.team_lead.model);
-                cfg.team_lead.model = try allocator.dupe(u8, override_cfg.team_lead.model);
-            }
-            if (!std.mem.eql(u8, override_cfg.team_lead.permissions, "full")) {
-                allocator.free(cfg.team_lead.permissions);
-                cfg.team_lead.permissions = try allocator.dupe(u8, override_cfg.team_lead.permissions);
-            }
+        if (override_cfg.fields_set.tl_model) {
+            allocator.free(cfg.team_lead.model);
+            cfg.team_lead.model = try allocator.dupe(u8, override_cfg.team_lead.model);
+        }
+        if (override_cfg.fields_set.tl_permissions) {
+            allocator.free(cfg.team_lead.permissions);
+            cfg.team_lead.permissions = try allocator.dupe(u8, override_cfg.team_lead.permissions);
         }
     }
     return cfg;
@@ -395,11 +407,7 @@ pub const ConfigWatcher = struct {
 
     pub fn stop(self: *ConfigWatcher) void {
         self.running.store(false, .release);
-        if (self.kq >= 0) {
-            // Trigger the kqueue to wake up by closing it
-            std.posix.close(@intCast(self.kq));
-            self.kq = -1;
-        }
+        // Let the thread exit via its 1-second kevent timeout
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -408,6 +416,10 @@ pub const ConfigWatcher = struct {
 
     pub fn deinit(self: *ConfigWatcher) void {
         self.stop();
+        if (self.kq >= 0) {
+            std.posix.close(@intCast(self.kq));
+            self.kq = -1;
+        }
         if (self.watch_fd >= 0) {
             std.posix.close(@intCast(self.watch_fd));
             self.watch_fd = -1;
@@ -446,13 +458,15 @@ pub const ConfigWatcher = struct {
 
                 // Handle rename/delete: editor saved via temp file rename
                 if (fflags & std.c.NOTE.DELETE != 0 or fflags & std.c.NOTE.RENAME != 0) {
-                    // Close old fd and re-open by path (editor rename-on-save pattern)
+                    // Close old fd and mark invalid to prevent stale kqueue registration
                     std.posix.close(@intCast(self.watch_fd));
+                    self.watch_fd = -1;
                     // Small delay for rename to complete
-                    std.time.sleep(100 * std.time.ns_per_ms);
+                    std.Thread.sleep(100 * std.time.ns_per_ms);
 
                     const new_file = std.fs.cwd().openFile(self.config_path, .{}) catch {
-                        // File not available yet — retry next iteration
+                        // File not available yet — retry next iteration with watch_fd = -1
+                        // The changelist will use -1 which kevent will reject; caught by catch break above.
                         continue;
                     };
                     self.watch_fd = new_file.handle;
@@ -619,7 +633,7 @@ test "config - github token in config" {
 
 test "config - load from file" {
     // Write a temp config file
-    const tmp_dir = std.testing.tmpDir(.{});
+    var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     const config_content =
@@ -644,7 +658,7 @@ test "config - load from file" {
 }
 
 test "config - local override merges correctly" {
-    const tmp_dir = std.testing.tmpDir(.{});
+    var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     const base =
@@ -684,8 +698,41 @@ test "config - local override merges correctly" {
     try std.testing.expectEqualStrings("full", cfg.team_lead.permissions);
 }
 
+test "config - override back to default value works" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Base config has non-default model
+    const base =
+        \\[project]
+        \\name = "default-override"
+        \\
+        \\[team_lead]
+        \\model = "gpt-5"
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "config.toml", .data = base });
+
+    // Override sets model back to the default value
+    const override =
+        \\[team_lead]
+        \\model = "claude-opus-4-6"
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "config.local.toml", .data = override });
+
+    const base_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "config.toml");
+    defer std.testing.allocator.free(base_path);
+    const override_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "config.local.toml");
+    defer std.testing.allocator.free(override_path);
+
+    var cfg = try loadWithOverrides(std.testing.allocator, base_path, override_path);
+    defer cfg.deinit(std.testing.allocator);
+
+    // Override to default value must be applied (not ignored)
+    try std.testing.expectEqualStrings("claude-opus-4-6", cfg.team_lead.model);
+}
+
 test "config - load with missing override file" {
-    const tmp_dir = std.testing.tmpDir(.{});
+    var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     const base =
