@@ -5,6 +5,9 @@ const worktree = @import("worktree.zig");
 // Types
 // ─────────────────────────────────────────────────────────
 
+/// Merge status per worker.
+/// Valid transitions: pending → in_progress → {success, conflict, rejected}
+///                    conflict → rejected (via reject)
 pub const MergeStatus = enum(c_int) {
     pending = 0,
     in_progress = 1,
@@ -22,17 +25,15 @@ pub const Conflict = struct {
 
 pub const ApproveResult = enum {
     success,
-    conflicts,
+    conflict,
 };
 
 pub const GitOutput = struct {
     exit_code: u32,
     stdout: []u8,
-    stderr: []u8,
 
     pub fn deinit(self: GitOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
-        allocator.free(self.stderr);
     }
 };
 
@@ -64,8 +65,9 @@ pub const MergeCoordinator = struct {
         self.statuses.deinit();
     }
 
-    /// Approve merge of a worker's branch into the current branch (must be main).
-    /// Returns .success if merge was clean, .conflicts if conflicts were detected.
+    /// Approve merge of a worker's branch into main.
+    /// Returns .success if merge was clean, .conflict if conflicts were detected.
+    /// On conflict, active_merge remains set — caller must reject() before approving another worker.
     pub fn approve(
         self: *MergeCoordinator,
         roster: *worktree.Roster,
@@ -96,11 +98,13 @@ pub const MergeCoordinator = struct {
         try self.statuses.put(worker_id, .in_progress);
         self.active_merge = worker_id;
 
-        // Build git merge command based on strategy
+        std.log.info("[teammux] merge approve: worker {d} branch={s} strategy={s}", .{ worker_id, branch_name, strategy });
+
+        // Execute merge based on strategy
         const merge_result = if (std.mem.eql(u8, strategy, "squash"))
             try runGitCapture(self.allocator, project_root, &.{ "merge", "--squash", branch_name })
         else if (std.mem.eql(u8, strategy, "rebase"))
-            try runGitCapture(self.allocator, project_root, &.{ "rebase", branch_name })
+            try self.runRebaseStrategy(project_root, branch_name)
         else
             // Default: merge (--no-ff ensures merge commit)
             try runGitCapture(self.allocator, project_root, &.{ "merge", "--no-ff", branch_name });
@@ -114,13 +118,18 @@ pub const MergeCoordinator = struct {
                 const commit_result = try runGitCapture(self.allocator, project_root, &.{ "commit", "-m", commit_msg });
                 defer commit_result.deinit(self.allocator);
                 if (commit_result.exit_code != 0) {
-                    try self.statuses.put(worker_id, .conflict);
+                    std.log.err("[teammux] squash commit failed for worker {d}", .{worker_id});
+                    // Abort the squash merge to restore clean state
+                    const abort = try runGitCapture(self.allocator, project_root, &.{ "merge", "--abort" });
+                    abort.deinit(self.allocator);
                     self.active_merge = null;
+                    try self.statuses.put(worker_id, .conflict);
                     return error.GitFailed;
                 }
             }
 
             // Clean merge — remove worktree and branch, update statuses
+            std.log.info("[teammux] merge success: worker {d}", .{worker_id});
             try self.statuses.put(worker_id, .success);
             self.active_merge = null;
 
@@ -138,27 +147,65 @@ pub const MergeCoordinator = struct {
             return .success;
         } else {
             // Non-zero exit — check for conflicts
+            std.log.info("[teammux] merge exit code {d} for worker {d} — checking for conflicts", .{ merge_result.exit_code, worker_id });
+
             const conflict_list = self.detectConflicts(project_root) catch {
+                // Detection failed — keep active_merge set so reject() can still abort
+                std.log.err("[teammux] conflict detection failed for worker {d}", .{worker_id});
                 try self.statuses.put(worker_id, .conflict);
-                self.active_merge = null;
-                return .conflicts;
+                return .conflict;
             };
 
             if (conflict_list.len > 0) {
+                std.log.info("[teammux] {d} conflicts detected for worker {d}", .{ conflict_list.len, worker_id });
                 if (self.conflicts.fetchRemove(worker_id)) |old| {
                     freeConflicts(self.allocator, old.value);
                 }
                 try self.conflicts.put(worker_id, conflict_list);
                 try self.statuses.put(worker_id, .conflict);
+                // active_merge stays set — repo is in MERGING state, reject() must be called
             } else {
+                // Non-zero exit but no conflict markers — abort and report error
+                std.log.err("[teammux] merge failed (no conflicts) for worker {d}", .{worker_id});
+                const abort = try runGitCapture(self.allocator, project_root, &.{ "merge", "--abort" });
+                abort.deinit(self.allocator);
                 self.active_merge = null;
                 try self.statuses.put(worker_id, .conflict);
                 freeConflicts(self.allocator, conflict_list);
                 return error.GitFailed;
             }
 
-            return .conflicts;
+            return .conflict;
         }
+    }
+
+    /// Rebase strategy: checkout worker branch → rebase onto main → checkout main → fast-forward merge.
+    /// This preserves main's history (no rewrite) while linearizing the worker's commits.
+    fn runRebaseStrategy(self: *MergeCoordinator, project_root: []const u8, branch_name: []const u8) !GitOutput {
+        // Step 1: checkout worker branch
+        const checkout_branch = try runGitCapture(self.allocator, project_root, &.{ "checkout", branch_name });
+        defer checkout_branch.deinit(self.allocator);
+        if (checkout_branch.exit_code != 0) return .{ .exit_code = checkout_branch.exit_code, .stdout = try self.allocator.dupe(u8, "") };
+
+        // Step 2: rebase worker onto main
+        const rebase = try runGitCapture(self.allocator, project_root, &.{ "rebase", "main" });
+        if (rebase.exit_code != 0) {
+            // Rebase failed — abort and return to main
+            const abort = try runGitCapture(self.allocator, project_root, &.{ "rebase", "--abort" });
+            abort.deinit(self.allocator);
+            const back = try runGitCapture(self.allocator, project_root, &.{ "checkout", "main" });
+            back.deinit(self.allocator);
+            return rebase; // Return the rebase failure result
+        }
+        rebase.deinit(self.allocator);
+
+        // Step 3: checkout main
+        const checkout_main = try runGitCapture(self.allocator, project_root, &.{ "checkout", "main" });
+        defer checkout_main.deinit(self.allocator);
+        if (checkout_main.exit_code != 0) return .{ .exit_code = checkout_main.exit_code, .stdout = try self.allocator.dupe(u8, "") };
+
+        // Step 4: fast-forward merge
+        return try runGitCapture(self.allocator, project_root, &.{ "merge", "--ff-only", branch_name });
     }
 
     /// Reject a worker's merge: abort any in-progress merge, remove worktree, delete branch.
@@ -175,10 +222,20 @@ pub const MergeCoordinator = struct {
         const wt_path = try self.allocator.dupe(u8, worker.worktree_path);
         defer self.allocator.free(wt_path);
 
+        std.log.info("[teammux] merge reject: worker {d} branch={s}", .{ worker_id, branch_name });
+
         // If this worker has an active merge (repo in merging state), abort it
         if (self.active_merge) |active| {
             if (active == worker_id) {
-                runGitIgnoreResult(self.allocator, project_root, &.{ "merge", "--abort" });
+                const abort_result = runGitCapture(self.allocator, project_root, &.{ "merge", "--abort" }) catch |err| {
+                    std.log.err("[teammux] merge --abort spawn failed for worker {d}: {}", .{ worker_id, err });
+                    self.active_merge = null;
+                    return err;
+                };
+                defer abort_result.deinit(self.allocator);
+                if (abort_result.exit_code != 0) {
+                    std.log.warn("[teammux] merge --abort exited {d} for worker {d} (may not have been in merging state)", .{ abort_result.exit_code, worker_id });
+                }
                 self.active_merge = null;
             }
         }
@@ -190,7 +247,9 @@ pub const MergeCoordinator = struct {
         runGitIgnoreResult(self.allocator, project_root, &.{ "branch", "-D", branch_name });
 
         // Remove from roster (worktree remove will fail silently — already done)
-        roster.dismiss(project_root, worker_id) catch {};
+        roster.dismiss(project_root, worker_id) catch |err| switch (err) {
+            error.WorkerNotFound => {}, // Already removed by reject cleanup
+        };
 
         // Set merge status to rejected
         try self.statuses.put(worker_id, .rejected);
@@ -235,27 +294,34 @@ pub const MergeCoordinator = struct {
             const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ project_root, trimmed });
             defer self.allocator.free(file_path);
 
-            const file = std.fs.openFileAbsolute(file_path, .{}) catch {
-                const owned_path = try self.allocator.dupe(u8, trimmed);
-                errdefer self.allocator.free(owned_path);
-                const empty = try self.allocator.dupe(u8, "");
-                errdefer self.allocator.free(empty);
-                const ctype = try self.allocator.dupe(u8, "unknown");
-                errdefer self.allocator.free(ctype);
-                const empty2 = try self.allocator.dupe(u8, "");
-                try all_conflicts.append(self.allocator, .{
-                    .file_path = owned_path,
-                    .conflict_type = ctype,
-                    .ours = empty,
-                    .theirs = empty2,
-                });
-                continue;
+            const file = std.fs.openFileAbsolute(file_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => {
+                    // TOCTOU: file listed by git diff but deleted before we could read it
+                    const owned_path = try self.allocator.dupe(u8, trimmed);
+                    errdefer self.allocator.free(owned_path);
+                    const empty = try self.allocator.dupe(u8, "");
+                    errdefer self.allocator.free(empty);
+                    const ctype = try self.allocator.dupe(u8, "unknown");
+                    errdefer self.allocator.free(ctype);
+                    const empty2 = try self.allocator.dupe(u8, "");
+                    try all_conflicts.append(self.allocator, .{
+                        .file_path = owned_path,
+                        .conflict_type = ctype,
+                        .ours = empty,
+                        .theirs = empty2,
+                    });
+                    continue;
+                },
+                else => return err,
             };
             defer file.close();
             const content = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
             defer self.allocator.free(content);
 
             const parsed = try parseConflictMarkers(self.allocator, trimmed, content);
+            errdefer {
+                for (parsed) |c| freeConflict(self.allocator, c);
+            }
             defer self.allocator.free(parsed);
             try all_conflicts.appendSlice(self.allocator, parsed);
         }
@@ -334,7 +400,7 @@ pub fn parseConflictMarkers(allocator: std.mem.Allocator, file_path: []const u8,
 // Git subprocess helpers
 // ─────────────────────────────────────────────────────────
 
-/// Run git command and capture stdout, stderr, and exit code.
+/// Run git command and capture stdout and exit code. Stderr is discarded.
 pub fn runGitCapture(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8) !GitOutput {
     var argv: std.ArrayList([]const u8) = .{};
     defer argv.deinit(allocator);
@@ -346,14 +412,12 @@ pub fn runGitCapture(allocator: std.mem.Allocator, cwd: []const u8, args: []cons
     var child = std.process.Child.init(argv.items, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
 
     try child.spawn();
     const stdout = child.stdout.?;
-    const stderr = child.stderr.?;
     const stdout_data = try stdout.readToEndAlloc(allocator, 10 * 1024 * 1024);
     errdefer allocator.free(stdout_data);
-    const stderr_data = try stderr.readToEndAlloc(allocator, 10 * 1024 * 1024);
     const term = try child.wait();
 
     const exit_code: u32 = if (term == .Exited) term.Exited else 128;
@@ -361,7 +425,6 @@ pub fn runGitCapture(allocator: std.mem.Allocator, cwd: []const u8, args: []cons
     return .{
         .exit_code = exit_code,
         .stdout = stdout_data,
-        .stderr = stderr_data,
     };
 }
 
@@ -414,17 +477,14 @@ test "merge - status tracking" {
     var mc = MergeCoordinator.init(std.testing.allocator);
     defer mc.deinit();
 
-    // Default is pending
     try std.testing.expect(mc.getStatus(42) == .pending);
 
-    // Set and get
     try mc.statuses.put(42, .in_progress);
     try std.testing.expect(mc.getStatus(42) == .in_progress);
 
     try mc.statuses.put(42, .success);
     try std.testing.expect(mc.getStatus(42) == .success);
 
-    // Different workers are independent
     try std.testing.expect(mc.getStatus(99) == .pending);
 }
 
@@ -497,7 +557,6 @@ test "merge - runGitCapture captures output" {
     worktree.runGit(std.testing.allocator, path, &.{ "init", "-b", "main" }) catch return;
     worktree.runGit(std.testing.allocator, path, &.{ "config", "user.email", "test@test.com" }) catch return;
     worktree.runGit(std.testing.allocator, path, &.{ "config", "user.name", "Test" }) catch return;
-    // Need at least one commit for rev-parse HEAD to work
     const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{path});
     defer std.testing.allocator.free(readme_path);
     {
@@ -527,7 +586,6 @@ fn setupTestRepo(allocator: std.mem.Allocator) !struct { tmp: std.testing.TmpDir
     try worktree.runGit(allocator, path, &.{ "config", "user.email", "test@test.com" });
     try worktree.runGit(allocator, path, &.{ "config", "user.name", "Test" });
 
-    // Initial commit
     const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{path});
     defer allocator.free(readme_path);
     const readme = try std.fs.createFileAbsolute(readme_path, .{});
@@ -556,13 +614,9 @@ test "merge - reject removes worktree and branch (integration)" {
 
     try mc.reject(&roster, repo.path, id);
 
-    // Worker should be removed from roster
     try std.testing.expect(roster.getWorker(id) == null);
-
-    // Status should be rejected
     try std.testing.expect(mc.getStatus(id) == .rejected);
 
-    // Branch should be deleted
     const branch_result = try runGitCapture(std.testing.allocator, repo.path, &.{ "branch", "--list", branch_name });
     defer branch_result.deinit(std.testing.allocator);
     const branch_output = std.mem.trim(u8, branch_result.stdout, &[_]u8{ '\n', '\r', ' ' });
@@ -581,7 +635,6 @@ test "merge - approve clean merge (integration)" {
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
-    // Make a commit on the worker branch
     const file_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/feature.txt", .{wt_path});
     defer std.testing.allocator.free(file_path);
     const file = try std.fs.createFileAbsolute(file_path, .{});
@@ -598,12 +651,10 @@ test "merge - approve clean merge (integration)" {
     try std.testing.expect(result == .success);
     try std.testing.expect(mc.getStatus(id) == .success);
 
-    // Worker should still exist in roster with complete status
     const worker = roster.getWorker(id);
     try std.testing.expect(worker != null);
     try std.testing.expect(worker.?.status == .complete);
 
-    // feature.txt should exist on main
     const main_feature = try std.fmt.allocPrint(std.testing.allocator, "{s}/feature.txt", .{repo.path});
     defer std.testing.allocator.free(main_feature);
     const check = std.fs.openFileAbsolute(main_feature, .{});
@@ -622,7 +673,6 @@ test "merge - approve with conflicts (integration)" {
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
-    // Modify README.md on the worker branch
     const wt_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{wt_path});
     defer std.testing.allocator.free(wt_readme);
     {
@@ -633,7 +683,6 @@ test "merge - approve with conflicts (integration)" {
     try worktree.runGit(std.testing.allocator, wt_path, &.{ "add", "." });
     try worktree.runGit(std.testing.allocator, wt_path, &.{ "commit", "-m", "worker edit" });
 
-    // Modify README.md on main (creates conflict)
     const main_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{repo.path});
     defer std.testing.allocator.free(main_readme);
     {
@@ -649,10 +698,11 @@ test "merge - approve with conflicts (integration)" {
 
     const result = try mc.approve(&roster, repo.path, id, "merge");
 
-    try std.testing.expect(result == .conflicts);
+    try std.testing.expect(result == .conflict);
     try std.testing.expect(mc.getStatus(id) == .conflict);
+    // active_merge should stay set (repo in MERGING state)
+    try std.testing.expect(mc.active_merge != null);
 
-    // Should have conflicts for README.md
     const conflict_list = mc.getConflicts(id);
     try std.testing.expect(conflict_list != null);
     try std.testing.expect(conflict_list.?.len > 0);
@@ -674,7 +724,6 @@ test "merge - reject after conflicted merge (integration)" {
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
-    // Create conflict
     const wt_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{wt_path});
     defer std.testing.allocator.free(wt_readme);
     {
@@ -698,15 +747,123 @@ test "merge - reject after conflicted merge (integration)" {
     var mc = MergeCoordinator.init(std.testing.allocator);
     defer mc.deinit();
 
-    // Approve → conflicts
     const approve_result = try mc.approve(&roster, repo.path, id, "merge");
-    try std.testing.expect(approve_result == .conflicts);
+    try std.testing.expect(approve_result == .conflict);
     try std.testing.expect(mc.active_merge != null);
 
-    // Reject → cleans up everything
     try mc.reject(&roster, repo.path, id);
     try std.testing.expect(mc.getStatus(id) == .rejected);
     try std.testing.expect(mc.active_merge == null);
     try std.testing.expect(mc.getConflicts(id) == null);
     try std.testing.expect(roster.getWorker(id) == null);
+}
+
+test "merge - approve squash strategy (integration)" {
+    var repo = setupTestRepo(std.testing.allocator) catch return;
+    defer repo.tmp.cleanup();
+    defer std.testing.allocator.free(repo.path);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker5", "squash feature");
+    const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
+    defer std.testing.allocator.free(wt_path);
+
+    // Make two commits on worker branch
+    const fp1 = try std.fmt.allocPrint(std.testing.allocator, "{s}/file1.txt", .{wt_path});
+    defer std.testing.allocator.free(fp1);
+    {
+        const f = try std.fs.createFileAbsolute(fp1, .{});
+        try f.writeAll("file1");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "commit", "-m", "commit 1" });
+
+    const fp2 = try std.fmt.allocPrint(std.testing.allocator, "{s}/file2.txt", .{wt_path});
+    defer std.testing.allocator.free(fp2);
+    {
+        const f = try std.fs.createFileAbsolute(fp2, .{});
+        try f.writeAll("file2");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "commit", "-m", "commit 2" });
+
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    const result = try mc.approve(&roster, repo.path, id, "squash");
+
+    try std.testing.expect(result == .success);
+    try std.testing.expect(mc.getStatus(id) == .success);
+
+    // Verify squash commit message
+    const log_result = try runGitCapture(std.testing.allocator, repo.path, &.{ "log", "--oneline", "-1" });
+    defer log_result.deinit(std.testing.allocator);
+    const log_line = std.mem.trim(u8, log_result.stdout, &[_]u8{ '\n', '\r', ' ' });
+    try std.testing.expect(std.mem.indexOf(u8, log_line, "Squash merge:") != null);
+}
+
+test "merge - concurrent merge prevention" {
+    var repo = setupTestRepo(std.testing.allocator) catch return;
+    defer repo.tmp.cleanup();
+    defer std.testing.allocator.free(repo.path);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id1 = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "WorkerA", "task a");
+    const id2 = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "WorkerB", "task b");
+    const wt1 = try std.testing.allocator.dupe(u8, roster.getWorker(id1).?.worktree_path);
+    defer std.testing.allocator.free(wt1);
+
+    // Make conflicting changes on worker A so merge produces conflict state
+    const wt_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{wt1});
+    defer std.testing.allocator.free(wt_readme);
+    {
+        const f = try std.fs.createFileAbsolute(wt_readme, .{});
+        try f.writeAll("# WorkerA change");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, wt1, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, wt1, &.{ "commit", "-m", "workerA edit" });
+
+    const main_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{repo.path});
+    defer std.testing.allocator.free(main_readme);
+    {
+        const f = try std.fs.createFileAbsolute(main_readme, .{});
+        try f.writeAll("# Main conflict");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "commit", "-m", "main conflict" });
+
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    // Worker A merge → conflicts, active_merge set
+    const r1 = try mc.approve(&roster, repo.path, id1, "merge");
+    try std.testing.expect(r1 == .conflict);
+    try std.testing.expect(mc.active_merge != null);
+
+    // Worker B merge should be blocked
+    const r2 = mc.approve(&roster, repo.path, id2, "merge");
+    try std.testing.expectError(error.MergeInProgress, r2);
+
+    // Worker A re-approve should NOT be blocked (same worker retry)
+    // But it will fail at the git level since merge is still in progress
+    // We just verify it doesn't return MergeInProgress
+    const r3 = mc.approve(&roster, repo.path, id1, "merge");
+    // r3 should be .conflict again (not MergeInProgress error)
+    if (r3) |res| {
+        try std.testing.expect(res == .conflict);
+    } else |err| {
+        // GitFailed is also acceptable (merge on dirty state)
+        try std.testing.expect(err == error.GitFailed);
+    }
+
+    // Clean up
+    try mc.reject(&roster, repo.path, id1);
 }
