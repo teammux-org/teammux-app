@@ -255,20 +255,38 @@ pub const MessageBus = struct {
         );
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
 
-        child.spawn() catch return null;
-        const stdout = child.stdout.?;
-        const result = stdout.readToEndAlloc(self.allocator, 256) catch {
-            _ = child.wait() catch {};
+        child.spawn() catch |err| {
+            std.log.debug("[teammux] git rev-parse spawn failed: {s}", .{@errorName(err)});
             return null;
         };
-        const term = child.wait() catch {
+        const stdout = child.stdout.?;
+        const result = stdout.readToEndAlloc(self.allocator, 256) catch |err| {
+            std.log.debug("[teammux] git rev-parse stdout read failed: {s}", .{@errorName(err)});
+            _ = child.wait() catch |werr| {
+                std.log.debug("[teammux] git rev-parse cleanup failed: {s}", .{@errorName(werr)});
+            };
+            return null;
+        };
+        const term = child.wait() catch |err| {
+            std.log.debug("[teammux] git rev-parse wait failed: {s}", .{@errorName(err)});
             self.allocator.free(result);
             return null;
         };
 
         if (term != .Exited or term.Exited != 0 or result.len == 0) {
+            // Log stderr for diagnostics on failure
+            if (child.stderr) |stderr_stream| {
+                const stderr_out = stderr_stream.readToEndAlloc(self.allocator, 256) catch null;
+                if (stderr_out) |se| {
+                    defer self.allocator.free(se);
+                    const trimmed_err = std.mem.trim(u8, se, &[_]u8{ '\n', '\r', ' ' });
+                    if (trimmed_err.len > 0) {
+                        std.log.debug("[teammux] git rev-parse failed: {s}", .{trimmed_err});
+                    }
+                }
+            }
             self.allocator.free(result);
             return null;
         }
@@ -279,7 +297,8 @@ pub const MessageBus = struct {
             return null;
         }
 
-        const commit = self.allocator.dupe(u8, trimmed) catch {
+        const commit = self.allocator.dupe(u8, trimmed) catch |err| {
+            std.log.debug("[teammux] git rev-parse alloc failed: {s}", .{@errorName(err)});
             self.allocator.free(result);
             return null;
         };
