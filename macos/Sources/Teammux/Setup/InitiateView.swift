@@ -132,6 +132,14 @@ struct InitiateView: View {
         isInitiating = true
         errorMessage = nil
 
+        // Validate config before writing any files
+        let validationErrors = teamConfig.validate()
+        if !validationErrors.isEmpty {
+            errorMessage = validationErrors.joined(separator: "\n")
+            isInitiating = false
+            return
+        }
+
         let fm = FileManager.default
         let teammuxDir = projectURL.appendingPathComponent(".teammux")
         let configFile = teammuxDir.appendingPathComponent("config.toml")
@@ -145,11 +153,12 @@ struct InitiateView: View {
             let toml = teamConfig.toTOML(projectName: projectURL.lastPathComponent)
             try toml.write(to: configFile, atomically: true, encoding: .utf8)
 
-            // 3. Write .gitignore
+            // 3. Write .gitignore (per spec Section 13)
             let gitignoreContent = """
-            # Teammux runtime data
-            *.log
-            worktrees/
+            worker-*/
+            config.local.toml
+            commands/
+            logs/
             """
             try gitignoreContent.write(to: gitignoreFile, atomically: true, encoding: .utf8)
 
@@ -160,16 +169,27 @@ struct InitiateView: View {
             )
 
             // 5. Create engine and start session
-            if let engine = projectManager.engine(for: project.id) {
-                let created = engine.create(projectRoot: projectURL.path)
-                if created {
-                    let started = engine.sessionStart()
-                    if !started {
-                        errorMessage = engine.lastError ?? "Failed to start session."
-                    }
-                } else {
-                    errorMessage = engine.lastError ?? "Failed to create engine."
-                }
+            guard let engine = projectManager.engine(for: project.id) else {
+                errorMessage = "Failed to create engine for project"
+                isInitiating = false
+                return
+            }
+
+            if !engine.create(projectRoot: projectURL.path) {
+                errorMessage = engine.lastError ?? "Failed to create engine"
+                projectManager.closeProject(project.id)
+                // Clean up .teammux directory
+                try? fm.removeItem(at: teammuxDir)
+                isInitiating = false
+                return
+            }
+
+            if !engine.sessionStart() {
+                errorMessage = engine.lastError ?? "Failed to start session"
+                projectManager.closeProject(project.id)
+                try? fm.removeItem(at: teammuxDir)
+                isInitiating = false
+                return
             }
 
             isInitiating = false

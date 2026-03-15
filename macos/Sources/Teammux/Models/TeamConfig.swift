@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Represents the current GitHub connection state, shown in the Team Builder
 /// and workspace status areas.
-enum GitHubStatus: Equatable {
+enum GitHubStatus: Equatable, Sendable {
     case detecting
     case connected(String)   // associated value is "owner/repo"
     case disconnected
@@ -145,5 +145,24 @@ struct TeamConfig: Equatable {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\t", with: "\\t")
+    }
+
+    /// Validate the config and return a list of errors. Empty means valid.
+    func validate() -> [String] {
+        var errors: [String] = []
+        if teamLead.model.trimmingCharacters(in: .whitespaces).isEmpty {
+            errors.append("Team Lead model is required")
+        }
+        for worker in workers {
+            if worker.name.trimmingCharacters(in: .whitespaces).isEmpty {
+                errors.append("Worker name is required")
+            }
+            if worker.model.trimmingCharacters(in: .whitespaces).isEmpty {
+                errors.append("Worker model is required for \(worker.name)")
+            }
+        }
+        return errors
     }
 }

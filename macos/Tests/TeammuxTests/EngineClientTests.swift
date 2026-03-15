@@ -32,7 +32,7 @@ struct EngineClientTests {
 
     @Test func gitHubDisconnectedOnCreate() {
         let client = EngineClient()
-        #expect(client.githubConnected == false)
+        #expect(client.githubStatus == .disconnected)
     }
 
     @Test func worktreeReadyQueueEmptyOnCreate() {
@@ -85,7 +85,7 @@ struct EngineClientTests {
         let client = EngineClient()
         let result = client.connectGitHub()
         #expect(result == false)
-        #expect(client.githubConnected == false)
+        #expect(client.githubStatus == .disconnected)
         #expect(client.lastError == "Engine not created")
     }
 
@@ -122,7 +122,7 @@ struct EngineClientTests {
                 seq: 1
             )
         ]
-        client.githubConnected = true
+        client.githubStatus = .connected("test/repo")
         client.lastError = "some error"
 
         // destroy() should not crash and should clear all state
@@ -131,7 +131,7 @@ struct EngineClientTests {
         #expect(client.roster.isEmpty)
         #expect(client.messages.isEmpty)
         #expect(client.worktreeReadyQueue.isEmpty)
-        #expect(client.githubConnected == false)
+        #expect(client.githubStatus == .disconnected)
         #expect(client.lastError == nil)
         #expect(client.projectRoot == nil)
     }
@@ -203,9 +203,9 @@ struct EngineClientTests {
         // Hyphens preserved
         #expect(EngineClient.slugify("already-slugified") == "already-slugified")
 
-        // Multiple spaces collapse to hyphens (each space becomes a hyphen)
+        // Multiple spaces collapse to a single hyphen (consecutive hyphens are collapsed)
         let multiSpace = EngineClient.slugify("a  b")
-        #expect(multiSpace == "a--b")
+        #expect(multiSpace == "a-b")
     }
 
     // MARK: - Surface registry
@@ -265,6 +265,16 @@ struct EngineClientTests {
         client.destroy()
 
         #expect(client.surfaceView(for: 1) == nil)
+    }
+
+    // MARK: - WorktreeReady
+
+    @Test func worktreeReadyStruct() {
+        let ready = WorktreeReady(id: 1, worktreePath: "/tmp/wt", agentBinary: "claude", taskDescription: "test task")
+        #expect(ready.id == 1)
+        #expect(ready.worktreePath == "/tmp/wt")
+        #expect(ready.agentBinary == "claude")
+        #expect(ready.taskDescription == "test task")
     }
 
     // MARK: - Double create guard

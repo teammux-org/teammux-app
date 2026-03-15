@@ -119,10 +119,25 @@ struct WorkerInfoTests {
         )
     }
 
-    @Test func workerInfoEqualityById() {
-        // Same ID means equal, even if other fields differ
-        let w1 = makeWorker(id: 1, name: "Alice", status: .idle)
-        let w2 = makeWorker(id: 1, name: "Bob", status: .working)
+    @Test func workerInfoEqualityByAllFields() {
+        let w1 = WorkerInfo(id: 1, name: "A", taskDescription: "t", branchName: "b",
+                           worktreePath: "/p", status: .idle, agentType: .claudeCode,
+                           agentBinary: "claude", spawnedAt: Date(timeIntervalSince1970: 0))
+        let w2 = WorkerInfo(id: 1, name: "B", taskDescription: "t2", branchName: "b2",
+                           worktreePath: "/p2", status: .working, agentType: .codexCli,
+                           agentBinary: "codex", spawnedAt: Date(timeIntervalSince1970: 100))
+        // Now that we use synthesized Equatable, different fields = not equal
+        #expect(w1 != w2)
+    }
+
+    @Test func workerInfoEqualityIdenticalFields() {
+        let date = Date(timeIntervalSince1970: 1000)
+        let w1 = WorkerInfo(id: 1, name: "A", taskDescription: "t", branchName: "b",
+                           worktreePath: "/p", status: .idle, agentType: .claudeCode,
+                           agentBinary: "claude", spawnedAt: date)
+        let w2 = WorkerInfo(id: 1, name: "A", taskDescription: "t", branchName: "b",
+                           worktreePath: "/p", status: .idle, agentType: .claudeCode,
+                           agentBinary: "claude", spawnedAt: date)
         #expect(w1 == w2)
     }
 
@@ -250,7 +265,7 @@ struct GitHubPRTests {
             number: 42,
             url: "https://github.com/org/repo/pull/42",
             title: "Add feature",
-            state: "open"
+            state: .open
         )
         #expect(pr.id == 42)
         #expect(pr.number == 42)
@@ -261,11 +276,11 @@ struct GitHubPRTests {
             number: 100,
             url: "https://github.com/org/repo/pull/100",
             title: "Fix bug",
-            state: "closed"
+            state: .closed
         )
         #expect(pr.url == "https://github.com/org/repo/pull/100")
         #expect(pr.title == "Fix bug")
-        #expect(pr.state == "closed")
+        #expect(pr.state == .closed)
     }
 }
 
@@ -362,6 +377,26 @@ struct TeamConfigTests {
         let toml = config.toTOML(projectName: "TestProject")
 
         #expect(!toml.contains("github_repo"))
+    }
+
+    @Test func teamConfigTOMLEmptyGitHubRepoOmitted() {
+        var config = TeamConfig.default
+        config.githubRepo = ""
+        let toml = config.toTOML(projectName: "Test")
+        #expect(!toml.contains("github_repo"))
+    }
+
+    @Test func teamConfigValidateEmptyModel() {
+        var config = TeamConfig.default
+        config.teamLead.model = ""
+        let errors = config.validate()
+        #expect(!errors.isEmpty)
+    }
+
+    @Test func teamConfigValidatePassesDefault() {
+        let config = TeamConfig.default
+        let errors = config.validate()
+        #expect(errors.isEmpty)
     }
 
     @Test func teamConfigTOMLEscaping() {
@@ -513,5 +548,51 @@ struct ProjectTests {
             hasUnseenActivity: true
         )
         #expect(project.hasUnseenActivity == true)
+    }
+}
+
+// MARK: - C Value Round-Trip Tests
+
+@Suite
+struct CValueRoundTripTests {
+
+    @Test func workerStatusCValueRoundTrip() {
+        for status in WorkerStatus.allCases {
+            let roundTripped = WorkerStatus(fromCValue: Int32(status.rawValue))
+            #expect(roundTripped == status)
+        }
+    }
+
+    @Test func agentTypeRoundTrip() {
+        let cases: [(AgentType, String)] = [
+            (.claudeCode, "claude"),
+            (.codexCli, "codex"),
+            (.custom("test-agent"), "test-agent")
+        ]
+        for (agent, binary) in cases {
+            let roundTripped = AgentType(fromCValue: agent.cValue, binaryName: binary)
+            #expect(roundTripped == agent)
+        }
+    }
+
+    @Test func messageTypeRoundTrip() {
+        for type in MessageType.allCases {
+            let roundTripped = MessageType(fromCValue: type.cValue)
+            #expect(roundTripped == type)
+        }
+    }
+}
+
+// MARK: - PRState Tests
+
+@Suite
+struct PRStateTests {
+
+    @Test func prStateFromString() {
+        #expect(PRState(from: "open") == .open)
+        #expect(PRState(from: "closed") == .closed)
+        #expect(PRState(from: "merged") == .merged)
+        #expect(PRState(from: "OPEN") == .open)  // case insensitive
+        #expect(PRState(from: "banana") == .unknown)
     }
 }

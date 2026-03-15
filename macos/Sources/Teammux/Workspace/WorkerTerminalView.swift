@@ -12,6 +12,7 @@ struct WorkerTerminalView: NSViewRepresentable {
     @EnvironmentObject var ghosttyApp: Ghostty.App
 
     let worker: WorkerInfo
+    let engine: EngineClient
 
     func makeNSView(context: Context) -> NSView {
         guard let app = ghosttyApp.app else {
@@ -29,6 +30,7 @@ struct WorkerTerminalView: NSViewRepresentable {
         }
 
         let surfaceView = Ghostty.SurfaceView(app, baseConfig: config)
+        engine.registerSurface(surfaceView, for: worker.id)
         return surfaceView
     }
 

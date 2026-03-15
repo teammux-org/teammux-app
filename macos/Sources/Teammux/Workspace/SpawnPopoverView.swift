@@ -14,6 +14,7 @@ struct SpawnPopoverView: View {
     @State private var selectedAgentType: AgentTypeOption = .claudeCode
     @State private var customBinary: String = ""
     @State private var isSpawning = false
+    @State private var spawnError: String?
 
     /// Simplified agent type picker options.
     enum AgentTypeOption: String, CaseIterable, Identifiable {
@@ -102,6 +103,13 @@ struct SpawnPopoverView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            // Spawn error
+            if let error = spawnError {
+                Text(error)
+                    .foregroundColor(.red)
+                    .font(.caption)
+            }
+
             // Spawn button
             HStack {
                 Spacer()
@@ -127,25 +135,30 @@ struct SpawnPopoverView: View {
 
     private func spawnWorker() {
         isSpawning = true
+        spawnError = nil
 
-        let name = workerName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedName = name.isEmpty
-            ? "Worker \(engine.roster.count + 1)"
-            : name
+        Task {
+            let name = workerName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedName = name.isEmpty
+                ? "Worker \(engine.roster.count + 1)"
+                : name
 
-        let agentType = selectedAgentType.toAgentType(customBinary: customBinary)
-        let binary = selectedAgentType.resolvedBinary(customBinary: customBinary)
+            let agentType = selectedAgentType.toAgentType(customBinary: customBinary)
+            let binary = selectedAgentType.resolvedBinary(customBinary: customBinary)
 
-        let workerId = engine.spawnWorker(
-            agentBinary: binary,
-            agentType: agentType,
-            workerName: resolvedName,
-            taskDescription: taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
+            let workerId = engine.spawnWorker(
+                agentBinary: binary,
+                agentType: agentType,
+                workerName: resolvedName,
+                taskDescription: taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
 
-        isSpawning = false
+            isSpawning = false
 
-        if workerId != 0 {
+            if workerId == 0 {
+                spawnError = engine.lastError ?? "Failed to spawn worker"
+                return  // don't dismiss
+            }
             isPresented = false
         }
     }

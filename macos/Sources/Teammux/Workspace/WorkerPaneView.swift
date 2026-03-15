@@ -47,7 +47,7 @@ struct WorkerPaneView: View {
     private var workerStack: some View {
         ZStack {
             ForEach(engine.roster) { worker in
-                WorkerTerminalView(worker: worker)
+                WorkerTerminalView(worker: worker, engine: engine)
                     .opacity(activeWorkerId == worker.id ? 1 : 0)
                     .allowsHitTesting(activeWorkerId == worker.id)
             }

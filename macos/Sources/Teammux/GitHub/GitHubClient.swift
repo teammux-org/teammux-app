@@ -115,8 +115,14 @@ class GitHubOAuthFlow: NSObject, ObservableObject, ASWebAuthenticationPresentati
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
-        guard status == errSecSuccess,
-              let data = result as? Data,
+        guard status == errSecSuccess else {
+            if status != errSecItemNotFound {
+                error = "Keychain read failed (OSStatus \(status))"
+            }
+            return nil
+        }
+
+        guard let data = result as? Data,
               let tokenString = String(data: data, encoding: .utf8) else {
             return nil
         }
@@ -143,7 +149,11 @@ class GitHubOAuthFlow: NSObject, ObservableObject, ASWebAuthenticationPresentati
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: keychainAccount
         ]
-        SecItemDelete(deleteQuery as CFDictionary)
+        let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            error = "Keychain delete failed (OSStatus \(deleteStatus))"
+            return
+        }
 
         let addQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -167,6 +177,7 @@ class GitHubOAuthFlow: NSObject, ObservableObject, ASWebAuthenticationPresentati
     /// client secret. For now we treat the authorization code itself as
     /// the token and persist it.
     private func exchangeCodeForToken(_ code: String) async {
+        #warning("TODO: Implement proper OAuth token exchange — currently saves raw auth code as token")
         // Placeholder: a real implementation would call
         // https://github.com/login/oauth/access_token with the client
         // secret and exchange the code for an actual bearer token.

@@ -191,8 +191,15 @@ struct ProjectPickerView: View {
             .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted) { providers in
                 guard let provider = providers.first else { return false }
 
-                _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                    guard let url else { return }
+                _ = provider.loadObject(ofClass: URL.self) { url, loadError in
+                    guard let url else {
+                        if let loadError {
+                            DispatchQueue.main.async {
+                                self.validationError = "Could not read dropped item: \(loadError.localizedDescription)"
+                            }
+                        }
+                        return
+                    }
                     DispatchQueue.main.async {
                         var isDir: ObjCBool = false
                         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),

@@ -8,11 +8,11 @@ import SwiftUI
 /// Each project maps to an independent `EngineClient` instance.
 /// The active project determines which pane content is shown.
 @MainActor
-class ProjectManager: ObservableObject {
+final class ProjectManager: ObservableObject {
 
     // MARK: - Published state
 
-    @Published var projects: [Project] = []
+    @Published private(set) var projects: [Project] = []
     @Published var activeProjectId: UUID?
 
     // MARK: - Computed properties
@@ -98,10 +98,14 @@ class ProjectManager: ObservableObject {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        let name = url.lastPathComponent
-        addProject(name: name, path: url)
+        if panel.runModal() == .OK, let url = panel.url {
+            let gitDir = url.appendingPathComponent(".git")
+            guard FileManager.default.fileExists(atPath: gitDir.path) else {
+                // Cannot show error from here — just don't add
+                return
+            }
+            _ = addProject(name: url.lastPathComponent, path: url)
+        }
     }
 
     /// Retrieve the engine for a specific project id.

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import os
 
 // MARK: - MergeStrategy
 
@@ -24,20 +25,32 @@ enum MergeStrategy: Int, Sendable {
 /// `spawnWorker` creates a worktree + branch, Swift creates a
 /// `Ghostty.SurfaceView` to launch the agent. Message bus text
 /// injection goes via `SurfaceView.sendText()`, not the engine.
+/// A worker whose worktree is ready but whose SurfaceView has not yet been created.
+struct WorktreeReady: Identifiable, Equatable, Sendable {
+    let id: UInt32  // worker ID, also serves as Identifiable.id
+    let worktreePath: String
+    let agentBinary: String
+    let taskDescription: String
+}
+
 @MainActor
 final class EngineClient: ObservableObject {
+
+    // MARK: - Logger
+
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "EngineClient")
 
     // MARK: - Published properties
 
     @Published var roster: [WorkerInfo] = []
     @Published var messages: [TeamMessage] = []
-    @Published var githubConnected: Bool = false
+    @Published var githubStatus: GitHubStatus = .disconnected
     @Published var lastError: String? = nil
     @Published var projectRoot: String? = nil
 
     /// Workers whose worktree is ready but whose SurfaceView has not
     /// yet been created. `WorkerPaneView` observes this to spawn terminals.
-    @Published var worktreeReadyQueue: [(workerId: UInt32, path: String, binary: String, task: String)] = []
+    @Published var worktreeReadyQueue: [WorktreeReady] = []
 
     // MARK: - Private state
 
@@ -88,9 +101,12 @@ final class EngineClient: ObservableObject {
             return char
         }
         let filtered = replaced.filter { $0.isLetter || $0.isNumber || $0 == "-" }
-        let slug = String(filtered)
-        return slug
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        // Collapse consecutive hyphens
+        var slug = String(filtered)
+        while slug.contains("--") {
+            slug = slug.replacingOccurrences(of: "--", with: "-")
+        }
+        return slug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
     }
 
     // MARK: - Engine lifecycle
@@ -101,6 +117,7 @@ final class EngineClient: ObservableObject {
     func create(projectRoot: String) -> Bool {
         guard engine == nil else {
             lastError = "Engine already created"
+            Self.logger.error("Engine already created")
             return false
         }
 
@@ -110,6 +127,7 @@ final class EngineClient: ObservableObject {
 
         guard let ptr else {
             lastError = "tm_engine_create returned nil"
+            Self.logger.error("tm_engine_create returned nil")
             return false
         }
 
@@ -124,12 +142,15 @@ final class EngineClient: ObservableObject {
     func sessionStart() -> Bool {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return false
         }
 
         let result = tm_session_start(engine)
         guard result == TM_OK else {
-            lastError = lastEngineError() ?? "tm_session_start failed (\(result.rawValue))"
+            let msg = lastEngineError() ?? "tm_session_start failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("sessionStart failed: \(msg)")
             return false
         }
 
@@ -157,7 +178,7 @@ final class EngineClient: ObservableObject {
         roster.removeAll()
         messages.removeAll()
         worktreeReadyQueue.removeAll()
-        githubConnected = false
+        githubStatus = .disconnected
         lastError = nil
     }
 
@@ -168,11 +189,14 @@ final class EngineClient: ObservableObject {
     func reloadConfig() {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return
         }
         let result = tm_config_reload(engine)
         if result != TM_OK {
-            lastError = lastEngineError() ?? "tm_config_reload failed (\(result.rawValue))"
+            let msg = lastEngineError() ?? "tm_config_reload failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("reloadConfig failed: \(msg)")
         }
     }
 
@@ -191,6 +215,7 @@ final class EngineClient: ObservableObject {
     ) -> UInt32 {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return 0
         }
 
@@ -209,7 +234,9 @@ final class EngineClient: ObservableObject {
         }
 
         if workerId == 0 {
-            lastError = lastEngineError() ?? "tm_worker_spawn failed"
+            let msg = lastEngineError() ?? "tm_worker_spawn failed"
+            lastError = msg
+            Self.logger.error("spawnWorker failed: \(msg)")
             return 0
         }
 
@@ -220,12 +247,15 @@ final class EngineClient: ObservableObject {
             let task = String(cString: infoPtr.pointee.task_description)
             tm_worker_info_free(infoPtr)
 
-            worktreeReadyQueue.append((
-                workerId: workerId,
-                path: path,
-                binary: binary,
-                task: task
+            worktreeReadyQueue.append(WorktreeReady(
+                id: workerId,
+                worktreePath: path,
+                agentBinary: binary,
+                taskDescription: task
             ))
+        } else {
+            lastError = "Worker \(workerId) spawned but tm_worker_get returned nil"
+            Self.logger.error("Worker \(workerId) spawned but tm_worker_get returned nil")
         }
 
         // Refresh the roster to pick up the new worker
@@ -241,17 +271,20 @@ final class EngineClient: ObservableObject {
     func dismissWorker(_ workerId: UInt32) -> Bool {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return false
         }
 
         let result = tm_worker_dismiss(engine, workerId)
-        unregisterSurface(for: workerId)
 
         guard result == TM_OK else {
-            lastError = lastEngineError() ?? "tm_worker_dismiss failed (\(result.rawValue))"
+            let msg = lastEngineError() ?? "tm_worker_dismiss failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("dismissWorker failed: \(msg)")
             return false
         }
 
+        unregisterSurface(for: workerId)
         refreshRoster()
         return true
     }
@@ -296,6 +329,7 @@ final class EngineClient: ObservableObject {
     func sendMessage(to workerId: UInt32, type: MessageType, payload: String) -> Bool {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return false
         }
 
@@ -309,7 +343,9 @@ final class EngineClient: ObservableObject {
         }
 
         guard result == TM_OK else {
-            lastError = lastEngineError() ?? "tm_message_send failed (\(result.rawValue))"
+            let msg = lastEngineError() ?? "tm_message_send failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("sendMessage failed: \(msg)")
             return false
         }
 
@@ -322,6 +358,7 @@ final class EngineClient: ObservableObject {
     func broadcastMessage(type: MessageType, payload: String) -> Bool {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return false
         }
 
@@ -334,7 +371,9 @@ final class EngineClient: ObservableObject {
         }
 
         guard result == TM_OK else {
-            lastError = lastEngineError() ?? "tm_message_broadcast failed (\(result.rawValue))"
+            let msg = lastEngineError() ?? "tm_message_broadcast failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("broadcastMessage failed: \(msg)")
             return false
         }
 
@@ -349,17 +388,29 @@ final class EngineClient: ObservableObject {
     func connectGitHub() -> Bool {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return false
         }
 
         let result = tm_github_auth(engine)
         guard result == TM_OK else {
-            lastError = lastEngineError() ?? "tm_github_auth failed (\(result.rawValue))"
+            let msg = lastEngineError() ?? "tm_github_auth failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("connectGitHub failed: \(msg)")
+            githubStatus = .error(msg)
             return false
         }
 
-        githubConnected = tm_github_is_authed(engine)
-        return githubConnected
+        if tm_github_is_authed(engine) {
+            githubStatus = .connected("engine")
+            return true
+        } else {
+            let msg = "GitHub auth succeeded but is_authed returned false"
+            lastError = msg
+            Self.logger.error("\(msg)")
+            githubStatus = .error(msg)
+            return false
+        }
     }
 
     /// Create a pull request for a worker's branch.
@@ -368,6 +419,7 @@ final class EngineClient: ObservableObject {
     func createPR(for workerId: UInt32, title: String, body: String) -> GitHubPR? {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return nil
         }
 
@@ -378,7 +430,9 @@ final class EngineClient: ObservableObject {
         }
 
         guard let prPtr else {
-            lastError = lastEngineError() ?? "tm_github_create_pr failed"
+            let msg = lastEngineError() ?? "tm_github_create_pr failed"
+            lastError = msg
+            Self.logger.error("createPR failed: \(msg)")
             return nil
         }
 
@@ -386,7 +440,7 @@ final class EngineClient: ObservableObject {
             number: prPtr.pointee.pr_number,
             url: String(cString: prPtr.pointee.pr_url),
             title: String(cString: prPtr.pointee.title),
-            state: String(cString: prPtr.pointee.state)
+            state: PRState(from: String(cString: prPtr.pointee.state))
         )
 
         tm_pr_free(prPtr)
@@ -399,6 +453,7 @@ final class EngineClient: ObservableObject {
     func mergePR(_ prNumber: UInt64, strategy: MergeStrategy) -> Bool {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return false
         }
 
@@ -409,7 +464,9 @@ final class EngineClient: ObservableObject {
         )
 
         guard result == TM_OK else {
-            lastError = lastEngineError() ?? "tm_github_merge_pr failed (\(result.rawValue))"
+            let msg = lastEngineError() ?? "tm_github_merge_pr failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("mergePR failed: \(msg)")
             return false
         }
 
@@ -422,11 +479,14 @@ final class EngineClient: ObservableObject {
     func getDiff(for workerId: UInt32) -> [DiffFile] {
         guard let engine else {
             lastError = "Engine not created"
+            Self.logger.error("Engine not created")
             return []
         }
 
         guard let diffPtr = tm_github_get_diff(engine, workerId) else {
-            lastError = lastEngineError() ?? "tm_github_get_diff failed"
+            let msg = lastEngineError() ?? "tm_github_get_diff failed"
+            lastError = msg
+            Self.logger.error("getDiff failed: \(msg)")
             return []
         }
 
@@ -464,7 +524,14 @@ final class EngineClient: ObservableObject {
 
         // --- Roster changes ---
         tm_roster_watch(engine, { rosterPtr, userdata in
-            guard let userdata, let rosterPtr else { return }
+            guard let userdata else {
+                Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("roster_watch: nil userdata")
+                return
+            }
+            guard let rosterPtr else {
+                Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("roster_watch: nil rosterPtr")
+                return
+            }
 
             // Copy all data from the C roster while we are on the callback thread.
             var workers: [WorkerInfo] = []
@@ -496,7 +563,14 @@ final class EngineClient: ObservableObject {
 
         // --- Message subscription ---
         tm_message_subscribe(engine, { messagePtr, userdata in
-            guard let userdata, let messagePtr else { return }
+            guard let userdata else {
+                Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("message_subscribe: nil userdata")
+                return
+            }
+            guard let messagePtr else {
+                Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("message_subscribe: nil messagePtr")
+                return
+            }
 
             // Copy all string data while on the callback thread.
             let from = messagePtr.pointee.from
@@ -528,7 +602,10 @@ final class EngineClient: ObservableObject {
 
         // --- Command interception (/teammux-*) ---
         tm_commands_watch(engine, { commandPtr, argsPtr, userdata in
-            guard let userdata else { return }
+            guard let userdata else {
+                Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("commands_watch: nil userdata")
+                return
+            }
 
             // Copy strings before crossing thread boundary.
             let command: String = {
@@ -548,7 +625,10 @@ final class EngineClient: ObservableObject {
 
         // --- GitHub webhooks ---
         tm_github_webhooks_start(engine, { eventTypePtr, payloadPtr, userdata in
-            guard let userdata else { return }
+            guard let userdata else {
+                Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("github_webhooks: nil userdata")
+                return
+            }
 
             let eventType: String = {
                 guard let eventTypePtr else { return "" }
@@ -567,7 +647,10 @@ final class EngineClient: ObservableObject {
 
         // --- Config watcher ---
         tm_config_watch(engine, { userdata in
-            guard let userdata else { return }
+            guard let userdata else {
+                Logger(subsystem: "com.teammux.app", category: "EngineClient").warning("config_watch: nil userdata")
+                return
+            }
 
             let client = Unmanaged<EngineClient>.fromOpaque(userdata).takeUnretainedValue()
             Task { @MainActor in
@@ -585,23 +668,34 @@ final class EngineClient: ObservableObject {
 
         switch command {
         case "/teammux-add":
+            guard let task = args["task"], !task.isEmpty else {
+                lastError = "/teammux-add: missing or empty task"
+                Self.logger.error("/teammux-add: missing or empty task")
+                return
+            }
             let binary = args["binary"] ?? "claude"
             let agentTypeRaw = Int32(args["agent_type"] ?? "0") ?? 0
             let agentType = AgentType(fromCValue: agentTypeRaw)
             let name = args["name"] ?? "Worker"
-            let task = args["task"] ?? ""
-            _ = spawnWorker(
+            let workerId = spawnWorker(
                 agentBinary: binary,
                 agentType: agentType,
                 workerName: name,
                 taskDescription: task
             )
+            if workerId == 0 {
+                Self.logger.error("handleCommand /teammux-add: spawnWorker returned 0")
+            }
 
         case "/teammux-remove":
             if let idStr = args["worker_id"], let workerId = UInt32(idStr) {
-                _ = dismissWorker(workerId)
+                let success = dismissWorker(workerId)
+                if !success {
+                    Self.logger.error("handleCommand /teammux-remove: dismissWorker failed for \(workerId)")
+                }
             } else {
                 lastError = "/teammux-remove: missing or invalid worker_id"
+                Self.logger.error("/teammux-remove: missing or invalid worker_id")
             }
 
         case "/teammux-message":
@@ -611,9 +705,13 @@ final class EngineClient: ObservableObject {
                let typeRaw = Int(typeStr),
                let type = MessageType(rawValue: typeRaw) {
                 let payload = args["payload"] ?? ""
-                _ = sendMessage(to: to, type: type, payload: payload)
+                let success = sendMessage(to: to, type: type, payload: payload)
+                if !success {
+                    Self.logger.error("handleCommand /teammux-message: sendMessage failed")
+                }
             } else {
                 lastError = "/teammux-message: missing to, type, or payload"
+                Self.logger.error("/teammux-message: missing to, type, or payload")
             }
 
         case "/teammux-broadcast":
@@ -621,13 +719,18 @@ final class EngineClient: ObservableObject {
                let typeRaw = Int(typeStr),
                let type = MessageType(rawValue: typeRaw) {
                 let payload = args["payload"] ?? ""
-                _ = broadcastMessage(type: type, payload: payload)
+                let success = broadcastMessage(type: type, payload: payload)
+                if !success {
+                    Self.logger.error("handleCommand /teammux-broadcast: broadcastMessage failed")
+                }
             } else {
                 lastError = "/teammux-broadcast: missing type"
+                Self.logger.error("/teammux-broadcast: missing type")
             }
 
         default:
             lastError = "Unknown command: \(command)"
+            Self.logger.error("Unknown command: \(command)")
         }
     }
 
@@ -639,10 +742,14 @@ final class EngineClient: ObservableObject {
         case "pull_request":
             // Refresh auth status in case a PR event indicates changes
             if let engine {
-                githubConnected = tm_github_is_authed(engine)
+                if tm_github_is_authed(engine) {
+                    githubStatus = .connected("engine")
+                } else {
+                    githubStatus = .disconnected
+                }
             }
         default:
-            break
+            Self.logger.debug("Unhandled GitHub event type: \(eventType)")
         }
     }
 
@@ -674,18 +781,21 @@ final class EngineClient: ObservableObject {
                 return result
             }
         } catch {
-            // Fall through — return empty dict
+            lastError = "Failed to parse command args: \(error.localizedDescription)"
+            Self.logger.error("Failed to parse command args: \(error.localizedDescription)")
+            return [:]
         }
         return [:]
     }
 
     deinit {
-        // Safety: if someone drops the last reference without calling destroy(),
-        // clean up the engine handle. Note: deinit is not @MainActor-isolated,
-        // so we only call the C teardown functions which are thread-safe.
-        if let engine {
-            tm_session_stop(engine)
-            tm_engine_destroy(engine)
+        // Callers must call destroy() before dropping the last reference.
+        // We cannot safely call tm_* functions from deinit (non-MainActor context).
+        #if DEBUG
+        if engine != nil {
+            // Can't use assertionFailure in deinit reliably, but this logs the issue
+            print("EngineClient deallocated without calling destroy() -- engine handle leaked")
         }
+        #endif
     }
 }

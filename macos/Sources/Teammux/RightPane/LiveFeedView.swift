@@ -83,7 +83,7 @@ struct LiveFeedView: View {
                 .padding(.vertical, 4)
                 .padding(.horizontal, 8)
             }
-            .onChange(of: engine.messages.count) { _ in
+            .onChange(of: engine.messages.count) { _, _ in
                 // Auto-scroll to the latest message
                 if let lastMessage = engine.messages.last {
                     withAnimation(.easeOut(duration: 0.2)) {

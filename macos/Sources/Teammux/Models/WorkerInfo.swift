@@ -35,7 +35,14 @@ enum WorkerStatus: Int, CaseIterable, Sendable {
 
     /// Initialise from the C enum value. Falls back to `.idle` for unknown values.
     init(fromCValue value: Int32) {
-        self = WorkerStatus(rawValue: Int(value)) ?? .idle
+        if let known = WorkerStatus(rawValue: Int(value)) {
+            self = known
+        } else {
+            #if DEBUG
+            assertionFailure("Unknown WorkerStatus C value: \(value)")
+            #endif
+            self = .idle
+        }
     }
 }
 
@@ -80,7 +87,13 @@ enum AgentType: Equatable, Hashable, Sendable {
         switch value {
         case 0:  self = .claudeCode
         case 1:  self = .codexCli
-        default: self = .custom(binaryName ?? "")
+        default:
+            #if DEBUG
+            if value != 99 {
+                assertionFailure("Unknown AgentType C value: \(value)")
+            }
+            #endif
+            self = .custom(binaryName ?? "")
         }
     }
 }
@@ -88,20 +101,15 @@ enum AgentType: Equatable, Hashable, Sendable {
 // MARK: - WorkerInfo
 
 /// A snapshot of a single worker's state, mirroring `tm_worker_info_t`.
-/// Equality is by `id` only so SwiftUI list diffing keys on the worker identity
-/// rather than every mutable field.
-struct WorkerInfo: Identifiable, Equatable {
+/// Uses synthesized `Equatable` so SwiftUI detects changes across all fields.
+struct WorkerInfo: Identifiable, Equatable, Sendable {
     let id: UInt32
     let name: String
     let taskDescription: String
     let branchName: String
     let worktreePath: String
-    var status: WorkerStatus
+    let status: WorkerStatus
     let agentType: AgentType
     let agentBinary: String
     let spawnedAt: Date
-
-    static func == (lhs: WorkerInfo, rhs: WorkerInfo) -> Bool {
-        lhs.id == rhs.id
-    }
 }

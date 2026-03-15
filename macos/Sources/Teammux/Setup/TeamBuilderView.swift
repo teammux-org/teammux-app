@@ -136,6 +136,7 @@ struct TeamBuilderView: View {
                     .foregroundColor(.secondary)
                 Picker("Agent", selection: $config.workers[index].agent) {
                     Text("Claude Code").tag(AgentType.claudeCode)
+                    Text("Codex CLI").tag(AgentType.codexCli)
                 }
                 .labelsHidden()
                 .frame(maxWidth: 150)

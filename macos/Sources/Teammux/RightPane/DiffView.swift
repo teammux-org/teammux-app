@@ -44,7 +44,7 @@ struct DiffView: View {
                 }
             }
             .labelsHidden()
-            .onChange(of: selectedWorkerId) { newValue in
+            .onChange(of: selectedWorkerId) { _, newValue in
                 loadDiff(for: newValue)
             }
 
@@ -146,8 +146,10 @@ struct DiffView: View {
         }
 
         isLoading = true
-        diffFiles = engine.getDiff(for: workerId)
-        isLoading = false
+        Task {
+            diffFiles = engine.getDiff(for: workerId)
+            isLoading = false
+        }
     }
 }
 

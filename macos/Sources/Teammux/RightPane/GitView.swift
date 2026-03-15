@@ -126,12 +126,14 @@ struct GitWorkerRow: View {
 
     private func createPR(for worker: WorkerInfo) {
         isCreatingPR = true
-        let title = "\(worker.name): \(worker.taskDescription)"
-        _ = engine.createPR(
-            for: worker.id,
-            title: String(title.prefix(72)),
-            body: "Automated PR from Teammux worker.\n\nTask: \(worker.taskDescription)"
-        )
-        isCreatingPR = false
+        Task {
+            let title = "\(worker.name): \(worker.taskDescription)"
+            _ = engine.createPR(
+                for: worker.id,
+                title: String(title.prefix(72)),
+                body: "Automated PR from Teammux worker.\n\nTask: \(worker.taskDescription)"
+            )
+            isCreatingPR = false
+        }
     }
 }

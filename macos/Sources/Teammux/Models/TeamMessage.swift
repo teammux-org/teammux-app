@@ -50,7 +50,14 @@ enum MessageType: Int, CaseIterable, Sendable {
 
     /// Initialise from the C enum value. Falls back to `.task` for unknown values.
     init(fromCValue value: Int32) {
-        self = MessageType(rawValue: Int(value)) ?? .task
+        if let known = MessageType(rawValue: Int(value)) {
+            self = known
+        } else {
+            #if DEBUG
+            assertionFailure("Unknown MessageType C value: \(value)")
+            #endif
+            self = .task
+        }
     }
 }
 
@@ -59,7 +66,7 @@ enum MessageType: Int, CaseIterable, Sendable {
 /// A single message exchanged on the bus, mirroring `tm_message_t`.
 /// Each Swift-side instance gets a stable UUID for SwiftUI list identity
 /// independent of the engine's sequence number.
-struct TeamMessage: Identifiable, Equatable {
+struct TeamMessage: Identifiable, Equatable, Sendable {
     let id: UUID
     let from: UInt32
     let to: UInt32
@@ -92,12 +99,42 @@ struct TeamMessage: Identifiable, Equatable {
 
 // MARK: - GitHubPR
 
+// MARK: - PRState
+
+/// Type-safe representation of a GitHub PR's state.
+enum PRState: String, Sendable {
+    case open, closed, merged
+    case unknown
+
+    init(from string: String) {
+        self = PRState(rawValue: string.lowercased()) ?? .unknown
+    }
+
+    var label: String {
+        switch self {
+        case .open: return "Open"
+        case .closed: return "Closed"
+        case .merged: return "Merged"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .open: return .green
+        case .closed: return .red
+        case .merged: return .purple
+        case .unknown: return .secondary
+        }
+    }
+}
+
 /// Mirrors `tm_pr_t` in teammux.h.
-struct GitHubPR: Identifiable {
+struct GitHubPR: Identifiable, Sendable {
     let number: UInt64
     let url: String
     let title: String
-    let state: String
+    let state: PRState
 
     /// `Identifiable` conformance keyed on PR number.
     var id: UInt64 { number }
@@ -106,7 +143,7 @@ struct GitHubPR: Identifiable {
 // MARK: - DiffFile
 
 /// Mirrors `tm_diff_file_t` in teammux.h.
-struct DiffFile: Identifiable {
+struct DiffFile: Identifiable, Equatable, Sendable {
     let id: UUID
     let filePath: String
     let additions: Int
