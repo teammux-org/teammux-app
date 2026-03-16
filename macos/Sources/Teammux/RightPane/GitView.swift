@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 // MARK: - GitView
 
@@ -113,8 +114,14 @@ struct CompletedWorkerRow: View {
     let worker: WorkerInfo
     @ObservedObject var engine: EngineClient
 
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "CompletedWorkerRow")
+
     private var mergeStatus: MergeStatus {
-        engine.mergeStatuses[worker.id] ?? .pending
+        guard let status = engine.mergeStatuses[worker.id] else {
+            Self.logger.warning("Worker \(worker.id) in completed section but has no merge status")
+            return .pending
+        }
+        return status
     }
 
     /// Try to find a completion message for this worker to get timestamp and commit hash.
@@ -184,7 +191,13 @@ struct CompletedWorkerRow: View {
                 .background(Color.secondary.opacity(0.12))
                 .cornerRadius(4)
         default:
-            EmptyView()
+            Text("Unknown")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.orange)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Color.orange.opacity(0.12))
+                .cornerRadius(4)
         }
     }
 }
@@ -284,8 +297,13 @@ struct GitWorkerRow: View {
         .onChange(of: mergeStatus) { _, newStatus in
             if newStatus == .conflict && !conflicts.isEmpty {
                 showConflictSheet = true
-            } else {
+            } else if newStatus != .conflict {
                 showConflictSheet = false
+            }
+        }
+        .onChange(of: conflicts) { _, newConflicts in
+            if mergeStatus == .conflict && !newConflicts.isEmpty && !showConflictSheet {
+                showConflictSheet = true
             }
         }
         .sheet(isPresented: $showConflictSheet) {
