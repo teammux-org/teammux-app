@@ -5,13 +5,22 @@ import os
 // MARK: - MergeStrategy
 
 /// Maps to `tm_merge_strategy_t` in teammux.h.
-/// SQUASH=0, REBASE=1, MERGE=2
 enum MergeStrategy: Int, Sendable {
     case squash = 0
     case rebase = 1
     case merge  = 2
 
+    /// Integer value for `tm_github_merge_pr()` (`tm_merge_strategy_t`).
     var cValue: Int32 { Int32(rawValue) }
+
+    /// String value for `tm_merge_approve()` (local merge coordinator).
+    var strategyString: String {
+        switch self {
+        case .squash: return "squash"
+        case .rebase: return "rebase"
+        case .merge:  return "merge"
+        }
+    }
 }
 
 // MARK: - EngineClient
@@ -52,6 +61,12 @@ final class EngineClient: ObservableObject {
     /// yet been created. `WorkerPaneView` observes this to spawn terminals.
     @Published var worktreeReadyQueue: [WorktreeReady] = []
 
+    /// Current merge status per worker ID. Updated by polling after `approveMerge`.
+    @Published var mergeStatuses: [UInt32: MergeStatus] = [:]
+
+    /// Pending conflicts per worker ID after a conflicted merge.
+    @Published var pendingConflicts: [UInt32: [ConflictInfo]] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -68,6 +83,9 @@ final class EngineClient: ObservableObject {
     private var commandSubscription: UInt32 = 0
     private var githubSubscription: UInt32 = 0
     private var configSubscription: UInt32 = 0
+
+    /// Repeating timer that polls merge status for workers with active merges.
+    private var mergeStatusTimer: Timer?
 
     // MARK: - Surface registry
 
@@ -193,6 +211,9 @@ final class EngineClient: ObservableObject {
         roster.removeAll()
         messages.removeAll()
         worktreeReadyQueue.removeAll()
+        stopMergePolling()
+        mergeStatuses.removeAll()
+        pendingConflicts.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -530,6 +551,116 @@ final class EngineClient: ObservableObject {
         return files
     }
 
+    // MARK: - Merge Coordinator
+
+    /// Approve merge of a worker's branch into main.
+    /// Wraps `tm_merge_approve()`. Returns `true` if the engine accepted the request.
+    /// `true` does not mean the merge succeeded — check `getMergeStatus()` for the
+    /// outcome, which may be `.inProgress`, `.success`, or `.conflict`.
+    func approveMerge(workerId: UInt32, strategy: MergeStrategy) -> Bool {
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("Engine not created")
+            return false
+        }
+
+        let result = strategy.strategyString.withCString { cStrategy in
+            tm_merge_approve(engine, workerId, cStrategy)
+        }
+
+        guard result == TM_OK else {
+            let msg = lastEngineError() ?? "tm_merge_approve failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("approveMerge failed: \(msg)")
+            return false
+        }
+
+        let initialStatus = getMergeStatus(workerId: workerId)
+        mergeStatuses[workerId] = initialStatus
+        Self.logger.info("approveMerge: worker \(workerId) initial status: \(initialStatus.label)")
+        startMergePolling()
+        return true
+    }
+
+    /// Reject a worker's merge: abort in-progress merge, remove worktree, delete branch.
+    /// The worker remains in the roster with a completed/dismissed status.
+    /// Wraps `tm_merge_reject()`. Returns `true` on `TM_OK`.
+    func rejectMerge(workerId: UInt32) -> Bool {
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("Engine not created")
+            return false
+        }
+
+        let result = tm_merge_reject(engine, workerId)
+
+        guard result == TM_OK else {
+            let msg = lastEngineError() ?? "tm_merge_reject failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("rejectMerge failed: \(msg)")
+            return false
+        }
+
+        mergeStatuses[workerId] = .rejected
+        pendingConflicts.removeValue(forKey: workerId)
+        return true
+    }
+
+    /// Get current merge status for a worker.
+    /// Wraps `tm_merge_get_status()`.
+    /// Returns `.pending` if the engine is not initialized.
+    func getMergeStatus(workerId: UInt32) -> MergeStatus {
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("getMergeStatus: engine not created")
+            return .pending
+        }
+        let raw = tm_merge_get_status(engine, workerId)
+        return MergeStatus(fromCValue: Int32(raw.rawValue))
+    }
+
+    /// Get list of conflicts for a worker after a conflicted merge.
+    /// Wraps `tm_merge_conflicts_get()` + `tm_merge_conflicts_free()`.
+    func getConflicts(workerId: UInt32) -> [ConflictInfo] {
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("Engine not created")
+            return []
+        }
+
+        var count: UInt32 = 0
+        guard let conflictsPtr = tm_merge_conflicts_get(engine, workerId, &count) else {
+            if let msg = lastEngineError() {
+                lastError = msg
+                Self.logger.error("getConflicts failed: \(msg)")
+            }
+            return []
+        }
+
+        var conflicts: [ConflictInfo] = []
+        for i in 0..<Int(count) {
+            guard let ptr = conflictsPtr[i] else { continue }
+            let ours: String? = {
+                guard let p = ptr.pointee.ours, p.pointee != 0 else { return nil }
+                return String(cString: p)
+            }()
+            let theirs: String? = {
+                guard let p = ptr.pointee.theirs, p.pointee != 0 else { return nil }
+                return String(cString: p)
+            }()
+            let conflict = ConflictInfo(
+                filePath: String(cString: ptr.pointee.file_path),
+                conflictType: String(cString: ptr.pointee.conflict_type),
+                ours: ours,
+                theirs: theirs
+            )
+            conflicts.append(conflict)
+        }
+
+        tm_merge_conflicts_free(conflictsPtr, count)
+        return conflicts
+    }
+
     // MARK: - Private: Callbacks
 
     /// Register all engine callbacks. Called once after `sessionStart` succeeds.
@@ -841,6 +972,59 @@ final class EngineClient: ObservableObject {
             return [:]
         }
         return [:]
+    }
+
+    // MARK: - Private: Merge status polling
+
+    /// Start a 2-second repeating timer to poll merge statuses.
+    /// No-op if already running.
+    private func startMergePolling() {
+        guard mergeStatusTimer == nil else { return }
+        mergeStatusTimer = Timer.scheduledTimer(
+            withTimeInterval: 2.0,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.pollMergeStatuses()
+            }
+        }
+    }
+
+    /// Stop and invalidate the merge polling timer.
+    private func stopMergePolling() {
+        mergeStatusTimer?.invalidate()
+        mergeStatusTimer = nil
+    }
+
+    /// Polls `tm_merge_get_status()` for all workers tracked in `mergeStatuses`.
+    /// Updates `mergeStatuses` and `pendingConflicts` @Published properties.
+    /// Stops the timer when no tracked worker has `.inProgress` status.
+    private func pollMergeStatuses() {
+        guard engine != nil else {
+            stopMergePolling()
+            return
+        }
+
+        var hasInProgress = false
+        let trackedWorkers = Array(mergeStatuses.keys)
+        for workerId in trackedWorkers {
+            let status = getMergeStatus(workerId: workerId)
+            mergeStatuses[workerId] = status
+
+            if status == .conflict {
+                pendingConflicts[workerId] = getConflicts(workerId: workerId)
+            } else {
+                pendingConflicts.removeValue(forKey: workerId)
+            }
+
+            if status == .inProgress {
+                hasInProgress = true
+            }
+        }
+
+        if !hasInProgress {
+            stopMergePolling()
+        }
     }
 
     deinit {

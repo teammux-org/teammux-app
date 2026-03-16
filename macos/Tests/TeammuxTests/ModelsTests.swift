@@ -568,6 +568,103 @@ struct MergeStrategyTests {
         #expect(MergeStrategy.rebase.cValue == 1)
         #expect(MergeStrategy.merge.cValue == 2)
     }
+
+    @Test func mergeStrategyStrings() {
+        #expect(MergeStrategy.squash.strategyString == "squash")
+        #expect(MergeStrategy.rebase.strategyString == "rebase")
+        #expect(MergeStrategy.merge.strategyString == "merge")
+    }
+}
+
+// MARK: - MergeStatus Tests
+
+@Suite
+struct MergeStatusTests {
+
+    @Test func mergeStatusColors() {
+        #expect(MergeStatus.pending.color == .secondary)
+        #expect(MergeStatus.inProgress.color == .orange)
+        #expect(MergeStatus.success.color == .green)
+        #expect(MergeStatus.conflict.color == .red)
+        #expect(MergeStatus.rejected.color == .secondary)
+    }
+
+    @Test func mergeStatusLabels() {
+        #expect(MergeStatus.pending.label == "Pending")
+        #expect(MergeStatus.inProgress.label == "In Progress")
+        #expect(MergeStatus.success.label == "Success")
+        #expect(MergeStatus.conflict.label == "Conflict")
+        #expect(MergeStatus.rejected.label == "Rejected")
+    }
+
+    @Test func mergeStatusFromCValue() {
+        #expect(MergeStatus(fromCValue: 0) == .pending)
+        #expect(MergeStatus(fromCValue: 1) == .inProgress)
+        #expect(MergeStatus(fromCValue: 2) == .success)
+        #expect(MergeStatus(fromCValue: 3) == .conflict)
+        #expect(MergeStatus(fromCValue: 4) == .rejected)
+    }
+
+    @Test func mergeStatusFromCValueUnknown() {
+        #expect(MergeStatus(fromCValue: 5) == .pending)
+        #expect(MergeStatus(fromCValue: -1) == .pending)
+        #expect(MergeStatus(fromCValue: 99) == .pending)
+        #expect(MergeStatus(fromCValue: Int32.max) == .pending)
+    }
+
+    @Test func mergeStatusCValueRoundTrip() {
+        for status in MergeStatus.allCases {
+            let roundTripped = MergeStatus(fromCValue: Int32(status.rawValue))
+            #expect(roundTripped == status)
+        }
+    }
+}
+
+// MARK: - ConflictInfo Tests
+
+@Suite
+struct ConflictInfoTests {
+
+    @Test func conflictInfoFieldAccess() {
+        let conflict = ConflictInfo(
+            filePath: "src/main.swift",
+            conflictType: "content",
+            ours: "let x = 1",
+            theirs: "let x = 2"
+        )
+        #expect(conflict.filePath == "src/main.swift")
+        #expect(conflict.conflictType == "content")
+        #expect(conflict.ours == "let x = 1")
+        #expect(conflict.theirs == "let x = 2")
+    }
+
+    @Test func conflictInfoNullableFields() {
+        let conflict = ConflictInfo(
+            filePath: "new_file.swift",
+            conflictType: "add_add"
+        )
+        #expect(conflict.ours == nil)
+        #expect(conflict.theirs == nil)
+    }
+
+    @Test func conflictInfoUniqueId() {
+        let c1 = ConflictInfo(filePath: "a.swift", conflictType: "content")
+        let c2 = ConflictInfo(filePath: "a.swift", conflictType: "content")
+        #expect(c1.id != c2.id)
+    }
+
+    @Test func conflictInfoEquality() {
+        let id = UUID()
+        let c1 = ConflictInfo(id: id, filePath: "a.swift", conflictType: "content", ours: "x", theirs: "y")
+        let c2 = ConflictInfo(id: id, filePath: "a.swift", conflictType: "content", ours: "x", theirs: "y")
+        #expect(c1 == c2)
+    }
+
+    @Test func conflictInfoInequality() {
+        let c1 = ConflictInfo(filePath: "a.swift", conflictType: "content")
+        let c2 = ConflictInfo(filePath: "b.swift", conflictType: "content")
+        #expect(c1 != c2)
+    }
 }
 
 // MARK: - Project Tests
