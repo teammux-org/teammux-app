@@ -584,6 +584,95 @@ pub fn parseRoleContent(allocator: std.mem.Allocator, content: []const u8) Parse
 }
 
 // ─────────────────────────────────────────────────────────
+// Role path resolution
+// ─────────────────────────────────────────────────────────
+
+/// Resolve a role ID to its TOML file path.
+/// Search order (first match wins):
+///   1. {project_root}/.teammux/roles/{role_id}.toml — project-local overrides
+///   2. ~/.teammux/roles/{role_id}.toml — user-level custom roles
+///   3. {exe_dir}/../Resources/roles/{role_id}.toml — app bundle
+///   4. {exe_dir}/roles/{role_id}.toml — dev build fallback
+/// Returns null if not found in any location. Caller must free the returned path.
+pub fn resolveRolePath(
+    allocator: std.mem.Allocator,
+    role_id: []const u8,
+    project_root: []const u8,
+) !?[]u8 {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.toml", .{role_id});
+    defer allocator.free(filename);
+
+    // 1. Project-local: {project_root}/.teammux/roles/{role_id}.toml
+    {
+        const path = try std.fmt.allocPrint(allocator, "{s}/.teammux/roles/{s}", .{ project_root, filename });
+        if (fileExists(path)) return path;
+        allocator.free(path);
+    }
+
+    // 2. User-level: ~/.teammux/roles/{role_id}.toml
+    if (std.posix.getenv("HOME")) |home| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/.teammux/roles/{s}", .{ home, filename });
+        if (fileExists(path)) return path;
+        allocator.free(path);
+    }
+
+    // Only exercised in app bundle — tests use temp dirs
+    // 3. App bundle: {exe_dir}/../Resources/roles/{role_id}.toml
+    // 4. Dev build: {exe_dir}/roles/{role_id}.toml
+    if (getExeDir(allocator)) |exe_dir| {
+        defer allocator.free(exe_dir);
+        {
+            const path = try std.fmt.allocPrint(allocator, "{s}/../Resources/roles/{s}", .{ exe_dir, filename });
+            if (fileExists(path)) return path;
+            allocator.free(path);
+        }
+        {
+            const path = try std.fmt.allocPrint(allocator, "{s}/roles/{s}", .{ exe_dir, filename });
+            if (fileExists(path)) return path;
+            allocator.free(path);
+        }
+    }
+
+    return null;
+}
+
+fn fileExists(path: []const u8) bool {
+    const file = std.fs.cwd().openFile(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
+fn getExeDir(allocator: std.mem.Allocator) ?[]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&buf) catch return null;
+    const dir = std.fs.path.dirname(exe_path) orelse return null;
+    return allocator.dupe(u8, dir) catch null;
+}
+
+/// List all available role IDs from a directory. Returns owned slice of owned strings.
+pub fn listRolesInDir(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return allocator.alloc([]const u8, 0);
+    defer dir.close();
+
+    var items: std.ArrayList([]const u8) = .{};
+    errdefer {
+        for (items.items) |s| allocator.free(s);
+        items.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".toml")) continue;
+        // Strip .toml suffix to get role ID
+        const role_id = entry.name[0 .. entry.name.len - 5];
+        try items.append(allocator, try allocator.dupe(u8, role_id));
+    }
+
+    return items.toOwnedSlice(allocator);
+}
+
+// ─────────────────────────────────────────────────────────
 // File loading
 // ─────────────────────────────────────────────────────────
 
@@ -1283,4 +1372,92 @@ test "parseRoleDefinition - reads from file" {
     try std.testing.expectEqualStrings("from file", role.description);
     try std.testing.expect(role.write_patterns.len == 1);
     try std.testing.expectEqualStrings("src/**", role.write_patterns[0]);
+}
+
+// ─── resolveRolePath tests ───────────────────────────────
+
+test "resolveRolePath - finds project-local role" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    // Create project-local roles directory
+    try tmp_dir.dir.makePath(".teammux/roles");
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".teammux/roles/test-role.toml", .data = "[identity]\nid = \"test-role\"\n" });
+
+    const result = try resolveRolePath(alloc, "test-role", project_root);
+    try std.testing.expect(result != null);
+    defer alloc.free(result.?);
+    try std.testing.expect(std.mem.endsWith(u8, result.?, ".teammux/roles/test-role.toml"));
+}
+
+test "resolveRolePath - returns null for missing role" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    const result = try resolveRolePath(alloc, "nonexistent-role", project_root);
+    try std.testing.expect(result == null);
+}
+
+test "resolveRolePath - project-local takes precedence" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    // Create project-local role
+    try tmp_dir.dir.makePath(".teammux/roles");
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".teammux/roles/priority-role.toml", .data = "[identity]\nid = \"priority-role\"\n" });
+
+    const result = try resolveRolePath(alloc, "priority-role", project_root);
+    try std.testing.expect(result != null);
+    defer alloc.free(result.?);
+    // Should contain project root path, not home dir
+    try std.testing.expect(std.mem.indexOf(u8, result.?, project_root) != null);
+}
+
+test "listRolesInDir - lists TOML files" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "frontend-engineer.toml", .data = "" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "backend-engineer.toml", .data = "" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "README.md", .data = "" }); // should be ignored
+
+    const dir_path = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+
+    const roles = try listRolesInDir(alloc, dir_path);
+    defer {
+        for (roles) |r| alloc.free(r);
+        alloc.free(roles);
+    }
+
+    try std.testing.expect(roles.len == 2);
+    // Check both names are present (order not guaranteed)
+    var found_fe = false;
+    var found_be = false;
+    for (roles) |r| {
+        if (std.mem.eql(u8, r, "frontend-engineer")) found_fe = true;
+        if (std.mem.eql(u8, r, "backend-engineer")) found_be = true;
+    }
+    try std.testing.expect(found_fe);
+    try std.testing.expect(found_be);
+}
+
+test "listRolesInDir - empty on missing directory" {
+    const alloc = std.testing.allocator;
+    const roles = try listRolesInDir(alloc, "/nonexistent/path/roles");
+    defer alloc.free(roles);
+    try std.testing.expect(roles.len == 0);
 }
