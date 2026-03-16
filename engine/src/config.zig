@@ -367,12 +367,21 @@ fn parseTomlMultilineArray(
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, trimmed);
 
+    var found_close = false;
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
         if (line.len > 0 and line[0] == '#') continue; // skip comment lines
         try buf.appendSlice(allocator, " ");
         try buf.appendSlice(allocator, line);
-        if (std.mem.indexOfScalar(u8, line, ']') != null) break;
+        if (std.mem.indexOfScalar(u8, line, ']') != null) {
+            found_close = true;
+            break;
+        }
+    }
+
+    // Unclosed bracket — reject rather than silently produce wrong results
+    if (!found_close and std.mem.indexOfScalar(u8, buf.items, ']') == null) {
+        return error.InvalidSyntax;
     }
 
     return parseTomlInlineArray(allocator, buf.items);
@@ -536,9 +545,15 @@ pub fn parseRoleContent(allocator: std.mem.Allocator, content: []const u8) Parse
                     if (deny_write_patterns) |old| freeStringSlice(allocator, old);
                     deny_write_patterns = try parseTomlMultilineArray(allocator, raw_val, &lines);
                 } else if (std.mem.eql(u8, key, "can_push")) {
-                    can_push = parseTomlBool(stripValue(raw_val)) orelse false;
+                    can_push = parseTomlBool(stripValue(raw_val)) orelse blk: {
+                        std.log.warn("[teammux] role: invalid boolean for can_push: '{s}', defaulting to false", .{stripValue(raw_val)});
+                        break :blk false;
+                    };
                 } else if (std.mem.eql(u8, key, "can_merge")) {
-                    can_merge = parseTomlBool(stripValue(raw_val)) orelse false;
+                    can_merge = parseTomlBool(stripValue(raw_val)) orelse blk: {
+                        std.log.warn("[teammux] role: invalid boolean for can_merge: '{s}', defaulting to false", .{stripValue(raw_val)});
+                        break :blk false;
+                    };
                 }
             },
             .triggers_on => {
@@ -570,6 +585,12 @@ pub fn parseRoleContent(allocator: std.mem.Allocator, content: []const u8) Parse
             },
             .none => {},
         }
+    }
+
+    // Validate required fields
+    if (id.len == 0) {
+        std.log.warn("[teammux] role file has no identity.id field", .{});
+        return error.InvalidSyntax;
     }
 
     return RoleDefinition{
@@ -1328,15 +1349,20 @@ test "parseRoleContent - multiline arrays" {
     try std.testing.expect(role.can_merge == true);
 }
 
-test "parseRoleContent - empty content yields defaults" {
+test "parseRoleContent - empty content returns InvalidSyntax (missing id)" {
     const alloc = std.testing.allocator;
-    var role = try parseRoleContent(alloc, "");
-    defer role.deinit(alloc);
+    try std.testing.expectError(error.InvalidSyntax, parseRoleContent(alloc, ""));
+}
 
-    try std.testing.expectEqualStrings("", role.id);
-    try std.testing.expect(role.write_patterns.len == 0);
-    try std.testing.expect(role.deny_write_patterns.len == 0);
-    try std.testing.expect(role.can_push == false);
+test "parseTomlMultilineArray - unclosed bracket returns InvalidSyntax" {
+    const alloc = std.testing.allocator;
+    // No closing ] anywhere in the continuation lines
+    const continuation =
+        \\  "item1",
+        \\  "item2"
+    ;
+    var lines = std.mem.splitScalar(u8, continuation, '\n');
+    try std.testing.expectError(error.InvalidSyntax, parseTomlMultilineArray(alloc, "[", &lines));
 }
 
 test "parseRoleDefinition - reads from file" {
