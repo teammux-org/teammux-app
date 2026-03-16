@@ -4,9 +4,10 @@ import SwiftUI
 
 /// Right-pane tab showing Git status for all workers.
 ///
-/// Displays a list grouped into "Main branch" and "Active workers" sections.
-/// Each worker row shows a status dot, monospaced branch name, and an
-/// "Open PR" button placeholder.
+/// Displays a list grouped into "Main branch", "Active workers", and
+/// optionally "Completed" sections. Each active worker row shows a status dot,
+/// monospaced branch name, PR action, merge status badge, and approve/reject
+/// buttons for the Team Lead review workflow.
 struct GitView: View {
     @ObservedObject var engine: EngineClient
 
@@ -78,7 +79,8 @@ struct GitView: View {
 
 // MARK: - GitWorkerRow
 
-/// A single row in the Git view showing a worker's branch and PR action.
+/// A single row in the Git view showing a worker's branch, PR action,
+/// merge status badge, and approve/reject buttons.
 struct GitWorkerRow: View {
     let worker: WorkerInfo
     @ObservedObject var engine: EngineClient
@@ -86,6 +88,12 @@ struct GitWorkerRow: View {
     @State private var isCreatingPR = false
     @State private var prError: String?
     @State private var lastCreatedPR: GitHubPR?
+    @State private var isMergeActionInFlight = false
+    @State private var mergeError: String?
+
+    private var mergeStatus: MergeStatus? {
+        engine.mergeStatuses[worker.id]
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -108,6 +116,11 @@ struct GitWorkerRow: View {
                 }
 
                 Spacer()
+
+                // Merge status badge
+                if let status = mergeStatus {
+                    mergeStatusBadge(status)
+                }
 
                 if let pr = lastCreatedPR {
                     Text("PR #\(pr.number)")
@@ -132,12 +145,109 @@ struct GitWorkerRow: View {
                 }
             }
 
+            // Approve / Reject buttons — shown when no terminal merge status
+            if shouldShowMergeActions {
+                mergeActions
+            }
+
             if let error = prError {
                 Text(error)
                     .font(.system(size: 10))
                     .foregroundColor(.red)
                     .lineLimit(2)
             }
+
+            if let error = mergeError {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    // MARK: - Merge status badge
+
+    private func mergeStatusBadge(_ status: MergeStatus) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(status.color)
+                .frame(width: 6, height: 6)
+
+            Text(status.label)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(status.color)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(status.color.opacity(0.12))
+        .cornerRadius(4)
+    }
+
+    // MARK: - Merge actions
+
+    private var shouldShowMergeActions: Bool {
+        guard let status = mergeStatus else {
+            // No merge initiated yet — show buttons so Team Lead can approve/reject
+            return true
+        }
+        // Show actions for pending and conflict states (re-approve or reject)
+        return status == .pending || status == .conflict
+    }
+
+    private var mergeActions: some View {
+        HStack(spacing: 8) {
+            Button(action: approveMerge) {
+                if isMergeActionInFlight {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Label("Approve", systemImage: "checkmark.circle")
+                        .font(.system(size: 10, weight: .medium))
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(.green)
+            .disabled(isMergeActionInFlight)
+
+            Button(action: rejectMerge) {
+                Label("Reject", systemImage: "xmark.circle")
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(.red)
+            .disabled(isMergeActionInFlight)
+
+            Spacer()
+        }
+        .padding(.leading, 16)
+    }
+
+    // MARK: - Actions
+
+    private func approveMerge() {
+        isMergeActionInFlight = true
+        mergeError = nil
+        Task {
+            let success = engine.approveMerge(workerId: worker.id, strategy: .merge)
+            if !success {
+                mergeError = engine.lastError ?? "Failed to approve merge"
+            }
+            isMergeActionInFlight = false
+        }
+    }
+
+    private func rejectMerge() {
+        isMergeActionInFlight = true
+        mergeError = nil
+        Task {
+            let success = engine.rejectMerge(workerId: worker.id)
+            if !success {
+                mergeError = engine.lastError ?? "Failed to reject merge"
+            }
+            isMergeActionInFlight = false
         }
     }
 
