@@ -44,6 +44,14 @@ struct GitView: View {
 
     // MARK: - Computed properties
 
+    /// Workers whose merge has not reached a terminal state.
+    private var activeWorkers: [WorkerInfo] {
+        engine.roster.filter { worker in
+            guard let status = engine.mergeStatuses[worker.id] else { return true }
+            return status != .success && status != .rejected
+        }
+    }
+
     /// Workers whose merge has reached a terminal state (success or rejected).
     private var completedWorkers: [WorkerInfo] {
         engine.roster.filter { worker in
@@ -78,7 +86,7 @@ struct GitView: View {
             }
 
             Section("Active workers") {
-                ForEach(engine.roster) { worker in
+                ForEach(activeWorkers) { worker in
                     GitWorkerRow(worker: worker, engine: engine)
                 }
             }
@@ -353,7 +361,7 @@ struct GitWorkerRow: View {
     private func approveMerge() {
         isMergeActionInFlight = true
         mergeError = nil
-        Task {
+        Task { @MainActor in
             let success = engine.approveMerge(workerId: worker.id, strategy: .merge)
             if !success {
                 mergeError = engine.lastError ?? "Failed to approve merge"
@@ -365,7 +373,7 @@ struct GitWorkerRow: View {
     private func rejectMerge() {
         isMergeActionInFlight = true
         mergeError = nil
-        Task {
+        Task { @MainActor in
             let success = engine.rejectMerge(workerId: worker.id)
             if !success {
                 mergeError = engine.lastError ?? "Failed to reject merge"
@@ -377,7 +385,7 @@ struct GitWorkerRow: View {
     private func createPR(for worker: WorkerInfo) {
         isCreatingPR = true
         prError = nil
-        Task {
+        Task { @MainActor in
             let title = "\(worker.name): \(worker.taskDescription)"
             let pr = engine.createPR(
                 for: worker.id,

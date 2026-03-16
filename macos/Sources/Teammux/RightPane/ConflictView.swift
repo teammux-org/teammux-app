@@ -6,8 +6,9 @@ import SwiftUI
 ///
 /// Shows each conflicting file with its type and read-only ours/theirs content
 /// previews. The Team Lead reviews the conflicts then chooses "Force Merge"
-/// (re-approve) or "Reject" as the resolution. Per-file resolution is not
-/// supported by the engine API — this view is informational + action footer.
+/// (calls `approveMerge` again) or "Reject" as the resolution. Per-file
+/// resolution is not supported by the engine API — this view is informational
+/// + action footer.
 struct ConflictView: View {
     let worker: WorkerInfo
     let conflicts: [ConflictInfo]
@@ -116,7 +117,7 @@ struct ConflictView: View {
     private func forceMerge() {
         isActionInFlight = true
         actionError = nil
-        Task {
+        Task { @MainActor in
             let success = engine.approveMerge(workerId: worker.id, strategy: .merge)
             if success {
                 dismiss()
@@ -130,7 +131,7 @@ struct ConflictView: View {
     private func reject() {
         isActionInFlight = true
         actionError = nil
-        Task {
+        Task { @MainActor in
             let success = engine.rejectMerge(workerId: worker.id)
             if success {
                 dismiss()
