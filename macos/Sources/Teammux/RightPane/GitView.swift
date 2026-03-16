@@ -194,9 +194,14 @@ struct GitWorkerRow: View {
     @State private var lastCreatedPR: GitHubPR?
     @State private var isMergeActionInFlight = false
     @State private var mergeError: String?
+    @State private var showConflictSheet = false
 
     private var mergeStatus: MergeStatus? {
         engine.mergeStatuses[worker.id]
+    }
+
+    private var conflicts: [ConflictInfo] {
+        engine.pendingConflicts[worker.id] ?? []
     }
 
     var body: some View {
@@ -267,6 +272,20 @@ struct GitWorkerRow: View {
                     .foregroundColor(.red)
                     .lineLimit(2)
             }
+        }
+        .onChange(of: mergeStatus) { _, newStatus in
+            if newStatus == .conflict && !conflicts.isEmpty {
+                showConflictSheet = true
+            } else {
+                showConflictSheet = false
+            }
+        }
+        .sheet(isPresented: $showConflictSheet) {
+            ConflictView(
+                worker: worker,
+                conflicts: conflicts,
+                engine: engine
+            )
         }
     }
 
