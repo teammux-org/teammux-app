@@ -23,3 +23,4 @@
 - TD5 adds new functions to teammux.h. stream-B1 owns the header changes. stream-B2 consumes them.
 - TD8: ConflictInfo.conflictType is a raw String. Deferred to v0.2 — only 2 engine values (content/unknown), displayed as-is in ConflictView. Consider an enum once engine's conflict type vocabulary is stable.
 - Merge order: A1 → A2 → B1 → B2 → C1
+
