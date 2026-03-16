@@ -34,6 +34,7 @@ typedef enum {
     TM_ERR_NOT_IMPLEMENTED  = 10,
     TM_ERR_TIMEOUT          = 11,
     TM_ERR_INVALID_WORKER   = 12,
+    TM_ERR_ROLE             = 13,
     TM_ERR_UNKNOWN          = 99,
 } tm_result_t;
 
@@ -320,6 +321,32 @@ const char* tm_agent_resolve(const char* agent_name);
 void        tm_free_string(const char* str);
 const char* tm_version(void);
 const char* tm_result_to_string(tm_result_t result);
+
+// -----------------------------------------------------------------
+// Role definitions
+// -----------------------------------------------------------------
+
+typedef struct {
+    const char*  id;
+    const char*  name;
+    const char*  division;
+    const char*  emoji;
+    const char*  description;
+    const char** write_patterns;
+    uint32_t     write_pattern_count;
+    const char** deny_write_patterns;
+    uint32_t     deny_write_pattern_count;
+} tm_role_t;
+
+// Resolve a role by ID. On success, writes a heap-allocated tm_role_t to *out_role.
+// Caller must call tm_role_free(). Returns TM_ERR_ROLE if not found.
+tm_result_t  tm_role_resolve(tm_engine_t* engine, const char* role_id, tm_role_t** out_role);
+void         tm_role_free(tm_role_t* role);
+
+// List all available roles from the search path. Returns heap-allocated array.
+// Caller must call tm_roles_list_free(). Writes count to *count.
+tm_role_t**  tm_roles_list(tm_engine_t* engine, uint32_t* count);
+void         tm_roles_list_free(tm_role_t** roles, uint32_t count);
 
 #ifdef __cplusplus
 }

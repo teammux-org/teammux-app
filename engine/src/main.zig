@@ -483,7 +483,8 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         0 => "TM_OK", 1 => "TM_ERR_NOT_GIT", 2 => "TM_ERR_NO_GH", 3 => "TM_ERR_GH_UNAUTH",
         4 => "TM_ERR_NO_AGENT", 5 => "TM_ERR_WORKTREE", 6 => "TM_ERR_PTY", 7 => "TM_ERR_CONFIG",
         8 => "TM_ERR_BUS", 9 => "TM_ERR_GITHUB", 10 => "TM_ERR_NOT_IMPLEMENTED",
-        11 => "TM_ERR_TIMEOUT", 12 => "TM_ERR_INVALID_WORKER", else => "TM_ERR_UNKNOWN",
+        11 => "TM_ERR_TIMEOUT", 12 => "TM_ERR_INVALID_WORKER", 13 => "TM_ERR_ROLE",
+        else => "TM_ERR_UNKNOWN",
     };
 }
 
