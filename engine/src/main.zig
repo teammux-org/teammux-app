@@ -152,6 +152,12 @@ const CConflict = extern struct {
     file_path: ?[*:0]const u8, conflict_type: ?[*:0]const u8,
     ours: ?[*:0]const u8, theirs: ?[*:0]const u8,
 };
+const CRole = extern struct {
+    id: ?[*:0]const u8, name: ?[*:0]const u8, division: ?[*:0]const u8,
+    emoji: ?[*:0]const u8, description: ?[*:0]const u8,
+    write_patterns: ?[*]?[*:0]const u8, write_pattern_count: u32,
+    deny_write_patterns: ?[*]?[*:0]const u8, deny_write_pattern_count: u32,
+};
 
 // Comptime ABI safety: verify extern struct sizes match expected C layout.
 // If a field is added/removed in teammux.h without updating Zig, this fails at build time.
@@ -162,6 +168,8 @@ comptime {
     if (@sizeOf(bus.CMessage) != 48) @compileError("CMessage size mismatch with tm_message_t");
     // CConflict: 4 ptrs = 32 bytes on arm64
     if (@sizeOf(CConflict) != 32) @compileError("CConflict size mismatch with tm_conflict_t");
+    // CRole: 5 ptrs(40) + ptr(8) + u32(4) + pad(4) + ptr(8) + u32(4) + pad(4) = 72 on arm64
+    if (@sizeOf(CRole) != 72) @compileError("CRole size mismatch with tm_role_t");
 }
 
 var last_create_error: [*:0]const u8 = "no error";
@@ -468,6 +476,133 @@ export fn tm_merge_conflicts_free(conflicts: ?[*]?*CConflict, count: u32) void {
     std.heap.c_allocator.free(ptrs[0..count]);
 }
 
+// ─── Roles ───────────────────────────────────────────────
+
+export fn tm_role_resolve(engine: ?*Engine, role_id: ?[*:0]const u8, out_role: ?*?*CRole) c_int {
+    if (out_role) |p| p.* = null;
+    const e = engine orelse return 99;
+    const rid = std.mem.span(role_id orelse return 13);
+
+    const role_path = config.resolveRolePath(e.allocator, rid, e.project_root) catch return 13;
+    if (role_path == null) {
+        std.log.warn("[teammux] role '{s}' not found in any search path", .{rid});
+        return 13; // TM_ERR_ROLE
+    }
+    defer e.allocator.free(role_path.?);
+
+    var role_def = config.parseRoleDefinition(e.allocator, role_path.?) catch {
+        std.log.warn("[teammux] failed to parse role '{s}'", .{rid});
+        return 13;
+    };
+    defer role_def.deinit(e.allocator);
+
+    const c_role = fillCRole(e.allocator, &role_def) catch return 99;
+    if (out_role) |p| p.* = c_role;
+    return 0;
+}
+
+export fn tm_role_free(role: ?*CRole) void {
+    if (role) |r| {
+        freeCRole(r);
+        std.heap.c_allocator.destroy(r);
+    }
+}
+
+export fn tm_roles_list(engine: ?*Engine, count: ?*u32) ?[*]?*CRole {
+    if (count) |c| c.* = 0;
+    const e = engine orelse return null;
+    const alloc = e.allocator;
+
+    // Collect unique role IDs from all search paths (project-local, user, bundled)
+    var seen = std.StringHashMap(void).init(alloc);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        seen.deinit();
+    }
+    var role_defs: std.ArrayList(*CRole) = .{};
+    defer role_defs.deinit(alloc);
+
+    // Search paths to scan for role directories
+    const project_roles = std.fmt.allocPrint(alloc, "{s}/.teammux/roles", .{e.project_root}) catch return null;
+    defer alloc.free(project_roles);
+
+    const home_roles = if (std.posix.getenv("HOME")) |home|
+        (std.fmt.allocPrint(alloc, "{s}/.teammux/roles", .{home}) catch null)
+    else
+        null;
+    defer if (home_roles) |hr| alloc.free(hr);
+
+    const exe_dir = config.getExeDir(alloc);
+    defer if (exe_dir) |ed| alloc.free(ed);
+
+    const bundle_roles = if (exe_dir) |ed|
+        (std.fmt.allocPrint(alloc, "{s}/../Resources/roles", .{ed}) catch null)
+    else
+        null;
+    defer if (bundle_roles) |br| alloc.free(br);
+
+    const dev_roles = if (exe_dir) |ed|
+        (std.fmt.allocPrint(alloc, "{s}/roles", .{ed}) catch null)
+    else
+        null;
+    defer if (dev_roles) |dr| alloc.free(dr);
+
+    const paths = [_]?[]const u8{ project_roles, home_roles, bundle_roles, dev_roles };
+
+    for (paths) |maybe_path| {
+        const dir_path = maybe_path orelse continue;
+        const role_ids = config.listRolesInDir(alloc, dir_path) catch continue;
+        defer {
+            for (role_ids) |rid| alloc.free(rid);
+            alloc.free(role_ids);
+        }
+        for (role_ids) |rid| {
+            if (seen.contains(rid)) continue;
+            // Try to resolve and parse this role
+            const role_path = config.resolveRolePath(alloc, rid, e.project_root) catch continue;
+            if (role_path == null) continue;
+            defer alloc.free(role_path.?);
+
+            var role_def = config.parseRoleDefinition(alloc, role_path.?) catch continue;
+            defer role_def.deinit(alloc);
+
+            const c_role = fillCRole(alloc, &role_def) catch continue;
+            role_defs.append(alloc, c_role) catch {
+                freeCRole(c_role);
+                alloc.destroy(c_role);
+                continue;
+            };
+            const owned_key = alloc.dupe(u8, rid) catch continue;
+            seen.put(owned_key, {}) catch {
+                alloc.free(owned_key);
+                continue;
+            };
+        }
+    }
+
+    if (role_defs.items.len == 0) return null;
+
+    // Convert to C-compatible array of pointers
+    const result = alloc.alloc(?*CRole, role_defs.items.len) catch return null;
+    for (role_defs.items, 0..) |ptr, i| {
+        result[i] = ptr;
+    }
+    if (count) |c| c.* = @intCast(role_defs.items.len);
+    return result.ptr;
+}
+
+export fn tm_roles_list_free(roles: ?[*]?*CRole, count: u32) void {
+    const ptrs = roles orelse return;
+    for (0..count) |i| {
+        if (ptrs[i]) |r| {
+            freeCRole(r);
+            std.heap.c_allocator.destroy(r);
+        }
+    }
+    std.heap.c_allocator.free(ptrs[0..count]);
+}
+
 // ─── Utility ─────────────────────────────────────────────
 
 export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
@@ -527,6 +662,64 @@ fn freeCConflict(ptr: ?*CConflict) void {
     std.heap.c_allocator.destroy(cc);
 }
 
+fn fillCRole(alloc: std.mem.Allocator, rd: *const config.RoleDefinition) !*CRole {
+    const c_role = try alloc.create(CRole);
+    errdefer alloc.destroy(c_role);
+
+    const id_z = try alloc.dupeZ(u8, rd.id); errdefer alloc.free(id_z);
+    const name_z = try alloc.dupeZ(u8, rd.name); errdefer alloc.free(name_z);
+    const div_z = try alloc.dupeZ(u8, rd.division); errdefer alloc.free(div_z);
+    const emoji_z = try alloc.dupeZ(u8, rd.emoji); errdefer alloc.free(emoji_z);
+    const desc_z = try alloc.dupeZ(u8, rd.description); errdefer alloc.free(desc_z);
+
+    const wp = try dupeStringArray(alloc, rd.write_patterns);
+    errdefer freeNullTerminatedArray(alloc, wp, @intCast(rd.write_patterns.len));
+    const dwp = try dupeStringArray(alloc, rd.deny_write_patterns);
+
+    c_role.* = .{
+        .id = id_z.ptr,
+        .name = name_z.ptr,
+        .division = div_z.ptr,
+        .emoji = emoji_z.ptr,
+        .description = desc_z.ptr,
+        .write_patterns = if (wp.len > 0) wp.ptr else null,
+        .write_pattern_count = @intCast(rd.write_patterns.len),
+        .deny_write_patterns = if (dwp.len > 0) dwp.ptr else null,
+        .deny_write_pattern_count = @intCast(rd.deny_write_patterns.len),
+    };
+    return c_role;
+}
+
+fn freeCRole(role: *CRole) void {
+    freeNullTerminated(role.id);
+    freeNullTerminated(role.name);
+    freeNullTerminated(role.division);
+    freeNullTerminated(role.emoji);
+    freeNullTerminated(role.description);
+    freeNullTerminatedArray(std.heap.c_allocator, if (role.write_patterns) |p| p[0..role.write_pattern_count] else &.{}, role.write_pattern_count);
+    freeNullTerminatedArray(std.heap.c_allocator, if (role.deny_write_patterns) |p| p[0..role.deny_write_pattern_count] else &.{}, role.deny_write_pattern_count);
+}
+
+fn dupeStringArray(alloc: std.mem.Allocator, strings: [][]const u8) ![]?[*:0]const u8 {
+    const result = try alloc.alloc(?[*:0]const u8, strings.len);
+    var filled: usize = 0;
+    errdefer {
+        for (0..filled) |i| freeNullTerminated(result[i]);
+        alloc.free(result);
+    }
+    for (strings, 0..) |s, i| {
+        const z = try alloc.dupeZ(u8, s);
+        result[i] = z.ptr;
+        filled += 1;
+    }
+    return result;
+}
+
+fn freeNullTerminatedArray(alloc: std.mem.Allocator, arr: []?[*:0]const u8, count: u32) void {
+    for (0..count) |i| freeNullTerminated(arr[i]);
+    if (count > 0) alloc.free(arr);
+}
+
 // ─── Tests ───────────────────────────────────────────────
 
 test "version returns 0.1.0" { try std.testing.expectEqualStrings("0.1.0", std.mem.span(tm_version())); }
@@ -535,6 +728,7 @@ test "result_to_string maps all codes" {
     try std.testing.expectEqualStrings("TM_OK", std.mem.span(tm_result_to_string(0)));
     try std.testing.expectEqualStrings("TM_ERR_CONFIG", std.mem.span(tm_result_to_string(7)));
     try std.testing.expectEqualStrings("TM_ERR_NOT_IMPLEMENTED", std.mem.span(tm_result_to_string(10)));
+    try std.testing.expectEqualStrings("TM_ERR_ROLE", std.mem.span(tm_result_to_string(13)));
     try std.testing.expectEqualStrings("TM_ERR_UNKNOWN", std.mem.span(tm_result_to_string(99)));
 }
 
@@ -568,5 +762,173 @@ test "tm_merge_conflicts_get null returns null" {
     try std.testing.expect(count == 0);
 }
 test "tm_merge_conflicts_free handles null" { tm_merge_conflicts_free(null, 0); }
+
+// ─── Role API tests ──────────────────────────────────────
+
+test "tm_role_resolve null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_role_resolve(null, null, null) == 99);
+}
+
+test "tm_role_resolve null role_id returns TM_ERR_ROLE" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    try std.testing.expect(tm_role_resolve(engine_ptr, null, null) == 13);
+}
+
+test "tm_role_resolve missing role returns TM_ERR_ROLE" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    var out_role: ?*CRole = null;
+    const role_id = try std.testing.allocator.dupeZ(u8, "nonexistent-role");
+    defer std.testing.allocator.free(role_id);
+    try std.testing.expect(tm_role_resolve(engine_ptr, role_id.ptr, &out_role) == 13);
+    try std.testing.expect(out_role == null);
+}
+
+test "tm_role_resolve finds and parses role" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+
+    // Create role file in project-local path
+    try tmp.dir.makePath(".teammux/roles");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".teammux/roles/test-resolve.toml",
+        .data =
+        \\[identity]
+        \\id = "test-resolve"
+        \\name = "Test Resolve Role"
+        \\division = "testing"
+        \\emoji = "t"
+        \\description = "for testing resolve"
+        \\
+        \\[capabilities]
+        \\write = ["src/**"]
+        \\deny_write = ["infra/**"]
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+        ,
+    });
+
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    var out_role: ?*CRole = null;
+    const role_id = try std.testing.allocator.dupeZ(u8, "test-resolve");
+    defer std.testing.allocator.free(role_id);
+    const result = tm_role_resolve(engine_ptr, role_id.ptr, &out_role);
+    try std.testing.expect(result == 0);
+    try std.testing.expect(out_role != null);
+    defer tm_role_free(out_role);
+
+    try std.testing.expectEqualStrings("test-resolve", std.mem.span(out_role.?.id.?));
+    try std.testing.expectEqualStrings("Test Resolve Role", std.mem.span(out_role.?.name.?));
+    try std.testing.expect(out_role.?.write_pattern_count == 1);
+    try std.testing.expect(out_role.?.deny_write_pattern_count == 1);
+}
+
+test "tm_role_free handles null" {
+    tm_role_free(null);
+}
+
+test "tm_roles_list null engine returns null" {
+    var count: u32 = 42;
+    try std.testing.expect(tm_roles_list(null, &count) == null);
+    try std.testing.expect(count == 0);
+}
+
+test "tm_roles_list_free handles null" {
+    tm_roles_list_free(null, 0);
+}
+
+test "tm_roles_list finds roles in project directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+
+    try tmp.dir.makePath(".teammux/roles");
+    const role_toml =
+        \\[identity]
+        \\id = "list-role"
+        \\name = "List Role"
+        \\division = "testing"
+        \\emoji = "l"
+        \\description = "for listing"
+        \\
+        \\[capabilities]
+        \\write = []
+        \\deny_write = []
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = ".teammux/roles/list-role.toml", .data = role_toml });
+
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    var count: u32 = 0;
+    const roles = tm_roles_list(engine_ptr, &count);
+    try std.testing.expect(count >= 1);
+    try std.testing.expect(roles != null);
+    defer tm_roles_list_free(roles, count);
+
+    // Find our role in the list
+    var found = false;
+    for (0..count) |i| {
+        if (roles.?[i]) |r| {
+            if (r.id) |id| {
+                if (std.mem.eql(u8, std.mem.span(id), "list-role")) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    try std.testing.expect(found);
+}
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; }

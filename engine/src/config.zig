@@ -651,7 +651,7 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-fn getExeDir(allocator: std.mem.Allocator) ?[]u8 {
+pub fn getExeDir(allocator: std.mem.Allocator) ?[]u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = std.fs.selfExePath(&buf) catch return null;
     const dir = std.fs.path.dirname(exe_path) orelse return null;
