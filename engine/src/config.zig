@@ -281,6 +281,100 @@ fn stripValue(raw: []const u8) []const u8 {
 }
 
 // ─────────────────────────────────────────────────────────
+// TOML helpers for role parsing
+// ─────────────────────────────────────────────────────────
+
+const RoleSection = enum { none, identity, capabilities, triggers_on, context };
+
+/// Parse a boolean TOML value. Returns null if not a valid boolean.
+fn parseTomlBool(raw: []const u8) ?bool {
+    const val = std.mem.trim(u8, raw, &[_]u8{ ' ', '\t' });
+    if (std.mem.eql(u8, val, "true")) return true;
+    if (std.mem.eql(u8, val, "false")) return false;
+    return null;
+}
+
+/// Parse a TOML inline array from a value string like `["a", "b", "c"]`.
+/// Returns owned slice of owned strings. Caller must free each string and the slice.
+fn parseTomlInlineArray(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    const trimmed = std.mem.trim(u8, raw, &[_]u8{ ' ', '\t' });
+    if (trimmed.len < 2 or trimmed[0] != '[') return allocator.alloc([]const u8, 0);
+
+    // Find closing bracket
+    const close = std.mem.lastIndexOfScalar(u8, trimmed, ']') orelse return allocator.alloc([]const u8, 0);
+    const inner = trimmed[1..close];
+
+    var items: std.ArrayList([]const u8) = .{};
+    errdefer {
+        for (items.items) |s| allocator.free(s);
+        items.deinit(allocator);
+    }
+
+    var rest = inner;
+    while (rest.len > 0) {
+        // Skip whitespace and commas
+        rest = std.mem.trimLeft(u8, rest, &[_]u8{ ' ', '\t', ',', '\n', '\r' });
+        if (rest.len == 0) break;
+
+        if (rest[0] == '"') {
+            // Find closing quote
+            const end = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse break;
+            try items.append(allocator, try allocator.dupe(u8, rest[1..end]));
+            rest = rest[end + 1 ..];
+        } else {
+            // Bare value — take until comma or end
+            const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+            const val = std.mem.trim(u8, rest[0..end], &[_]u8{ ' ', '\t' });
+            if (val.len > 0) {
+                try items.append(allocator, try allocator.dupe(u8, val));
+            }
+            rest = if (end < rest.len) rest[end + 1 ..] else rest[rest.len..];
+        }
+    }
+
+    return items.toOwnedSlice(allocator);
+}
+
+/// Parse a TOML array that may span multiple lines.
+/// `first_line` is the value part after `=` on the key line.
+/// `lines` iterator is advanced to consume continuation lines until `]` is found.
+/// Returns owned slice of owned strings.
+fn parseTomlMultilineArray(
+    allocator: std.mem.Allocator,
+    first_line: []const u8,
+    lines: *std.mem.SplitIterator(u8, .scalar),
+) ![][]const u8 {
+    const trimmed = std.mem.trim(u8, first_line, &[_]u8{ ' ', '\t' });
+
+    // Check if it's a complete inline array
+    if (trimmed.len >= 2 and trimmed[0] == '[') {
+        if (std.mem.lastIndexOfScalar(u8, trimmed, ']') != null) {
+            return parseTomlInlineArray(allocator, trimmed);
+        }
+    }
+
+    // Multi-line: accumulate content until we find ]
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, trimmed);
+
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
+        if (line.len > 0 and line[0] == '#') continue; // skip comment lines
+        try buf.appendSlice(allocator, " ");
+        try buf.appendSlice(allocator, line);
+        if (std.mem.indexOfScalar(u8, line, ']') != null) break;
+    }
+
+    return parseTomlInlineArray(allocator, buf.items);
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, slice: [][]const u8) void {
+    for (slice) |s| allocator.free(s);
+    allocator.free(slice);
+}
+
+// ─────────────────────────────────────────────────────────
 // File loading
 // ─────────────────────────────────────────────────────────
 
@@ -748,4 +842,78 @@ test "config - load with missing override file" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("no-override", cfg.project.name);
+}
+
+// ─── TOML helper tests ───────────────────────────────────
+
+test "parseTomlBool - true and false" {
+    try std.testing.expect(parseTomlBool("true").? == true);
+    try std.testing.expect(parseTomlBool("false").? == false);
+    try std.testing.expect(parseTomlBool(" true ").? == true);
+    try std.testing.expect(parseTomlBool("yes") == null);
+    try std.testing.expect(parseTomlBool("") == null);
+}
+
+test "parseTomlInlineArray - basic" {
+    const alloc = std.testing.allocator;
+    const result = try parseTomlInlineArray(alloc, "[\"src/**\", \"tests/**\"]");
+    defer {
+        for (result) |s| alloc.free(s);
+        alloc.free(result);
+    }
+    try std.testing.expect(result.len == 2);
+    try std.testing.expectEqualStrings("src/**", result[0]);
+    try std.testing.expectEqualStrings("tests/**", result[1]);
+}
+
+test "parseTomlInlineArray - empty" {
+    const alloc = std.testing.allocator;
+    const result = try parseTomlInlineArray(alloc, "[]");
+    defer alloc.free(result);
+    try std.testing.expect(result.len == 0);
+}
+
+test "parseTomlInlineArray - single element" {
+    const alloc = std.testing.allocator;
+    const result = try parseTomlInlineArray(alloc, "[\"only\"]");
+    defer {
+        for (result) |s| alloc.free(s);
+        alloc.free(result);
+    }
+    try std.testing.expect(result.len == 1);
+    try std.testing.expectEqualStrings("only", result[0]);
+}
+
+test "parseTomlMultilineArray - inline completes on one line" {
+    const alloc = std.testing.allocator;
+    const input = "[\"a\", \"b\"]";
+    var lines = std.mem.splitScalar(u8, "", '\n');
+    const result = try parseTomlMultilineArray(alloc, input, &lines);
+    defer {
+        for (result) |s| alloc.free(s);
+        alloc.free(result);
+    }
+    try std.testing.expect(result.len == 2);
+    try std.testing.expectEqualStrings("a", result[0]);
+    try std.testing.expectEqualStrings("b", result[1]);
+}
+
+test "parseTomlMultilineArray - spans multiple lines" {
+    const alloc = std.testing.allocator;
+    const continuation =
+        \\  "item1",
+        \\  "item2",
+        \\  "item3"
+        \\]
+    ;
+    var lines = std.mem.splitScalar(u8, continuation, '\n');
+    const result = try parseTomlMultilineArray(alloc, "[", &lines);
+    defer {
+        for (result) |s| alloc.free(s);
+        alloc.free(result);
+    }
+    try std.testing.expect(result.len == 3);
+    try std.testing.expectEqualStrings("item1", result[0]);
+    try std.testing.expectEqualStrings("item2", result[1]);
+    try std.testing.expectEqualStrings("item3", result[2]);
 }
