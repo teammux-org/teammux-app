@@ -375,6 +375,215 @@ fn freeStringSlice(allocator: std.mem.Allocator, slice: [][]const u8) void {
 }
 
 // ─────────────────────────────────────────────────────────
+// RoleDefinition
+// ─────────────────────────────────────────────────────────
+
+pub const RoleDefinition = struct {
+    id: []const u8,
+    name: []const u8,
+    division: []const u8,
+    emoji: []const u8,
+    description: []const u8,
+    write_patterns: [][]const u8,
+    deny_write_patterns: [][]const u8,
+    can_push: bool,
+    can_merge: bool,
+    trigger_events: [][]const u8,
+    mission: []const u8,
+    focus: []const u8,
+    deliverables: [][]const u8,
+    rules: [][]const u8,
+    workflow: [][]const u8,
+    success_metrics: [][]const u8,
+
+    pub fn deinit(self: *RoleDefinition, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.division);
+        allocator.free(self.emoji);
+        allocator.free(self.description);
+        freeStringSlice(allocator, self.write_patterns);
+        freeStringSlice(allocator, self.deny_write_patterns);
+        freeStringSlice(allocator, self.trigger_events);
+        allocator.free(self.mission);
+        allocator.free(self.focus);
+        freeStringSlice(allocator, self.deliverables);
+        freeStringSlice(allocator, self.rules);
+        freeStringSlice(allocator, self.workflow);
+        freeStringSlice(allocator, self.success_metrics);
+    }
+};
+
+pub const RoleParseError = ParseError || std.fs.File.OpenError || std.fs.File.ReadError || error{StreamTooLong};
+
+/// Parse a role TOML file into a RoleDefinition.
+pub fn parseRoleDefinition(allocator: std.mem.Allocator, role_path: []const u8) RoleParseError!RoleDefinition {
+    const file = try std.fs.cwd().openFile(role_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+    return parseRoleContent(allocator, content);
+}
+
+/// Parse role TOML content string into a RoleDefinition.
+pub fn parseRoleContent(allocator: std.mem.Allocator, content: []const u8) ParseError!RoleDefinition {
+    var current_section: RoleSection = .none;
+
+    // Scalar defaults
+    var id: []const u8 = try allocator.dupe(u8, "");
+    var name: []const u8 = try allocator.dupe(u8, "");
+    var division: []const u8 = try allocator.dupe(u8, "");
+    var emoji: []const u8 = try allocator.dupe(u8, "");
+    var description: []const u8 = try allocator.dupe(u8, "");
+    var mission: []const u8 = try allocator.dupe(u8, "");
+    var focus: []const u8 = try allocator.dupe(u8, "");
+    var can_push: bool = false;
+    var can_merge: bool = false;
+
+    // Array fields — null means not yet parsed
+    var write_patterns: ?[][]const u8 = null;
+    var deny_write_patterns: ?[][]const u8 = null;
+    var trigger_events: ?[][]const u8 = null;
+    var deliverables: ?[][]const u8 = null;
+    var rules: ?[][]const u8 = null;
+    var workflow: ?[][]const u8 = null;
+    var success_metrics: ?[][]const u8 = null;
+
+    errdefer {
+        allocator.free(id);
+        allocator.free(name);
+        allocator.free(division);
+        allocator.free(emoji);
+        allocator.free(description);
+        allocator.free(mission);
+        allocator.free(focus);
+        if (write_patterns) |p| freeStringSlice(allocator, p);
+        if (deny_write_patterns) |p| freeStringSlice(allocator, p);
+        if (trigger_events) |p| freeStringSlice(allocator, p);
+        if (deliverables) |p| freeStringSlice(allocator, p);
+        if (rules) |p| freeStringSlice(allocator, p);
+        if (workflow) |p| freeStringSlice(allocator, p);
+        if (success_metrics) |p| freeStringSlice(allocator, p);
+    }
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
+
+        if (line.len == 0) continue;
+        if (line[0] == '#') continue;
+
+        // Section header
+        if (line[0] == '[' and (line.len < 2 or line[1] != '[')) {
+            const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+            const section_name = std.mem.trim(u8, line[1..end], &[_]u8{ ' ', '\t' });
+            if (std.mem.eql(u8, section_name, "identity")) {
+                current_section = .identity;
+            } else if (std.mem.eql(u8, section_name, "capabilities")) {
+                current_section = .capabilities;
+            } else if (std.mem.eql(u8, section_name, "triggers_on")) {
+                current_section = .triggers_on;
+            } else if (std.mem.eql(u8, section_name, "context")) {
+                current_section = .context;
+            } else {
+                current_section = .none;
+            }
+            continue;
+        }
+
+        // Key = value
+        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq_idx], &[_]u8{ ' ', '\t' });
+        const raw_val = std.mem.trim(u8, line[eq_idx + 1 ..], &[_]u8{ ' ', '\t' });
+
+        switch (current_section) {
+            .identity => {
+                const val = stripValue(raw_val);
+                if (std.mem.eql(u8, key, "id")) {
+                    allocator.free(id);
+                    id = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "name")) {
+                    allocator.free(name);
+                    name = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "division")) {
+                    allocator.free(division);
+                    division = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "emoji")) {
+                    allocator.free(emoji);
+                    emoji = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "description")) {
+                    allocator.free(description);
+                    description = try allocator.dupe(u8, val);
+                }
+            },
+            .capabilities => {
+                if (std.mem.eql(u8, key, "read")) {
+                    // read patterns — acknowledged but not stored in RoleDefinition
+                    // (ownership.zig uses write/deny_write only)
+                } else if (std.mem.eql(u8, key, "write")) {
+                    if (write_patterns) |old| freeStringSlice(allocator, old);
+                    write_patterns = try parseTomlMultilineArray(allocator, raw_val, &lines);
+                } else if (std.mem.eql(u8, key, "deny_write")) {
+                    if (deny_write_patterns) |old| freeStringSlice(allocator, old);
+                    deny_write_patterns = try parseTomlMultilineArray(allocator, raw_val, &lines);
+                } else if (std.mem.eql(u8, key, "can_push")) {
+                    can_push = parseTomlBool(stripValue(raw_val)) orelse false;
+                } else if (std.mem.eql(u8, key, "can_merge")) {
+                    can_merge = parseTomlBool(stripValue(raw_val)) orelse false;
+                }
+            },
+            .triggers_on => {
+                if (std.mem.eql(u8, key, "events")) {
+                    if (trigger_events) |old| freeStringSlice(allocator, old);
+                    trigger_events = try parseTomlMultilineArray(allocator, raw_val, &lines);
+                }
+            },
+            .context => {
+                if (std.mem.eql(u8, key, "mission")) {
+                    allocator.free(mission);
+                    mission = try allocator.dupe(u8, stripValue(raw_val));
+                } else if (std.mem.eql(u8, key, "focus")) {
+                    allocator.free(focus);
+                    focus = try allocator.dupe(u8, stripValue(raw_val));
+                } else if (std.mem.eql(u8, key, "deliverables")) {
+                    if (deliverables) |old| freeStringSlice(allocator, old);
+                    deliverables = try parseTomlMultilineArray(allocator, raw_val, &lines);
+                } else if (std.mem.eql(u8, key, "rules")) {
+                    if (rules) |old| freeStringSlice(allocator, old);
+                    rules = try parseTomlMultilineArray(allocator, raw_val, &lines);
+                } else if (std.mem.eql(u8, key, "workflow")) {
+                    if (workflow) |old| freeStringSlice(allocator, old);
+                    workflow = try parseTomlMultilineArray(allocator, raw_val, &lines);
+                } else if (std.mem.eql(u8, key, "success_metrics")) {
+                    if (success_metrics) |old| freeStringSlice(allocator, old);
+                    success_metrics = try parseTomlMultilineArray(allocator, raw_val, &lines);
+                }
+            },
+            .none => {},
+        }
+    }
+
+    return RoleDefinition{
+        .id = id,
+        .name = name,
+        .division = division,
+        .emoji = emoji,
+        .description = description,
+        .write_patterns = write_patterns orelse try allocator.alloc([]const u8, 0),
+        .deny_write_patterns = deny_write_patterns orelse try allocator.alloc([]const u8, 0),
+        .can_push = can_push,
+        .can_merge = can_merge,
+        .trigger_events = trigger_events orelse try allocator.alloc([]const u8, 0),
+        .mission = mission,
+        .focus = focus,
+        .deliverables = deliverables orelse try allocator.alloc([]const u8, 0),
+        .rules = rules orelse try allocator.alloc([]const u8, 0),
+        .workflow = workflow orelse try allocator.alloc([]const u8, 0),
+        .success_metrics = success_metrics orelse try allocator.alloc([]const u8, 0),
+    };
+}
+
+// ─────────────────────────────────────────────────────────
 // File loading
 // ─────────────────────────────────────────────────────────
 
@@ -916,4 +1125,162 @@ test "parseTomlMultilineArray - spans multiple lines" {
     try std.testing.expectEqualStrings("item1", result[0]);
     try std.testing.expectEqualStrings("item2", result[1]);
     try std.testing.expectEqualStrings("item3", result[2]);
+}
+
+// ─── RoleDefinition tests ────────────────────────────────
+
+test "parseRoleContent - full role TOML" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[identity]
+        \\id = "frontend-engineer"
+        \\name = "Frontend Engineer"
+        \\division = "engineering"
+        \\emoji = "paint"
+        \\description = "React, Vue, UI implementation"
+        \\
+        \\[capabilities]
+        \\read = ["**"]
+        \\write = ["src/frontend/**", "tests/frontend/**"]
+        \\deny_write = ["src/backend/**", "infrastructure/**"]
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "Build pixel-perfect UI components"
+        \\focus = "Component architecture, accessibility"
+        \\deliverables = ["Working components", "Tests"]
+        \\rules = ["Never modify backend", "Write tests"]
+        \\workflow = ["Read task", "Implement", "Test"]
+        \\success_metrics = ["Tests pass", "No regressions"]
+    ;
+
+    var role = try parseRoleContent(alloc, toml);
+    defer role.deinit(alloc);
+
+    try std.testing.expectEqualStrings("frontend-engineer", role.id);
+    try std.testing.expectEqualStrings("Frontend Engineer", role.name);
+    try std.testing.expectEqualStrings("engineering", role.division);
+    try std.testing.expectEqualStrings("paint", role.emoji);
+    try std.testing.expectEqualStrings("React, Vue, UI implementation", role.description);
+
+    try std.testing.expect(role.write_patterns.len == 2);
+    try std.testing.expectEqualStrings("src/frontend/**", role.write_patterns[0]);
+    try std.testing.expectEqualStrings("tests/frontend/**", role.write_patterns[1]);
+
+    try std.testing.expect(role.deny_write_patterns.len == 2);
+    try std.testing.expectEqualStrings("src/backend/**", role.deny_write_patterns[0]);
+    try std.testing.expectEqualStrings("infrastructure/**", role.deny_write_patterns[1]);
+
+    try std.testing.expect(role.can_push == false);
+    try std.testing.expect(role.can_merge == false);
+
+    try std.testing.expect(role.trigger_events.len == 0);
+
+    try std.testing.expectEqualStrings("Build pixel-perfect UI components", role.mission);
+    try std.testing.expectEqualStrings("Component architecture, accessibility", role.focus);
+
+    try std.testing.expect(role.deliverables.len == 2);
+    try std.testing.expect(role.rules.len == 2);
+    try std.testing.expect(role.workflow.len == 3);
+    try std.testing.expect(role.success_metrics.len == 2);
+}
+
+test "parseRoleContent - multiline arrays" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[identity]
+        \\id = "test-role"
+        \\name = "Test"
+        \\division = "testing"
+        \\emoji = "x"
+        \\description = "test"
+        \\
+        \\[capabilities]
+        \\write = [
+        \\  "src/a/**",
+        \\  "src/b/**"
+        \\]
+        \\deny_write = []
+        \\can_push = true
+        \\can_merge = true
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+    ;
+
+    var role = try parseRoleContent(alloc, toml);
+    defer role.deinit(alloc);
+
+    try std.testing.expect(role.write_patterns.len == 2);
+    try std.testing.expectEqualStrings("src/a/**", role.write_patterns[0]);
+    try std.testing.expectEqualStrings("src/b/**", role.write_patterns[1]);
+    try std.testing.expect(role.can_push == true);
+    try std.testing.expect(role.can_merge == true);
+}
+
+test "parseRoleContent - empty content yields defaults" {
+    const alloc = std.testing.allocator;
+    var role = try parseRoleContent(alloc, "");
+    defer role.deinit(alloc);
+
+    try std.testing.expectEqualStrings("", role.id);
+    try std.testing.expect(role.write_patterns.len == 0);
+    try std.testing.expect(role.deny_write_patterns.len == 0);
+    try std.testing.expect(role.can_push == false);
+}
+
+test "parseRoleDefinition - reads from file" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const role_toml =
+        \\[identity]
+        \\id = "file-role"
+        \\name = "File Role"
+        \\division = "testing"
+        \\emoji = "f"
+        \\description = "from file"
+        \\
+        \\[capabilities]
+        \\write = ["src/**"]
+        \\deny_write = []
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test-role.toml", .data = role_toml });
+
+    const abs_path = try tmp_dir.dir.realpathAlloc(alloc, "test-role.toml");
+    defer alloc.free(abs_path);
+
+    var role = try parseRoleDefinition(alloc, abs_path);
+    defer role.deinit(alloc);
+
+    try std.testing.expectEqualStrings("file-role", role.id);
+    try std.testing.expectEqualStrings("from file", role.description);
+    try std.testing.expect(role.write_patterns.len == 1);
+    try std.testing.expectEqualStrings("src/**", role.write_patterns[0]);
 }
