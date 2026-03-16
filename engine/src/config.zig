@@ -23,6 +23,8 @@ pub const WorkerConfig = struct {
     model: []const u8,
     permissions: []const u8,
     default_task: []const u8,
+    role: ?[]const u8 = null,
+    role_path: ?[]const u8 = null,
 };
 
 pub const TeamLeadConfig = struct {
@@ -62,6 +64,8 @@ pub const Config = struct {
             allocator.free(w.model);
             allocator.free(w.permissions);
             allocator.free(w.default_task);
+            if (w.role) |r| allocator.free(r);
+            if (w.role_path) |rp| allocator.free(rp);
         }
         allocator.free(self.workers);
         if (self.github_token) |t| allocator.free(t);
@@ -92,6 +96,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
             allocator.free(w.model);
             allocator.free(w.permissions);
             allocator.free(w.default_task);
+            if (w.role) |r| allocator.free(r);
+            if (w.role_path) |rp| allocator.free(rp);
         }
         workers.deinit(allocator);
     }
@@ -217,6 +223,9 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
                 } else if (std.mem.eql(u8, key, "default_task")) {
                     allocator.free(w.default_task);
                     w.default_task = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "role")) {
+                    if (w.role) |old| allocator.free(old);
+                    w.role = try allocator.dupe(u8, val);
                 }
             },
             .github => {
@@ -1460,4 +1469,70 @@ test "listRolesInDir - empty on missing directory" {
     const roles = try listRolesInDir(alloc, "/nonexistent/path/roles");
     defer alloc.free(roles);
     try std.testing.expect(roles.len == 0);
+}
+
+// ─── WorkerConfig role field tests ───────────────────────
+
+test "config - worker role field parsed" {
+    const toml =
+        \\[project]
+        \\name = "role-test"
+        \\
+        \\[[workers]]
+        \\id = "w1"
+        \\name = "Frontend"
+        \\agent = "claude-code"
+        \\model = "claude-sonnet-4-6"
+        \\permissions = "full"
+        \\role = "frontend-engineer"
+    ;
+
+    var cfg = try parse(std.testing.allocator, toml);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.workers.len == 1);
+    try std.testing.expectEqualStrings("frontend-engineer", cfg.workers[0].role.?);
+    try std.testing.expect(cfg.workers[0].role_path == null);
+}
+
+test "config - worker without role has null" {
+    const toml =
+        \\[project]
+        \\name = "no-role"
+        \\
+        \\[[workers]]
+        \\id = "w1"
+        \\name = "Generic"
+        \\agent = "claude-code"
+    ;
+
+    var cfg = try parse(std.testing.allocator, toml);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.workers.len == 1);
+    try std.testing.expect(cfg.workers[0].role == null);
+    try std.testing.expect(cfg.workers[0].role_path == null);
+}
+
+test "config - multiple workers with and without roles" {
+    const toml =
+        \\[project]
+        \\name = "mixed"
+        \\
+        \\[[workers]]
+        \\id = "w1"
+        \\name = "Frontend"
+        \\role = "frontend-engineer"
+        \\
+        \\[[workers]]
+        \\id = "w2"
+        \\name = "Generic"
+    ;
+
+    var cfg = try parse(std.testing.allocator, toml);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.workers.len == 2);
+    try std.testing.expectEqualStrings("frontend-engineer", cfg.workers[0].role.?);
+    try std.testing.expect(cfg.workers[1].role == null);
 }
