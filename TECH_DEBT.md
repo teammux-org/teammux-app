@@ -15,11 +15,11 @@
 |-----|-----------------|----------------------------------|-----------|----------|--------|
 | TD5 | merge.zig       | MergeCoordinator not implemented | stream-B1 | YES      | RESOLVED |
 | TD6 | EngineClient    | tm_merge_* bridge missing        | stream-B2 | NO       | RESOLVED |
-| TD7 | GitView.swift   | Team Lead review UI not built    | stream-C1 | NO       | OPEN   |
-| TD8 | ConflictInfo    | conflictType as String not enum  | stream-C1 or v0.2 | NO | OPEN |
+| TD7 | GitView.swift   | Team Lead review UI not built    | stream-C1 | NO       | RESOLVED |
+| TD8 | ConflictInfo    | conflictType as String not enum  | v0.2 | NO | DEFERRED |
 
 ## Notes
 - TD1 breaking change: tm_message_cb gains a return value. stream-A1 updates engine/include/teammux.h, bus.zig, and EngineClient.swift atomically. No partial states.
 - TD5 adds new functions to teammux.h. stream-B1 owns the header changes. stream-B2 consumes them.
-- TD8: ConflictInfo.conflictType is a raw String. Consider an enum once engine's conflict type vocabulary is stable. Deferred from stream-B2 review.
+- TD8: ConflictInfo.conflictType is a raw String. Deferred to v0.2 — only 2 engine values (content/unknown), displayed as-is in ConflictView. Consider an enum once engine's conflict type vocabulary is stable.
 - Merge order: A1 → A2 → B1 → B2 → C1

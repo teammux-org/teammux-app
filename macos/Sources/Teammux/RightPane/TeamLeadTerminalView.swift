@@ -12,16 +12,66 @@ import os
 struct TeamLeadTerminalView: View {
     @EnvironmentObject var ghosttyApp: Ghostty.App
     @ObservedObject var engine: EngineClient
+    @Binding var activeTab: RightTab
+
+    /// Workers whose merge status is .pending — these need Team Lead review.
+    private var pendingWorkers: [WorkerInfo] {
+        engine.roster.filter { engine.mergeStatuses[$0.id] == .pending }
+    }
 
     var body: some View {
-        Group {
-            if ghosttyApp.app != nil {
-                terminalSurface
-            } else {
-                loadingState
+        ZStack(alignment: .top) {
+            Group {
+                if ghosttyApp.app != nil {
+                    terminalSurface
+                } else {
+                    loadingState
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if !pendingWorkers.isEmpty {
+                reviewBanner
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Review pending banner
+
+    private var reviewBanner: some View {
+        Button(action: {
+            activeTab = .git
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.system(size: 10))
+
+                Text(bannerText)
+                    .font(.system(size: 11, weight: .medium))
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial)
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.accentColor.opacity(0.3), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 8)
+    }
+
+    private var bannerText: String {
+        let count = pendingWorkers.count
+        if count == 1, let worker = pendingWorkers.first {
+            return "Worker \(worker.name) is ready for review"
+        }
+        return "\(count) workers ready for review"
     }
 
     // MARK: - Terminal surface
