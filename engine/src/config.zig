@@ -646,10 +646,10 @@ pub fn resolveRolePath(
         allocator.free(path);
     }
 
-    // Only exercised in app bundle — tests use temp dirs
+    // Bundled/dev paths — only exercised in app bundle or dev builds, tests use temp dirs
     // 3. App bundle: {exe_dir}/../Resources/roles/{role_id}.toml
     // 4. Dev build: {exe_dir}/roles/{role_id}.toml
-    if (getExeDir(allocator)) |exe_dir| {
+    if (try getExeDir(allocator)) |exe_dir| {
         defer allocator.free(exe_dir);
         {
             const path = try std.fmt.allocPrint(allocator, "{s}/../Resources/roles/{s}", .{ exe_dir, filename });
@@ -672,16 +672,20 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-pub fn getExeDir(allocator: std.mem.Allocator) ?[]u8 {
+pub fn getExeDir(allocator: std.mem.Allocator) !?[]u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = std.fs.selfExePath(&buf) catch return null;
     const dir = std.fs.path.dirname(exe_path) orelse return null;
-    return allocator.dupe(u8, dir) catch null;
+    return try allocator.dupe(u8, dir);
 }
 
 /// List all available role IDs from a directory. Returns owned slice of owned strings.
+/// Returns empty slice if directory does not exist. Propagates other errors.
 pub fn listRolesInDir(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return allocator.alloc([]const u8, 0);
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return allocator.alloc([]const u8, 0),
+        else => return err,
+    };
     defer dir.close();
 
     var items: std.ArrayList([]const u8) = .{};

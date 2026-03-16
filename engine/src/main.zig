@@ -564,7 +564,7 @@ export fn tm_roles_list(engine: ?*Engine, count: ?*u32) ?[*]?*CRole {
         null;
     defer if (home_roles) |hr| alloc.free(hr);
 
-    const exe_dir = config.getExeDir(alloc);
+    const exe_dir = config.getExeDir(alloc) catch return null;
     defer if (exe_dir) |ed| alloc.free(ed);
 
     const bundle_roles = if (exe_dir) |ed|
