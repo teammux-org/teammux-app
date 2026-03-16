@@ -87,7 +87,7 @@ struct RightPaneView: View {
     private var tabContent: some View {
         switch activeTab {
         case .teamLead:
-            TeamLeadTerminalView(engine: engine)
+            TeamLeadTerminalView(engine: engine, activeTab: $activeTab)
         case .git:
             GitView(engine: engine)
         case .diff:
