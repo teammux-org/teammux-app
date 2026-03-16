@@ -42,6 +42,16 @@ struct GitView: View {
         .padding()
     }
 
+    // MARK: - Computed properties
+
+    /// Workers whose merge has reached a terminal state (success or rejected).
+    private var completedWorkers: [WorkerInfo] {
+        engine.roster.filter { worker in
+            guard let status = engine.mergeStatuses[worker.id] else { return false }
+            return status == .success || status == .rejected
+        }
+    }
+
     // MARK: - Git list
 
     private var gitList: some View {
@@ -72,8 +82,102 @@ struct GitView: View {
                     GitWorkerRow(worker: worker, engine: engine)
                 }
             }
+
+            if !completedWorkers.isEmpty {
+                Section("Completed") {
+                    ForEach(completedWorkers) { worker in
+                        CompletedWorkerRow(
+                            worker: worker,
+                            engine: engine
+                        )
+                    }
+                }
+            }
         }
         .listStyle(.sidebar)
+    }
+}
+
+// MARK: - CompletedWorkerRow
+
+/// A row in the history section showing a worker whose merge completed or was rejected.
+struct CompletedWorkerRow: View {
+    let worker: WorkerInfo
+    @ObservedObject var engine: EngineClient
+
+    private var mergeStatus: MergeStatus {
+        engine.mergeStatuses[worker.id] ?? .pending
+    }
+
+    /// Try to find a completion message for this worker to get timestamp and commit hash.
+    private var completionMessage: TeamMessage? {
+        engine.messages.last { $0.from == worker.id && $0.type == .completion }
+    }
+
+    private var displayTimestamp: Date {
+        completionMessage?.timestamp ?? worker.spawnedAt
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(mergeStatus.color)
+                .frame(width: 8, height: 8)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(worker.name)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+
+                Text(worker.taskDescription)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 2) {
+                outcomeBadge
+
+                HStack(spacing: 4) {
+                    if let commit = completionMessage?.gitCommit {
+                        Text(String(commit.prefix(7)))
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+
+                    Text(displayTimestamp, style: .relative)
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var outcomeBadge: some View {
+        switch mergeStatus {
+        case .success:
+            Text("Merged")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.green)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Color.green.opacity(0.12))
+                .cornerRadius(4)
+        case .rejected:
+            Text("Rejected")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.12))
+                .cornerRadius(4)
+        default:
+            EmptyView()
+        }
     }
 }
 
