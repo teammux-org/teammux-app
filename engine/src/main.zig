@@ -481,23 +481,45 @@ export fn tm_merge_conflicts_free(conflicts: ?[*]?*CConflict, count: u32) void {
 export fn tm_role_resolve(engine: ?*Engine, role_id: ?[*:0]const u8, out_role: ?*?*CRole) c_int {
     if (out_role) |p| p.* = null;
     const e = engine orelse return 99;
-    const rid = std.mem.span(role_id orelse return 13);
+    const out = out_role orelse {
+        e.setError("tm_role_resolve: out_role must not be NULL") catch {};
+        return 13;
+    };
+    const rid = std.mem.span(role_id orelse {
+        e.setError("tm_role_resolve: role_id must not be NULL") catch {};
+        return 13;
+    });
 
-    const role_path = config.resolveRolePath(e.allocator, rid, e.project_root) catch return 13;
+    const role_path = config.resolveRolePath(e.allocator, rid, e.project_root) catch |err| {
+        if (err == error.OutOfMemory) return 99;
+        e.setError("role resolve failed: path search error") catch {};
+        return 13;
+    };
     if (role_path == null) {
         std.log.warn("[teammux] role '{s}' not found in any search path", .{rid});
+        e.setError("role not found in any search path") catch {};
         return 13; // TM_ERR_ROLE
     }
     defer e.allocator.free(role_path.?);
 
-    var role_def = config.parseRoleDefinition(e.allocator, role_path.?) catch {
-        std.log.warn("[teammux] failed to parse role '{s}'", .{rid});
+    var role_def = config.parseRoleDefinition(e.allocator, role_path.?) catch |err| {
+        const msg = switch (err) {
+            error.OutOfMemory => {
+                e.setError("role parse failed: out of memory") catch {};
+                return 99;
+            },
+            error.InvalidSyntax => "role parse failed: invalid TOML syntax",
+            error.StreamTooLong => "role parse failed: file exceeds 1MB limit",
+            else => "role parse failed: file read error",
+        };
+        std.log.warn("[teammux] failed to parse role '{s}': {s}", .{ rid, msg });
+        e.setError(msg) catch {};
         return 13;
     };
     defer role_def.deinit(e.allocator);
 
     const c_role = fillCRole(e.allocator, &role_def) catch return 99;
-    if (out_role) |p| p.* = c_role;
+    out.* = c_role;
     return 0;
 }
 
@@ -513,7 +535,7 @@ export fn tm_roles_list(engine: ?*Engine, count: ?*u32) ?[*]?*CRole {
     const e = engine orelse return null;
     const alloc = e.allocator;
 
-    // Collect unique role IDs from all search paths (project-local, user, bundled)
+    // Collect unique role IDs from all search paths (project-local, user, bundled, dev-build)
     var seen = std.StringHashMap(void).init(alloc);
     defer {
         var it = seen.keyIterator();
@@ -521,7 +543,16 @@ export fn tm_roles_list(engine: ?*Engine, count: ?*u32) ?[*]?*CRole {
         seen.deinit();
     }
     var role_defs: std.ArrayList(*CRole) = .{};
-    defer role_defs.deinit(alloc);
+    var role_defs_transferred = false;
+    defer {
+        if (!role_defs_transferred) {
+            for (role_defs.items) |cr| {
+                freeCRole(cr);
+                alloc.destroy(cr);
+            }
+        }
+        role_defs.deinit(alloc);
+    }
 
     // Search paths to scan for role directories
     const project_roles = std.fmt.allocPrint(alloc, "{s}/.teammux/roles", .{e.project_root}) catch return null;
@@ -552,31 +583,45 @@ export fn tm_roles_list(engine: ?*Engine, count: ?*u32) ?[*]?*CRole {
 
     for (paths) |maybe_path| {
         const dir_path = maybe_path orelse continue;
-        const role_ids = config.listRolesInDir(alloc, dir_path) catch continue;
+        const role_ids = config.listRolesInDir(alloc, dir_path) catch |err| {
+            if (err == error.OutOfMemory) return null;
+            std.log.warn("[teammux] roles: failed to list directory '{s}': {s}", .{ dir_path, @errorName(err) });
+            continue;
+        };
         defer {
             for (role_ids) |rid| alloc.free(rid);
             alloc.free(role_ids);
         }
         for (role_ids) |rid| {
             if (seen.contains(rid)) continue;
-            // Try to resolve and parse this role
-            const role_path = config.resolveRolePath(alloc, rid, e.project_root) catch continue;
+            const role_path = config.resolveRolePath(alloc, rid, e.project_root) catch |err| {
+                if (err == error.OutOfMemory) return null;
+                std.log.warn("[teammux] roles: resolve failed for '{s}': {s}", .{ rid, @errorName(err) });
+                continue;
+            };
             if (role_path == null) continue;
             defer alloc.free(role_path.?);
 
-            var role_def = config.parseRoleDefinition(alloc, role_path.?) catch continue;
+            var role_def = config.parseRoleDefinition(alloc, role_path.?) catch |err| {
+                if (err == error.OutOfMemory) return null;
+                std.log.warn("[teammux] roles: parse failed for '{s}': {s}", .{ rid, @errorName(err) });
+                continue;
+            };
             defer role_def.deinit(alloc);
 
-            const c_role = fillCRole(alloc, &role_def) catch continue;
+            const c_role = fillCRole(alloc, &role_def) catch |err| {
+                if (err == error.OutOfMemory) return null;
+                continue;
+            };
             role_defs.append(alloc, c_role) catch {
                 freeCRole(c_role);
                 alloc.destroy(c_role);
-                continue;
+                return null; // OOM
             };
-            const owned_key = alloc.dupe(u8, rid) catch continue;
+            const owned_key = alloc.dupe(u8, rid) catch return null;
             seen.put(owned_key, {}) catch {
                 alloc.free(owned_key);
-                continue;
+                return null; // OOM
             };
         }
     }
@@ -588,6 +633,7 @@ export fn tm_roles_list(engine: ?*Engine, count: ?*u32) ?[*]?*CRole {
     for (role_defs.items, 0..) |ptr, i| {
         result[i] = ptr;
     }
+    role_defs_transferred = true;
     if (count) |c| c.* = @intCast(role_defs.items.len);
     return result.ptr;
 }
@@ -675,6 +721,7 @@ fn fillCRole(alloc: std.mem.Allocator, rd: *const config.RoleDefinition) !*CRole
     const wp = try dupeStringArray(alloc, rd.write_patterns);
     errdefer freeNullTerminatedArray(alloc, wp, @intCast(rd.write_patterns.len));
     const dwp = try dupeStringArray(alloc, rd.deny_write_patterns);
+    errdefer freeNullTerminatedArray(alloc, dwp, @intCast(rd.deny_write_patterns.len));
 
     c_role.* = .{
         .id = id_z.ptr,
