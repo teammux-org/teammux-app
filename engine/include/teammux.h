@@ -400,13 +400,16 @@ void tm_ownership_free(tm_ownership_entry_t** entries, uint32_t count);
 // -----------------------------------------------------------------
 
 // Install a git wrapper script into the worker's worktree that intercepts
-// `git add` and blocks files matching deny patterns from the ownership registry.
+// `git add` and blocks files matching deny patterns. Reads deny and write
+// patterns from rules previously registered via tm_ownership_register().
 // If no deny patterns are registered, installs a pass-through wrapper.
-// Called after ownership patterns are registered for the worker.
+// Returns TM_ERR_WORKTREE if pattern contains shell metacharacters or
+// git binary cannot be found on PATH.
 tm_result_t tm_interceptor_install(tm_engine_t* engine, uint32_t worker_id);
 
 // Remove the git wrapper script from the worker's worktree.
-// Called automatically by tm_worker_dismiss and tm_merge_reject.
+// The interceptor is automatically cleaned up by tm_worker_dismiss and
+// tm_merge_reject. This function is available for explicit removal.
 // Idempotent — safe to call even if no interceptor was installed.
 tm_result_t tm_interceptor_remove(tm_engine_t* engine, uint32_t worker_id);
 

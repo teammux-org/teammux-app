@@ -264,7 +264,9 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
     // Remove interceptor wrapper before worktree is deleted
     if (e.roster.getWorker(worker_id)) |w| {
-        interceptor.remove(w.worktree_path);
+        interceptor.remove(e.allocator, w.worktree_path) catch |err| {
+            std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
+        };
     }
     e.roster.dismiss(e.project_root, worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
     e.ownership_registry.release(worker_id);
@@ -455,7 +457,9 @@ export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
     // Remove interceptor wrapper before worktree is deleted
     if (e.roster.getWorker(worker_id)) |w| {
-        interceptor.remove(w.worktree_path);
+        interceptor.remove(e.allocator, w.worktree_path) catch |err| {
+            std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
+        };
     }
     e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
         e.setError(if (err == error.WorkerNotFound) "merge reject failed: worker not found" else "merge reject failed") catch {};
@@ -783,15 +787,18 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
         }
     }
 
-    // Build pattern arrays
+    // Build pattern arrays — copy pattern pointers from registry.
+    // NOTE: These are pointers into registry-owned memory. Safe because
+    // all C API calls are dispatched from the main thread; no concurrent
+    // register/release can occur during this function.
     const deny_pats = e.allocator.alloc([]const u8, deny_count) catch {
         e.setError("tm_interceptor_install: allocation failed") catch {};
-        return 99;
+        return 5; // TM_ERR_WORKTREE
     };
     defer e.allocator.free(deny_pats);
     const write_pats = e.allocator.alloc([]const u8, write_count) catch {
         e.setError("tm_interceptor_install: allocation failed") catch {};
-        return 99;
+        return 5; // TM_ERR_WORKTREE
     };
     defer e.allocator.free(write_pats);
 
@@ -810,7 +817,11 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
     }
 
     interceptor.install(e.allocator, w.worktree_path, worker_id, w.name, deny_pats, write_pats) catch |err| {
-        e.setError(if (err == error.GitNotFound) "tm_interceptor_install: git binary not found on PATH" else "tm_interceptor_install: failed to write wrapper script") catch {};
+        e.setError(switch (err) {
+            error.GitNotFound => "tm_interceptor_install: git binary not found on PATH",
+            error.UnsafePattern => "tm_interceptor_install: pattern contains shell metacharacters",
+            else => "tm_interceptor_install: failed to install wrapper script",
+        }) catch {};
         return 5; // TM_ERR_WORKTREE
     };
     return 0;
@@ -822,14 +833,20 @@ export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
         e.setError("tm_interceptor_remove: worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     };
-    interceptor.remove(w.worktree_path);
+    interceptor.remove(e.allocator, w.worktree_path) catch {
+        e.setError("tm_interceptor_remove: failed to remove wrapper") catch {};
+        return 5; // TM_ERR_WORKTREE
+    };
     return 0;
 }
 
 export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     const e = engine orelse return null;
     const w = e.roster.getWorker(worker_id) orelse return null;
-    const path = interceptor.getInterceptorPath(std.heap.c_allocator, w.worktree_path) catch return null;
+    const path = interceptor.getInterceptorPath(std.heap.c_allocator, w.worktree_path) catch {
+        e.setError("tm_interceptor_path: filesystem error checking interceptor directory") catch {};
+        return null;
+    };
     if (path) |p| {
         const z = std.heap.c_allocator.dupeZ(u8, p) catch {
             std.heap.c_allocator.free(p);
@@ -1580,6 +1597,87 @@ test "tm_interceptor_install no patterns creates pass-through" {
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "DENY_PATTERNS") == null);
     try std.testing.expect(std.mem.indexOf(u8, content, "exec \"") != null);
+}
+
+test "tm_interceptor_install invalid worker returns TM_ERR_INVALID_WORKER" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Worker 999 does not exist
+    try std.testing.expect(tm_interceptor_install(engine_ptr, 999) == 12);
+}
+
+test "tm_interceptor_remove invalid worker returns TM_ERR_INVALID_WORKER" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Worker 999 does not exist
+    try std.testing.expect(tm_interceptor_remove(engine_ptr, 999) == 12);
+}
+
+test "tm_merge_reject removes interceptor wrapper" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Set up a git repo
+    try worktree.runGit(std.testing.allocator, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.email", "test@test.com" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.name", "Test" });
+    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{root});
+    defer std.testing.allocator.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    try worktree.runGit(std.testing.allocator, root, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, root, &.{ "commit", "-m", "initial" });
+
+    // Spawn a worker
+    const name_z = try std.testing.allocator.dupeZ(u8, "/usr/bin/echo");
+    defer std.testing.allocator.free(name_z);
+    const worker_z = try std.testing.allocator.dupeZ(u8, "WorkerA");
+    defer std.testing.allocator.free(worker_z);
+    const task_z = try std.testing.allocator.dupeZ(u8, "test reject");
+    defer std.testing.allocator.free(task_z);
+
+    const worker_id = tm_worker_spawn(engine_ptr, name_z.ptr, 0, worker_z.ptr, task_z.ptr);
+    try std.testing.expect(worker_id != 0xFFFFFFFF);
+
+    // Register ownership and install interceptor
+    const pat = try std.testing.allocator.dupeZ(u8, "src/**");
+    defer std.testing.allocator.free(pat);
+    try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, pat.ptr, false) == 0);
+    try std.testing.expect(tm_interceptor_install(engine_ptr, worker_id) == 0);
+
+    // Verify interceptor is installed
+    try std.testing.expect(tm_interceptor_path(engine_ptr, worker_id) != null);
+    tm_free_string(tm_interceptor_path(engine_ptr, worker_id));
+
+    // Reject merge — should remove interceptor and ownership
+    try std.testing.expect(tm_merge_reject(engine_ptr, worker_id) == 0);
+
+    // After reject, worker is gone so interceptor path returns null
+    try std.testing.expect(tm_interceptor_path(engine_ptr, worker_id) == null);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; }
