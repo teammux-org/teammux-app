@@ -314,11 +314,16 @@ final class EngineClient: ObservableObject {
 
         // Resolve role and register ownership patterns if roleId was provided.
         // Failure here is non-fatal — the worker still operates, just without
-        // role-based ownership enforcement.
+        // role-based ownership enforcement. The role is always cached when
+        // resolution succeeds (valid metadata for UI), even if ownership
+        // registration partially fails (R8 interceptor is the real enforcement).
         if let roleId {
             if let role = resolveRole(id: roleId) {
-                registerOwnership(workerId: workerId, role: role)
+                let registered = registerOwnership(workerId: workerId, role: role)
                 workerRoles[workerId] = role
+                if !registered {
+                    Self.logger.error("spawnWorker: role '\(roleId)' resolved but ownership registration failed for worker \(workerId) — enforcement degraded")
+                }
             } else {
                 Self.logger.warning("spawnWorker: role '\(roleId)' could not be resolved for worker \(workerId)")
             }
@@ -845,18 +850,24 @@ final class EngineClient: ObservableObject {
 
     /// Register all write and deny_write patterns from a role definition
     /// into the engine's ownership registry for a given worker.
+    /// Returns `true` only when all patterns registered successfully.
     /// Wraps `tm_ownership_register()`.
-    private func registerOwnership(workerId: UInt32, role: RoleDefinition) {
+    @discardableResult
+    private func registerOwnership(workerId: UInt32, role: RoleDefinition) -> Bool {
         guard let engine else {
             Self.logger.error("registerOwnership: engine not created — skipping \(role.writePatterns.count + role.denyWritePatterns.count) patterns for worker \(workerId)")
-            return
+            return false
         }
+
+        var allSucceeded = true
 
         for pattern in role.writePatterns {
             pattern.withCString { cPattern in
                 let result = tm_ownership_register(engine, workerId, cPattern, true)
                 if result != TM_OK {
-                    Self.logger.warning("registerOwnership: failed to register write pattern '\(pattern)' for worker \(workerId)")
+                    let msg = lastEngineError() ?? "(\(result.rawValue))"
+                    Self.logger.warning("registerOwnership: failed to register write pattern '\(pattern)' for worker \(workerId): \(msg)")
+                    allSucceeded = false
                 }
             }
         }
@@ -865,10 +876,14 @@ final class EngineClient: ObservableObject {
             pattern.withCString { cPattern in
                 let result = tm_ownership_register(engine, workerId, cPattern, false)
                 if result != TM_OK {
-                    Self.logger.warning("registerOwnership: failed to register deny pattern '\(pattern)' for worker \(workerId)")
+                    let msg = lastEngineError() ?? "(\(result.rawValue))"
+                    Self.logger.warning("registerOwnership: failed to register deny pattern '\(pattern)' for worker \(workerId): \(msg)")
+                    allSucceeded = false
                 }
             }
         }
+
+        return allSucceeded
     }
 
     // MARK: - Private: Callbacks
