@@ -343,7 +343,11 @@ final class EngineClient: ObservableObject {
                 // write-scope guarantees.
                 lastError = msg
                 Self.logger.error("spawnWorker: \(msg) — dismissing worker to avoid degraded enforcement")
-                _ = tm_worker_dismiss(engine, workerId)
+                let dismissResult = tm_worker_dismiss(engine, workerId)
+                if dismissResult != TM_OK {
+                    let dismissMsg = lastEngineError() ?? "tm_worker_dismiss failed (\(dismissResult.rawValue))"
+                    Self.logger.error("spawnWorker: cleanup dismiss failed for worker \(workerId): \(dismissMsg)")
+                }
                 workerRoles.removeValue(forKey: workerId)
                 worktreeReadyQueue.removeAll { $0.id == workerId }
                 refreshRoster()
