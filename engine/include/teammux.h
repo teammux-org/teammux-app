@@ -476,6 +476,35 @@ tm_result_t tm_interceptor_remove(tm_engine_t* engine, uint32_t worker_id);
 // Returned string must be freed with tm_free_string().
 const char* tm_interceptor_path(tm_engine_t* engine, uint32_t worker_id);
 
+// -----------------------------------------------------------------
+// Role hot-reload
+// -----------------------------------------------------------------
+
+// Callback fired when a watched role TOML file changes.
+// new_claude_md is the regenerated CLAUDE.md content as a C string.
+// Memory ownership: engine allocates, valid only during the callback.
+// Caller must copy if needed beyond callback scope.
+typedef void (*tm_role_changed_cb)(uint32_t worker_id,
+                                    const char* new_claude_md,
+                                    void* userdata);
+
+// Start watching the role TOML file for a worker. When the file changes
+// (write, rename, delete+recreate), the engine re-parses the role definition,
+// regenerates CLAUDE.md, and fires the callback with the new content.
+// role_id is resolved to a file path via the standard search order.
+// Returns TM_ERR_ROLE if role_id cannot be resolved.
+// Returns TM_ERR_INVALID_WORKER if worker_id is not in the roster.
+tm_result_t tm_role_watch(tm_engine_t* engine,
+                           uint32_t worker_id,
+                           const char* role_id,
+                           tm_role_changed_cb callback,
+                           void* userdata);
+
+// Stop watching the role file for a worker. Idempotent — safe to call
+// even if no watcher was registered. Called automatically by tm_worker_dismiss.
+tm_result_t tm_role_unwatch(tm_engine_t* engine,
+                             uint32_t worker_id);
+
 #ifdef __cplusplus
 }
 #endif
