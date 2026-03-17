@@ -4,7 +4,7 @@ This directory contains the default role definitions shipped with Teammux. Each 
 
 ## TOML Format Reference
 
-Every role file must contain all 4 sections with all fields populated.
+Every role file must contain all 4 TOML sections (`[identity]`, `[capabilities]`, `[triggers_on]`, `[context]`) with all 16 fields populated.
 
 ### [identity]
 
@@ -20,7 +20,7 @@ Every role file must contain all 4 sections with all fields populated.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `read` | string[] | Glob patterns for readable paths (typically `["**"]` for full read access) |
+| `read` | string[] | Glob patterns for readable paths (typically `["**"]`). Note: in v0.1.2, read access is universally granted and not enforced by the engine. This field is reserved for future capability narrowing. |
 | `write` | string[] | Glob patterns for writable paths |
 | `deny_write` | string[] | Glob patterns explicitly denied for writing (takes precedence over `write`) |
 | `can_push` | bool | Whether the role can push branches to remote |
@@ -48,14 +48,16 @@ Every role file must contain all 4 sections with all fields populated.
 All paths are relative to the project root. Patterns follow gitignore-style semantics:
 
 - `**` matches any directory depth (zero or more levels)
-- `*` matches any characters within a single path segment
-- `?` matches any single character
+- `*` matches zero or more characters within a single path component (does not match `/`)
+- `?` matches any single character (does not match `/`)
+- A bare filename without `/` (e.g., `Makefile`) matches at the project root only
 
 Examples:
 - `src/frontend/**` — all files under src/frontend/ at any depth
 - `**/*.md` — all Markdown files anywhere in the project
+- `*.md` — Markdown files at the project root only
 - `tests/**` — all files under tests/ at any depth
-- `Dockerfile*` — Dockerfile, Dockerfile.dev, Dockerfile.prod, etc.
+- `Dockerfile*` — Dockerfile, Dockerfile.dev, Dockerfile.prod, etc. at the project root
 
 ## Capability Evaluation Order
 
@@ -63,7 +65,7 @@ Examples:
 2. Check `write` patterns — if any match, access is **allowed**
 3. Default: **denied** (no explicit allow = no access)
 
-`deny_write` always takes precedence over `write`.
+`deny_write` always takes precedence over `write`. Read access is not enforced in v0.1.2 — all roles have full read access regardless of the `read` field value. The evaluation order above applies to write operations only.
 
 ## Divisions
 
@@ -85,11 +87,13 @@ When a worker is assigned a role ID, Teammux resolves the role file using this s
 2. `~/.teammux/roles/{role_id}.toml` — user-level custom roles
 3. `{bundled_roles_path}/{role_id}.toml` — this directory (Teammux defaults)
 
+The bundled roles path resolves to `{executable_dir}/../Resources/roles/` in the macOS app bundle, or `{executable_dir}/roles/` in development builds.
+
 Project-local overrides let teams customize role scopes for their specific codebase structure without modifying the bundled defaults.
 
 ## Example Role
 
-See `frontend-engineer.toml` for a complete example with all sections populated.
+See `frontend-engineer.toml` for a standard engineering role, `tech-lead.toml` for a role with push and merge permissions, and `product-manager.toml` for a non-code role with documentation-only write access.
 
 ## Contributing a New Role
 
@@ -99,5 +103,6 @@ See `frontend-engineer.toml` for a complete example with all sections populated.
 4. Use an existing role in the same division as a reference for scope patterns
 5. Write substantive, role-specific content — generic placeholder text will be rejected
 6. `deny_write` patterns must realistically reflect what the role should NOT modify
-7. Include at least 4 rules, 4 workflow steps, and 3 success metrics
-8. Test your role by assigning it to a worker and verifying capability enforcement
+7. Include at least 4 rules, 4 workflow steps, and 3 success metrics (most shipped roles have 5 rules, 6 workflow steps, and 4 metrics — aim to match that standard)
+8. Verify before submitting: (a) file parses as valid TOML, (b) `id` matches the filename, (c) all 4 sections present with all 16 fields, (d) `division` is one of the 7 valid values listed above
+9. Test your role by assigning it to a worker and verifying capability enforcement

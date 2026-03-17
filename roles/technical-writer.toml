@@ -7,7 +7,7 @@ description = "API documentation, developer guides, architecture docs, changelog
 
 [capabilities]
 read = ["**"]
-write = ["docs/**", "**/*.md", "CHANGELOG.md"]
+write = ["docs/**", "*.md"]
 deny_write = ["src/**", "tests/**", "infrastructure/**", "scripts/**"]
 can_push = false
 can_merge = false
