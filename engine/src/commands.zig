@@ -1,4 +1,5 @@
 const std = @import("std");
+const bus = @import("bus.zig");
 
 // ─────────────────────────────────────────────────────────
 // /teammux-* command file watcher
@@ -201,8 +202,7 @@ pub const CommandWatcher = struct {
             std.log.warn("[teammux] /teammux-complete missing worker_id in args", .{});
             return error.InvalidJson;
         };
-        // TM_MSG_COMPLETION = 5
-        const rc = send_fn(0, worker_id, 5, args.ptr, self.bus_send_userdata);
+        const rc = send_fn(0, worker_id, @intFromEnum(bus.MessageType.completion), args.ptr, self.bus_send_userdata);
         if (rc != 0) {
             std.log.warn("[teammux] /teammux-complete bus send failed: rc={d}", .{rc});
             return error.BusSendFailed;
@@ -217,8 +217,7 @@ pub const CommandWatcher = struct {
             std.log.warn("[teammux] /teammux-question missing worker_id in args", .{});
             return error.InvalidJson;
         };
-        // TM_MSG_QUESTION = 8
-        const rc = send_fn(0, worker_id, 8, args.ptr, self.bus_send_userdata);
+        const rc = send_fn(0, worker_id, @intFromEnum(bus.MessageType.question), args.ptr, self.bus_send_userdata);
         if (rc != 0) {
             std.log.warn("[teammux] /teammux-question bus send failed: rc={d}", .{rc});
             return error.BusSendFailed;
@@ -512,7 +511,7 @@ test "commands - /teammux-complete routed to bus, generic callback not fired" {
     try std.testing.expect(State.bus_called);
     try std.testing.expect(State.bus_to == 0); // Team Lead
     try std.testing.expect(State.bus_from == 3); // worker_id from args
-    try std.testing.expect(State.bus_msg_type == 5); // TM_MSG_COMPLETION
+    try std.testing.expect(State.bus_msg_type == @intFromEnum(bus.MessageType.completion));
     // Payload contains the args JSON
     try std.testing.expect(std.mem.indexOf(u8, State.bus_payload[0..State.bus_payload_len], "auth done") != null);
 
@@ -569,7 +568,7 @@ test "commands - /teammux-question routed to bus, generic callback not fired" {
     watcher.scanAndProcess();
 
     try std.testing.expect(State.bus_called);
-    try std.testing.expect(State.bus_msg_type == 8); // TM_MSG_QUESTION
+    try std.testing.expect(State.bus_msg_type == @intFromEnum(bus.MessageType.question));
     try std.testing.expect(State.bus_from == 5); // worker_id from args
     try std.testing.expect(!State.generic_called);
 
