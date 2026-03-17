@@ -714,7 +714,7 @@ export fn tm_roles_list_bundled(project_root: ?[*:0]const u8, count: ?*u32) ?[*]
         null;
     defer if (home_roles) |hr| alloc.free(hr);
 
-    const exe_dir = config.getExeDir(alloc) catch null;
+    const exe_dir = config.getExeDir(alloc) catch return null;
     defer if (exe_dir) |ed| alloc.free(ed);
 
     const bundle_roles = if (exe_dir) |ed|
@@ -731,15 +731,17 @@ export fn tm_roles_list_bundled(project_root: ?[*:0]const u8, count: ?*u32) ?[*]
 
     const paths = [_]?[]const u8{ project_roles, home_roles, bundle_roles, dev_roles };
 
-    // Use a dummy project root for resolveRolePath when project_root is null.
-    // resolveRolePath checks project-local first, but with a nonexistent path
-    // it simply falls through to the other search paths.
+    // When project_root is null, pass a nonexistent path to resolveRolePath so
+    // its project-local check fails harmlessly and falls through to user/bundled/dev.
+    // This relies on /nonexistent not existing on disk. A cleaner alternative would
+    // be a resolveRolePath variant accepting optional project_root.
     const resolve_root = root orelse "/nonexistent";
 
     for (paths) |maybe_path| {
         const dir_path = maybe_path orelse continue;
         const role_ids = config.listRolesInDir(alloc, dir_path) catch |err| {
             if (err == error.OutOfMemory) return null;
+            std.log.warn("[teammux] bundled-roles: failed to list directory '{s}': {s}", .{ dir_path, @errorName(err) });
             continue;
         };
         defer {
@@ -750,6 +752,7 @@ export fn tm_roles_list_bundled(project_root: ?[*:0]const u8, count: ?*u32) ?[*]
             if (seen.contains(rid)) continue;
             const role_path = config.resolveRolePath(alloc, rid, resolve_root) catch |err| {
                 if (err == error.OutOfMemory) return null;
+                std.log.warn("[teammux] bundled-roles: resolve failed for '{s}': {s}", .{ rid, @errorName(err) });
                 continue;
             };
             if (role_path == null) continue;
@@ -757,14 +760,12 @@ export fn tm_roles_list_bundled(project_root: ?[*:0]const u8, count: ?*u32) ?[*]
 
             var role_def = config.parseRoleDefinition(alloc, role_path.?) catch |err| {
                 if (err == error.OutOfMemory) return null;
+                std.log.warn("[teammux] bundled-roles: parse failed for '{s}': {s}", .{ rid, @errorName(err) });
                 continue;
             };
             defer role_def.deinit(alloc);
 
-            const c_role = fillCRole(alloc, &role_def) catch |err| {
-                if (err == error.OutOfMemory) return null;
-                continue;
-            };
+            const c_role = fillCRole(alloc, &role_def) catch return null;
             role_defs.append(alloc, c_role) catch {
                 freeCRole(c_role);
                 alloc.destroy(c_role);
@@ -1322,6 +1323,86 @@ test "tm_roles_list_bundled null project_root returns null gracefully" {
     } else {
         try std.testing.expect(count == 0);
     }
+}
+
+test "tm_roles_list_bundled empty roles directory returns null" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+
+    try tmp.dir.makePath(".teammux/roles");
+
+    var count: u32 = 42;
+    const result = tm_roles_list_bundled(root_z.ptr, &count);
+    // Empty directory — no roles found, count should be 0
+    if (result) |r| {
+        defer tm_roles_list_bundled_free(r, count);
+    } else {
+        try std.testing.expect(count == 0);
+    }
+}
+
+test "tm_roles_list_bundled skips malformed TOML gracefully" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+
+    try tmp.dir.makePath(".teammux/roles");
+    // One valid role
+    const valid_toml =
+        \\[identity]
+        \\id = "valid-role"
+        \\name = "Valid"
+        \\division = "testing"
+        \\emoji = "v"
+        \\description = "valid role"
+        \\
+        \\[capabilities]
+        \\write = []
+        \\deny_write = []
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = ".teammux/roles/valid-role.toml", .data = valid_toml });
+    // One malformed role
+    try tmp.dir.writeFile(.{ .sub_path = ".teammux/roles/broken-role.toml", .data = "this is not valid toml {{{{" });
+
+    var count: u32 = 0;
+    const roles = tm_roles_list_bundled(root_z.ptr, &count);
+    try std.testing.expect(roles != null);
+    try std.testing.expect(count >= 1);
+    defer tm_roles_list_bundled_free(roles, count);
+
+    // Valid role should still be found despite the broken one
+    var found_valid = false;
+    for (0..count) |i| {
+        if (roles.?[i]) |r| {
+            if (r.id) |id| {
+                if (std.mem.eql(u8, std.mem.span(id), "valid-role")) {
+                    found_valid = true;
+                    break;
+                }
+            }
+        }
+    }
+    try std.testing.expect(found_valid);
 }
 
 test "tm_roles_list_bundled finds roles in project directory" {
