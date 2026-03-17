@@ -329,6 +329,33 @@ final class EngineClient: ObservableObject {
             }
         }
 
+        // Install git interceptor wrapper. Called unconditionally — the engine
+        // reads deny_write patterns from the ownership registry and embeds them
+        // in the wrapper script. Workers with no registered deny patterns
+        // (including those with no role) get a pass-through wrapper.
+        let hasResolvedRole = workerRoles[workerId] != nil
+        let interceptResult = tm_interceptor_install(engine, workerId)
+        if interceptResult != TM_OK {
+            let msg = lastEngineError() ?? "tm_interceptor_install failed (\(interceptResult.rawValue))"
+            if hasResolvedRole {
+                // Hard failure for role-assigned workers: enforcement is the
+                // whole point of roles. Continuing without it silently drops
+                // write-scope guarantees.
+                lastError = msg
+                Self.logger.error("spawnWorker: \(msg) — dismissing worker to avoid degraded enforcement")
+                let dismissResult = tm_worker_dismiss(engine, workerId)
+                if dismissResult != TM_OK {
+                    let dismissMsg = lastEngineError() ?? "tm_worker_dismiss failed (\(dismissResult.rawValue))"
+                    Self.logger.error("spawnWorker: cleanup dismiss failed for worker \(workerId): \(dismissMsg)")
+                }
+                workerRoles.removeValue(forKey: workerId)
+                worktreeReadyQueue.removeAll { $0.id == workerId }
+                refreshRoster()
+                return 0
+            }
+            Self.logger.warning("spawnWorker: \(msg) — no role assigned, continuing with pass-through")
+        }
+
         // Refresh the roster to pick up the new worker
         refreshRoster()
 
@@ -687,7 +714,7 @@ final class EngineClient: ObservableObject {
             }()
             let conflict = ConflictInfo(
                 filePath: String(cString: ptr.pointee.file_path),
-                conflictType: String(cString: ptr.pointee.conflict_type),
+                conflictType: ConflictType(rawString: String(cString: ptr.pointee.conflict_type)),
                 ours: ours,
                 theirs: theirs
             )
@@ -777,6 +804,22 @@ final class EngineClient: ObservableObject {
         }
 
         return allowed
+    }
+
+    /// Get the absolute path to the interceptor directory for a worker.
+    /// The caller prepends this to PATH in the worker's PTY environment so
+    /// that the wrapper script shadows the real git binary.
+    /// Returns `nil` if no interceptor is installed or the worker is not found.
+    /// Wraps `tm_interceptor_path()` + `tm_free_string()`.
+    func interceptorPath(for workerId: UInt32) -> String? {
+        guard let engine else {
+            Self.logger.error("interceptorPath: engine not created — worker \(workerId) will have no git interception")
+            return nil
+        }
+        guard let cStr = tm_interceptor_path(engine, workerId) else { return nil }
+        let path = String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
+        tm_free_string(cStr)
+        return path.isEmpty ? nil : path
     }
 
     // MARK: - Private: Role helpers

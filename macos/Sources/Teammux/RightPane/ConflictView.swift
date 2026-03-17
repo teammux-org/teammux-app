@@ -37,7 +37,7 @@ struct ConflictView: View {
                 .foregroundColor(.red)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Merge conflict in \(worker.name)'s branch")
+                Text(headerTitle)
                     .font(.headline)
 
                 Text(worker.branchName)
@@ -52,6 +52,13 @@ struct ConflictView: View {
                 .foregroundColor(.secondary)
         }
         .padding()
+    }
+
+    private var headerTitle: String {
+        if let role = engine.workerRoles[worker.id] {
+            return "Merge conflict in \(worker.name)'s \(role.emoji) \(role.name) branch"
+        }
+        return "Merge conflict in \(worker.name)'s branch"
     }
 
     // MARK: - Conflict list
@@ -165,7 +172,7 @@ struct ConflictFileRow: View {
 
                 Spacer()
 
-                Text(conflict.conflictType)
+                Text(conflict.conflictType.displayName)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 6)

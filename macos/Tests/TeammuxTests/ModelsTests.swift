@@ -628,12 +628,12 @@ struct ConflictInfoTests {
     @Test func conflictInfoFieldAccess() {
         let conflict = ConflictInfo(
             filePath: "src/main.swift",
-            conflictType: "content",
+            conflictType: .content,
             ours: "let x = 1",
             theirs: "let x = 2"
         )
         #expect(conflict.filePath == "src/main.swift")
-        #expect(conflict.conflictType == "content")
+        #expect(conflict.conflictType == .content)
         #expect(conflict.ours == "let x = 1")
         #expect(conflict.theirs == "let x = 2")
     }
@@ -641,28 +641,47 @@ struct ConflictInfoTests {
     @Test func conflictInfoNullableFields() {
         let conflict = ConflictInfo(
             filePath: "new_file.swift",
-            conflictType: "add_add"
+            conflictType: .unknown
         )
         #expect(conflict.ours == nil)
         #expect(conflict.theirs == nil)
     }
 
     @Test func conflictInfoUniqueId() {
-        let c1 = ConflictInfo(filePath: "a.swift", conflictType: "content")
-        let c2 = ConflictInfo(filePath: "a.swift", conflictType: "content")
+        let c1 = ConflictInfo(filePath: "a.swift", conflictType: .content)
+        let c2 = ConflictInfo(filePath: "a.swift", conflictType: .content)
         #expect(c1.id != c2.id)
     }
 
     @Test func conflictInfoEquality() {
         let id = UUID()
-        let c1 = ConflictInfo(id: id, filePath: "a.swift", conflictType: "content", ours: "x", theirs: "y")
-        let c2 = ConflictInfo(id: id, filePath: "a.swift", conflictType: "content", ours: "x", theirs: "y")
+        let c1 = ConflictInfo(id: id, filePath: "a.swift", conflictType: .content, ours: "x", theirs: "y")
+        let c2 = ConflictInfo(id: id, filePath: "a.swift", conflictType: .content, ours: "x", theirs: "y")
         #expect(c1 == c2)
     }
 
     @Test func conflictInfoInequality() {
-        let c1 = ConflictInfo(filePath: "a.swift", conflictType: "content")
-        let c2 = ConflictInfo(filePath: "b.swift", conflictType: "content")
+        let c1 = ConflictInfo(filePath: "a.swift", conflictType: .content)
+        let c2 = ConflictInfo(filePath: "b.swift", conflictType: .content)
+        #expect(c1 != c2)
+    }
+
+    @Test func conflictTypeFromRawString() {
+        #expect(ConflictType(rawString: "content") == .content)
+        #expect(ConflictType(rawString: "unknown") == .unknown)
+        #expect(ConflictType(rawString: "add_add") == .unknown)
+        #expect(ConflictType(rawString: "") == .unknown)
+    }
+
+    @Test func conflictTypeDisplayName() {
+        #expect(ConflictType.content.displayName == "Content conflict")
+        #expect(ConflictType.unknown.displayName == "Unknown conflict")
+    }
+
+    @Test func conflictInfoInequalityByType() {
+        let id = UUID()
+        let c1 = ConflictInfo(id: id, filePath: "a.swift", conflictType: .content)
+        let c2 = ConflictInfo(id: id, filePath: "a.swift", conflictType: .unknown)
         #expect(c1 != c2)
     }
 }

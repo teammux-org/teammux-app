@@ -16,7 +16,7 @@
 | TD5 | merge.zig       | MergeCoordinator not implemented | stream-B1 | YES      | RESOLVED |
 | TD6 | EngineClient    | tm_merge_* bridge missing        | stream-B2 | NO       | RESOLVED |
 | TD7 | GitView.swift   | Team Lead review UI not built    | stream-C1 | NO       | RESOLVED |
-| TD8 | ConflictInfo    | conflictType as String not enum  | v0.2 | NO | DEFERRED |
+| TD8 | ConflictInfo    | conflictType as String not enum  | stream-R7 | NO | RESOLVED |
 
 ## v0.1.2 — Role Definitions
 
@@ -30,7 +30,7 @@
 ## Notes
 - TD1 breaking change: tm_message_cb gains a return value. stream-A1 updates engine/include/teammux.h, bus.zig, and EngineClient.swift atomically. No partial states.
 - TD5 adds new functions to teammux.h. stream-B1 owns the header changes. stream-B2 consumes them.
-- TD8: ConflictInfo.conflictType is a raw String. Deferred to v0.2 — only 2 engine values (content/unknown), displayed as-is in ConflictView. Consider an enum once engine's conflict type vocabulary is stable.
+- TD8: ConflictInfo.conflictType replaced with ConflictType enum in stream-R7. Maps "content" and "unknown" engine values; unrecognised strings fall back to .unknown. ConflictView uses displayName for user-facing text.
 - Merge order: A1 → A2 → B1 → B2 → C1
 - TD9: interceptor.zig writes a bash wrapper to {worktree}/.git-wrapper/git that intercepts `git add` and blocks denied files. The wrapper is installed at spawn and removed at dismiss/reject. PATH injection (prepending .git-wrapper to PATH in Ghostty SurfaceConfiguration) is done via tm_interceptor_path — Swift calls this to get the path, then sets it in the PTY environment.
 - TD12: `git commit -a` (and `git commit --all`) bypasses the interceptor because the wrapper only intercepts `git add`. A worker using `git commit -a` can stage and commit denied files in a single command. Deferred to v0.2 — add `commit` subcommand interception with `-a`/`--all` flag detection.

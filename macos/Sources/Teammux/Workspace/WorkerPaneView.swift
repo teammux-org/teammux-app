@@ -35,7 +35,9 @@ struct WorkerPaneView: View {
                 .font(.headline)
                 .foregroundColor(.secondary)
 
-            Text("Click + to spawn a new teammate")
+            Text(engine.availableRoles.isEmpty
+                 ? "Click + to spawn a new teammate"
+                 : "Spawn a worker with a role to get started")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
         }

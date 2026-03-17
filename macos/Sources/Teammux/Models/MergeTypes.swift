@@ -47,6 +47,34 @@ enum MergeStatus: Int, CaseIterable, Sendable {
     }
 }
 
+// MARK: - ConflictType
+
+/// Type-safe conflict classification from the engine's `tm_conflict_t.conflict_type` string.
+/// Recognised values have dedicated cases; unrecognised strings fall back to `.unknown`.
+/// Add new cases here as the engine's conflict type vocabulary grows.
+enum ConflictType: String, Sendable {
+    case content = "content"
+    case unknown = "unknown"
+
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "ConflictType")
+
+    init(rawString: String) {
+        if let known = ConflictType(rawValue: rawString) {
+            self = known
+        } else {
+            Self.logger.warning("Unknown ConflictType raw string: \(rawString), defaulting to .unknown")
+            self = .unknown
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .content: return "Content conflict"
+        case .unknown: return "Unknown conflict"
+        }
+    }
+}
+
 // MARK: - ConflictInfo
 
 /// Mirrors `tm_conflict_t` in teammux.h.
@@ -54,14 +82,14 @@ enum MergeStatus: Int, CaseIterable, Sendable {
 struct ConflictInfo: Identifiable, Equatable, Sendable {
     let id: UUID
     let filePath: String
-    let conflictType: String
+    let conflictType: ConflictType
     let ours: String?
     let theirs: String?
 
     init(
         id: UUID = UUID(),
         filePath: String,
-        conflictType: String,
+        conflictType: ConflictType,
         ours: String? = nil,
         theirs: String? = nil
     ) {

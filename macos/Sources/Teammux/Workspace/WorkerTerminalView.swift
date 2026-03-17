@@ -27,6 +27,17 @@ struct WorkerTerminalView: NSViewRepresentable {
         config.command = worker.agentBinary
         config.workingDirectory = worker.worktreePath
 
+        // Prepend interceptor wrapper directory to PATH so the git
+        // wrapper script shadows the real git binary in this PTY session.
+        if let interceptorDir = engine.interceptorPath(for: worker.id) {
+            let existingPath = config.environmentVariables["PATH"]
+                ?? ProcessInfo.processInfo.environment["PATH"]
+                ?? "/usr/bin:/usr/local/bin"
+            config.environmentVariables["PATH"] = "\(interceptorDir):\(existingPath)"
+        } else {
+            Self.logger.warning("No interceptor path for worker \(worker.id) — git interception will not be active")
+        }
+
         // Send the task description as initial input so the agent
         // starts working on it immediately.
         if !worker.taskDescription.isEmpty {
