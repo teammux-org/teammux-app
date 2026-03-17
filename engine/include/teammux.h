@@ -35,6 +35,7 @@ typedef enum {
     TM_ERR_TIMEOUT          = 11,
     TM_ERR_INVALID_WORKER   = 12,
     TM_ERR_ROLE             = 13,
+    TM_ERR_OWNERSHIP        = 14,
     TM_ERR_UNKNOWN          = 99,
 } tm_result_t;
 
@@ -352,6 +353,47 @@ void         tm_role_free(tm_role_t* role);
 // (*count will be 0 in both cases). Caller must call tm_roles_list_free().
 tm_role_t**  tm_roles_list(tm_engine_t* engine, uint32_t* count);
 void         tm_roles_list_free(tm_role_t** roles, uint32_t count);
+
+// -----------------------------------------------------------------
+// File ownership
+// -----------------------------------------------------------------
+
+typedef struct {
+    const char* path_pattern;
+    uint32_t    worker_id;
+    bool        allow_write;
+} tm_ownership_entry_t;
+
+// Check whether a worker is allowed to write to file_path.
+// Writes result to *out_allowed. Returns TM_OK on success.
+// When no rules are registered for worker_id, *out_allowed is true (default allow).
+// Deny patterns take precedence over write patterns.
+tm_result_t tm_ownership_check(tm_engine_t* engine,
+                                uint32_t worker_id,
+                                const char* file_path,
+                                bool* out_allowed);
+
+// Register a path pattern for a worker. allow_write=true for write grants,
+// false for deny_write. Call multiple times to add multiple patterns.
+tm_result_t tm_ownership_register(tm_engine_t* engine,
+                                   uint32_t worker_id,
+                                   const char* path_pattern,
+                                   bool allow_write);
+
+// Release all ownership rules for a worker. Idempotent.
+// Called automatically by tm_worker_dismiss and tm_merge_reject.
+tm_result_t tm_ownership_release(tm_engine_t* engine,
+                                  uint32_t worker_id);
+
+// Get all ownership entries for a worker. Returns heap-allocated array.
+// Returns NULL if no rules registered (*count will be 0).
+// Caller must call tm_ownership_free().
+tm_ownership_entry_t** tm_ownership_get(tm_engine_t* engine,
+                                         uint32_t worker_id,
+                                         uint32_t* count);
+
+// Free entries returned by tm_ownership_get.
+void tm_ownership_free(tm_ownership_entry_t** entries, uint32_t count);
 
 #ifdef __cplusplus
 }
