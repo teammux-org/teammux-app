@@ -47,6 +47,26 @@ enum MergeStatus: Int, CaseIterable, Sendable {
     }
 }
 
+// MARK: - ConflictType
+
+/// Type-safe conflict classification from the engine's `tm_conflict_t.conflict_type` string.
+/// Currently the engine produces "content" and "unknown"; any unrecognised value maps to `.unknown`.
+enum ConflictType: String, Sendable {
+    case content = "content"
+    case unknown = "unknown"
+
+    init(rawString: String) {
+        self = ConflictType(rawValue: rawString) ?? .unknown
+    }
+
+    var displayName: String {
+        switch self {
+        case .content: return "Content conflict"
+        case .unknown: return "Unknown conflict"
+        }
+    }
+}
+
 // MARK: - ConflictInfo
 
 /// Mirrors `tm_conflict_t` in teammux.h.
@@ -54,14 +74,14 @@ enum MergeStatus: Int, CaseIterable, Sendable {
 struct ConflictInfo: Identifiable, Equatable, Sendable {
     let id: UUID
     let filePath: String
-    let conflictType: String
+    let conflictType: ConflictType
     let ours: String?
     let theirs: String?
 
     init(
         id: UUID = UUID(),
         filePath: String,
-        conflictType: String,
+        conflictType: ConflictType,
         ours: String? = nil,
         theirs: String? = nil
     ) {

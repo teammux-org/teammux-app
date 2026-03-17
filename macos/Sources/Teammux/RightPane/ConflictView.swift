@@ -165,7 +165,7 @@ struct ConflictFileRow: View {
 
                 Spacer()
 
-                Text(conflict.conflictType)
+                Text(conflict.conflictType.displayName)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 6)

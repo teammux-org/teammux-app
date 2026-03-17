@@ -687,7 +687,7 @@ final class EngineClient: ObservableObject {
             }()
             let conflict = ConflictInfo(
                 filePath: String(cString: ptr.pointee.file_path),
-                conflictType: String(cString: ptr.pointee.conflict_type),
+                conflictType: ConflictType(rawString: String(cString: ptr.pointee.conflict_type)),
                 ours: ours,
                 theirs: theirs
             )

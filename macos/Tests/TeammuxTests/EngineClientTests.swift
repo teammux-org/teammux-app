@@ -127,7 +127,7 @@ struct EngineClientTests {
         client.lastError = "some error"
         client.mergeStatuses[1] = .conflict
         client.pendingConflicts[1] = [
-            ConflictInfo(filePath: "f.swift", conflictType: "content")
+            ConflictInfo(filePath: "f.swift", conflictType: .content)
         ]
 
         // destroy() should not crash and should clear all state
@@ -318,7 +318,7 @@ struct EngineClientTests {
         let client = EngineClient()
         client.mergeStatuses[1] = .inProgress
         client.pendingConflicts[1] = [
-            ConflictInfo(filePath: "a.swift", conflictType: "content")
+            ConflictInfo(filePath: "a.swift", conflictType: .content)
         ]
 
         let result = client.rejectMerge(workerId: 1)
