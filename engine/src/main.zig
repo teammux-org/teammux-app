@@ -1801,4 +1801,216 @@ test "tm_merge_reject removes interceptor wrapper" {
     try std.testing.expect(tm_interceptor_path(engine_ptr, worker_id) == null);
 }
 
+// ─── Completion + Question signal tests ──────────────────
+
+test "tm_worker_complete null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_worker_complete(null, 1, "done", null) == 99);
+}
+
+test "tm_worker_complete null summary returns TM_ERR_UNKNOWN" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    // null summary → TM_ERR_UNKNOWN
+    try std.testing.expect(tm_worker_complete(engine_ptr, 1, null, null) == 99);
+}
+
+test "tm_worker_question null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_worker_question(null, 1, "help?", null) == 99);
+}
+
+test "tm_worker_question null question returns TM_ERR_UNKNOWN" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    try std.testing.expect(tm_worker_question(engine_ptr, 1, null, null) == 99);
+}
+
+test "tm_completion_free handles null" { tm_completion_free(null); }
+test "tm_question_free handles null" { tm_question_free(null); }
+
+test "tm_worker_complete routes completion to JSONL log" {
+    const alloc = std.testing.allocator;
+
+    // Set up a temp git repo (required for git commit capture)
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    // Create engine and start session
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Create config file so session start succeeds
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    // Send completion signal
+    const summary_z = try alloc.dupeZ(u8, "auth module done");
+    defer alloc.free(summary_z);
+    const details_z = try alloc.dupeZ(u8, "JWT implementation complete");
+    defer alloc.free(details_z);
+    try std.testing.expect(tm_worker_complete(engine_ptr, 3, summary_z.ptr, details_z.ptr) == 0);
+
+    // Read JSONL log and verify completion message
+    const e = engine_ptr.?;
+    const log_path = e.message_bus.?.log_path;
+    e.message_bus.?.log_file.?.close();
+    e.message_bus.?.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    // Verify the log contains the completion message with correct type and payload
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"type\":\"completion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"from\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"to\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "auth module done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "JWT implementation complete") != null);
+}
+
+test "tm_worker_question routes question to JSONL log" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    const q_z = try alloc.dupeZ(u8, "JWT or session tokens?");
+    defer alloc.free(q_z);
+    const ctx_z = try alloc.dupeZ(u8, "auth module design");
+    defer alloc.free(ctx_z);
+    try std.testing.expect(tm_worker_question(engine_ptr, 5, q_z.ptr, ctx_z.ptr) == 0);
+
+    const e = engine_ptr.?;
+    const log_path = e.message_bus.?.log_path;
+    e.message_bus.?.log_file.?.close();
+    e.message_bus.?.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"type\":\"question\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"from\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"to\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "JWT or session tokens?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "auth module design") != null);
+}
+
+test "tm_worker_complete with null details succeeds" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    const summary_z = try alloc.dupeZ(u8, "task finished");
+    defer alloc.free(summary_z);
+    // null details is allowed
+    try std.testing.expect(tm_worker_complete(engine_ptr, 1, summary_z.ptr, null) == 0);
+}
+
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; }
