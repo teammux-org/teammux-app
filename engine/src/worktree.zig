@@ -87,7 +87,7 @@ pub const Roster = struct {
             // Rollback: remove worktree if context file write fails
             runGit(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }) catch {};
         }
-        try writeContextFile(self.allocator, wt_path, agent_type, task_description);
+        try writeContextFile(self.allocator, wt_path, agent_type, task_description, null, branch);
 
         // 6. Register worker in roster
         const owned_name = try self.allocator.dupe(u8, worker_name);
@@ -219,23 +219,148 @@ pub fn slugify(allocator: std.mem.Allocator, input: []const u8, max_len: usize) 
 // ─────────────────────────────────────────────────────────
 
 /// Write CLAUDE.md (for Claude Code) or AGENTS.md (for all other agents)
-/// into the worktree root with task context.
+/// into the worktree root with task context. When a RoleDefinition is provided
+/// and agent_type is claude_code, generates a rich role-aware CLAUDE.md instead
+/// of the generic template.
 pub fn writeContextFile(
     allocator: std.mem.Allocator,
     worktree_path: []const u8,
     agent_type: config.AgentType,
     task_description: []const u8,
+    role_def: ?config.RoleDefinition,
+    branch_name: []const u8,
 ) !void {
     const filename = if (agent_type == .claude_code) "CLAUDE.md" else "AGENTS.md";
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_path, filename });
     defer allocator.free(path);
 
-    const content = try buildContextFileContent(allocator, task_description);
+    const content = blk: {
+        if (agent_type == .claude_code) {
+            if (role_def) |rd| {
+                break :blk try generateRoleClaude(allocator, rd, task_description, branch_name);
+            }
+        }
+        break :blk try buildContextFileContent(allocator, task_description);
+    };
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(content);
+}
+
+/// Generate a rich CLAUDE.md from a role definition, task description, and branch name.
+/// Sections with empty arrays are omitted to produce clean markdown.
+fn generateRoleClaude(
+    allocator: std.mem.Allocator,
+    role_def: config.RoleDefinition,
+    task_description: []const u8,
+    branch_name: []const u8,
+) ![]u8 {
+    var buf = try std.ArrayList(u8).initCapacity(allocator, 2048);
+    errdefer buf.deinit(allocator);
+
+    // Header
+    try buf.appendSlice(allocator, "# ");
+    try buf.appendSlice(allocator, role_def.name);
+    try buf.appendSlice(allocator, " \xe2\x80\x94 Teammux Worker\n\n");
+
+    // Your role
+    try buf.appendSlice(allocator, "## Your role\n");
+    try buf.appendSlice(allocator, role_def.description);
+    try buf.appendSlice(allocator, "\n\n");
+    if (role_def.mission.len > 0) {
+        try buf.appendSlice(allocator, "**Mission:** ");
+        try buf.appendSlice(allocator, role_def.mission);
+        try buf.appendSlice(allocator, "\n");
+    }
+    if (role_def.focus.len > 0) {
+        try buf.appendSlice(allocator, "**Focus:** ");
+        try buf.appendSlice(allocator, role_def.focus);
+        try buf.appendSlice(allocator, "\n");
+    }
+    try buf.appendSlice(allocator, "\n");
+
+    // Your mission for this task
+    try buf.appendSlice(allocator, "## Your mission for this task\n");
+    try buf.appendSlice(allocator, task_description);
+    try buf.appendSlice(allocator, "\n\n");
+
+    // What you own in this worktree
+    if (role_def.write_patterns.len > 0 or role_def.deny_write_patterns.len > 0) {
+        try buf.appendSlice(allocator, "## What you own in this worktree\n");
+        if (role_def.write_patterns.len > 0) {
+            try buf.appendSlice(allocator, "**Write access:**\n");
+            for (role_def.write_patterns) |pat| {
+                try buf.appendSlice(allocator, "- `");
+                try buf.appendSlice(allocator, pat);
+                try buf.appendSlice(allocator, "`\n");
+            }
+            try buf.appendSlice(allocator, "\n");
+        }
+        if (role_def.deny_write_patterns.len > 0) {
+            try buf.appendSlice(allocator, "**You must NOT modify (engine will block attempts):**\n");
+            for (role_def.deny_write_patterns) |pat| {
+                try buf.appendSlice(allocator, "- `");
+                try buf.appendSlice(allocator, pat);
+                try buf.appendSlice(allocator, "`\n");
+            }
+            try buf.appendSlice(allocator, "\n");
+        }
+    }
+
+    // Rules (non-negotiable)
+    if (role_def.rules.len > 0) {
+        try buf.appendSlice(allocator, "## Rules (non-negotiable)\n");
+        for (role_def.rules, 0..) |rule, i| {
+            var num_buf: [20]u8 = undefined;
+            const num = std.fmt.bufPrint(&num_buf, "{d}. ", .{i + 1}) catch unreachable;
+            try buf.appendSlice(allocator, num);
+            try buf.appendSlice(allocator, rule);
+            try buf.appendSlice(allocator, "\n");
+        }
+        try buf.appendSlice(allocator, "\n");
+    }
+
+    // Workflow
+    if (role_def.workflow.len > 0) {
+        try buf.appendSlice(allocator, "## Workflow\n");
+        for (role_def.workflow, 0..) |step, i| {
+            var num_buf: [20]u8 = undefined;
+            const num = std.fmt.bufPrint(&num_buf, "{d}. ", .{i + 1}) catch unreachable;
+            try buf.appendSlice(allocator, num);
+            try buf.appendSlice(allocator, step);
+            try buf.appendSlice(allocator, "\n");
+        }
+        try buf.appendSlice(allocator, "\n");
+    }
+
+    // Definition of done
+    if (role_def.deliverables.len > 0 or role_def.success_metrics.len > 0) {
+        try buf.appendSlice(allocator, "## Definition of done\n");
+        for (role_def.deliverables) |d| {
+            try buf.appendSlice(allocator, "- [ ] ");
+            try buf.appendSlice(allocator, d);
+            try buf.appendSlice(allocator, "\n");
+        }
+        for (role_def.success_metrics) |m| {
+            try buf.appendSlice(allocator, "- [ ] ");
+            try buf.appendSlice(allocator, m);
+            try buf.appendSlice(allocator, "\n");
+        }
+        try buf.appendSlice(allocator, "\n");
+    }
+
+    // Teammux coordination
+    try buf.appendSlice(allocator, "## Teammux coordination\n");
+    try buf.appendSlice(allocator, "- Branch: ");
+    try buf.appendSlice(allocator, branch_name);
+    try buf.appendSlice(allocator, "\n");
+    try buf.appendSlice(allocator, "- Report completion: /teammux-complete \"{brief summary}\"\n");
+    try buf.appendSlice(allocator, "- Request guidance: /teammux-question \"{your question}\"\n");
+    try buf.appendSlice(allocator, "- Your changes are isolated \xe2\x80\x94 git commands only affect this worktree\n");
+
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn buildContextFileContent(allocator: std.mem.Allocator, task: []const u8) ![]u8 {
@@ -330,7 +455,7 @@ test "worktree - context file is CLAUDE.md for claude_code agent" {
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(path);
 
-    try writeContextFile(std.testing.allocator, path, .claude_code, "test task");
+    try writeContextFile(std.testing.allocator, path, .claude_code, "test task", null, "test-branch");
 
     // Verify CLAUDE.md exists
     const file = try tmp.dir.openFile("CLAUDE.md", .{});
@@ -347,7 +472,7 @@ test "worktree - context file is AGENTS.md for codex_cli agent" {
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(path);
 
-    try writeContextFile(std.testing.allocator, path, .codex_cli, "codex task");
+    try writeContextFile(std.testing.allocator, path, .codex_cli, "codex task", null, "test-branch");
 
     // Verify AGENTS.md exists (not CLAUDE.md)
     const file = try tmp.dir.openFile("AGENTS.md", .{});
