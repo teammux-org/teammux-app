@@ -62,9 +62,6 @@ enum ConflictType: String, Sendable {
         if let known = ConflictType(rawValue: rawString) {
             self = known
         } else {
-            #if DEBUG
-            assertionFailure("Unknown ConflictType raw string: \(rawString)")
-            #endif
             Self.logger.warning("Unknown ConflictType raw string: \(rawString), defaulting to .unknown")
             self = .unknown
         }
