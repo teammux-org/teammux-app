@@ -60,6 +60,7 @@ pub const FileOwnershipRegistry = struct {
             existing.* = new_slice;
         } else {
             const new_slice = try self.allocator.alloc(PathRule, 1);
+            errdefer self.allocator.free(new_slice);
             new_slice[0] = new_rule;
             try self.rules.put(worker_id, new_slice);
         }
@@ -111,6 +112,9 @@ pub const FileOwnershipRegistry = struct {
 
     /// Get rules for a worker. Returns null if no rules registered.
     /// Returned slice is owned by the registry — do not free.
+    /// WARNING: The returned slice is invalidated by concurrent register()
+    /// or release() calls on the same worker_id. Callers must copy the data
+    /// out before releasing the lock on their side.
     pub fn getRules(self: *FileOwnershipRegistry, worker_id: WorkerId) ?[]const PathRule {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -298,6 +302,10 @@ test "glob - empty pattern does not match non-empty path" {
 
 test "glob - pattern with trailing slash" {
     try std.testing.expect(globMatch("src/*/", "src/foo/"));
+}
+
+test "glob - src/** does not match bare src" {
+    try std.testing.expect(!globMatch("src/**", "src"));
 }
 
 test "glob - **/* matches any file" {
