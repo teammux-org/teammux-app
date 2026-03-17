@@ -111,6 +111,34 @@ pub const Engine = struct {
             self.setError("commands watcher init failed") catch {};
             return err;
         };
+        // Wire bus routing for /teammux-complete and /teammux-question
+        if (self.commands_watcher) |*w| {
+            w.bus_send_fn = busSendBridge;
+            w.bus_send_userdata = self;
+        }
+    }
+
+    /// Bridge function for CommandWatcher → MessageBus routing.
+    /// Called by commands.zig when /teammux-complete or /teammux-question is detected.
+    /// Returns 0 on success, 8 (TM_ERR_BUS) on bus failure, 99 (TM_ERR_UNKNOWN) on invalid input.
+    fn busSendBridge(to: u32, from: u32, msg_type: c_int, payload: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) c_int {
+        const self: *Engine = @ptrCast(@alignCast(userdata orelse return 99));
+        const msg_enum = std.meta.intToEnum(bus.MessageType, msg_type) catch {
+            self.setError("busSendBridge: invalid message type") catch {};
+            return 99;
+        };
+        var b = &(self.message_bus orelse {
+            self.setError("busSendBridge: message bus not initialized") catch {};
+            return 8;
+        });
+        b.send(to, from, msg_enum, std.mem.span(payload orelse {
+            self.setError("busSendBridge: payload is NULL") catch {};
+            return 8;
+        })) catch |err| {
+            self.setError(if (err == error.DeliveryFailed) "completion/question delivery failed after retries exhausted" else "completion/question bus send failed") catch {};
+            return 8;
+        };
+        return 0;
     }
 
     pub fn sessionStop(self: *Engine) void {
@@ -183,6 +211,10 @@ comptime {
     if (@sizeOf(CRole) != 72) @compileError("CRole size mismatch with tm_role_t");
     // COwnershipEntry: ptr(8) + u32(4) + bool(1) + pad(3) = 16 bytes on arm64
     if (@sizeOf(COwnershipEntry) != 16) @compileError("COwnershipEntry size mismatch with tm_ownership_entry_t");
+    // CCompletion: u32(4) + pad(4) + 3 ptrs(24) + u64(8) = 40 bytes on arm64
+    if (@sizeOf(CCompletion) != 40) @compileError("CCompletion size mismatch with tm_completion_t");
+    // CQuestion: u32(4) + pad(4) + 2 ptrs(16) + u64(8) = 32 bytes on arm64
+    if (@sizeOf(CQuestion) != 32) @compileError("CQuestion size mismatch with tm_question_t");
 }
 
 var last_create_error: [*:0]const u8 = "no error";
@@ -430,6 +462,127 @@ export fn tm_commands_watch(engine: ?*Engine, callback: ?*const fn (?[*:0]const 
     return 0;
 }
 export fn tm_commands_unwatch(engine: ?*Engine, sub: u32) void { _ = sub; if (engine) |e| { if (e.commands_watcher) |*w| w.stop(); } }
+
+// ─── Completion + Question signaling ─────────────────────
+
+const CCompletion = extern struct {
+    worker_id: u32,
+    _pad0: u32 = 0,
+    summary: ?[*:0]const u8,
+    git_commit: ?[*:0]const u8,
+    details: ?[*:0]const u8,
+    timestamp: u64,
+};
+
+const CQuestion = extern struct {
+    worker_id: u32,
+    _pad0: u32 = 0,
+    question: ?[*:0]const u8,
+    context: ?[*:0]const u8,
+    timestamp: u64,
+};
+
+/// Signal worker completion. Creates TM_MSG_COMPLETION message, routes through
+/// bus to Team Lead (worker 0).
+export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]const u8, details: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const sum_str = std.mem.span(summary orelse {
+        e.setError("tm_worker_complete: summary must not be NULL") catch {};
+        return 99;
+    });
+    const det_str = if (details) |d| std.mem.span(d) else "";
+
+    // Escape JSON-special characters in user-provided strings
+    const sum_esc = jsonEscape(e.allocator, sum_str) catch {
+        e.setError("tm_worker_complete: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(sum_esc);
+    const det_esc = jsonEscape(e.allocator, det_str) catch {
+        e.setError("tm_worker_complete: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(det_esc);
+
+    const payload = std.fmt.allocPrint(e.allocator,
+        \\{{"worker_id":{d},"summary":"{s}","details":"{s}"}}
+    , .{ worker_id, sum_esc, det_esc }) catch {
+        e.setError("tm_worker_complete: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(payload);
+
+    var b = &(e.message_bus orelse {
+        e.setError("tm_worker_complete: message bus not initialized (call tm_session_start first)") catch {};
+        return 8;
+    });
+
+    b.send(0, worker_id, .completion, payload) catch |err| {
+        e.setError(if (err == error.DeliveryFailed) "completion delivery failed after retries exhausted" else "completion bus send failed") catch {};
+        return 8;
+    };
+    return 0;
+}
+
+/// Signal worker question. Creates TM_MSG_QUESTION message, routes through
+/// bus to Team Lead (worker 0).
+export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]const u8, ctx: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const q_str = std.mem.span(question orelse {
+        e.setError("tm_worker_question: question must not be NULL") catch {};
+        return 99;
+    });
+    const ctx_str = if (ctx) |c| std.mem.span(c) else "";
+
+    const q_esc = jsonEscape(e.allocator, q_str) catch {
+        e.setError("tm_worker_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(q_esc);
+    const ctx_esc = jsonEscape(e.allocator, ctx_str) catch {
+        e.setError("tm_worker_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(ctx_esc);
+
+    const payload = std.fmt.allocPrint(e.allocator,
+        \\{{"worker_id":{d},"question":"{s}","context":"{s}"}}
+    , .{ worker_id, q_esc, ctx_esc }) catch {
+        e.setError("tm_worker_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(payload);
+
+    var b = &(e.message_bus orelse {
+        e.setError("tm_worker_question: message bus not initialized (call tm_session_start first)") catch {};
+        return 8;
+    });
+
+    b.send(0, worker_id, .question, payload) catch |err| {
+        e.setError(if (err == error.DeliveryFailed) "question delivery failed after retries exhausted" else "question bus send failed") catch {};
+        return 8;
+    };
+    return 0;
+}
+
+/// Free a heap-allocated tm_completion_t.
+export fn tm_completion_free(completion: ?*CCompletion) void {
+    if (completion) |c| {
+        freeNullTerminated(c.summary);
+        freeNullTerminated(c.git_commit);
+        freeNullTerminated(c.details);
+        std.heap.c_allocator.destroy(c);
+    }
+}
+
+/// Free a heap-allocated tm_question_t.
+export fn tm_question_free(question: ?*CQuestion) void {
+    if (question) |q| {
+        freeNullTerminated(q.question);
+        freeNullTerminated(q.context);
+        std.heap.c_allocator.destroy(q);
+    }
+}
 
 // ─── Merge coordinator ───────────────────────────────────
 
@@ -1020,6 +1173,86 @@ fn freeCWorkerInfo(info: CWorkerInfo) void {
 
 fn freeNullTerminated(ptr: ?[*:0]const u8) void {
     if (ptr) |p| std.heap.c_allocator.free(std.mem.span(p));
+}
+
+/// Escape all JSON-special characters per RFC 8259 for safe interpolation into JSON values.
+/// Handles: " \ and all control characters U+0000..U+001F.
+/// Caller must free the returned slice.
+fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    // Fast path: if no special chars, just dupe
+    var needs_escape = false;
+    for (input) |c| {
+        if (c == '"' or c == '\\' or c <= 0x1F) {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) return try allocator.dupe(u8, input);
+
+    // Worst case: control chars become \uXXXX (6 bytes each)
+    const buf = try allocator.alloc(u8, input.len * 6);
+    const hex = "0123456789abcdef";
+    var pos: usize = 0;
+    for (input) |c| {
+        switch (c) {
+            '"' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = '"';
+                pos += 2;
+            },
+            '\\' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = '\\';
+                pos += 2;
+            },
+            '\n' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = 'n';
+                pos += 2;
+            },
+            '\r' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = 'r';
+                pos += 2;
+            },
+            '\t' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = 't';
+                pos += 2;
+            },
+            0x08 => { // \b backspace
+                buf[pos] = '\\';
+                buf[pos + 1] = 'b';
+                pos += 2;
+            },
+            0x0C => { // \f form feed
+                buf[pos] = '\\';
+                buf[pos + 1] = 'f';
+                pos += 2;
+            },
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                // Other control chars: escape as \u00XX
+                buf[pos] = '\\';
+                buf[pos + 1] = 'u';
+                buf[pos + 2] = '0';
+                buf[pos + 3] = '0';
+                buf[pos + 4] = hex[c >> 4];
+                buf[pos + 5] = hex[c & 0x0F];
+                pos += 6;
+            },
+            else => {
+                buf[pos] = c;
+                pos += 1;
+            },
+        }
+    }
+    // Shrink to actual size
+    if (pos < buf.len) {
+        return allocator.realloc(buf, pos) catch {
+            return buf[0..pos];
+        };
+    }
+    return buf;
 }
 
 fn fillCConflict(alloc: std.mem.Allocator, c: merge.Conflict) !CConflict {
@@ -2075,6 +2308,323 @@ test "tm_merge_reject removes interceptor wrapper" {
 
     // After reject, worker is gone so interceptor path returns null
     try std.testing.expect(tm_interceptor_path(engine_ptr, worker_id) == null);
+}
+
+// ─── Completion + Question signal tests ──────────────────
+
+test "tm_worker_complete null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_worker_complete(null, 1, "done", null) == 99);
+}
+
+test "tm_worker_complete null summary returns TM_ERR_UNKNOWN" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    // null summary → TM_ERR_UNKNOWN
+    try std.testing.expect(tm_worker_complete(engine_ptr, 1, null, null) == 99);
+}
+
+test "tm_worker_question null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_worker_question(null, 1, "help?", null) == 99);
+}
+
+test "tm_worker_question null question returns TM_ERR_UNKNOWN" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    try std.testing.expect(tm_worker_question(engine_ptr, 1, null, null) == 99);
+}
+
+test "tm_completion_free handles null" { tm_completion_free(null); }
+test "tm_question_free handles null" { tm_question_free(null); }
+
+test "jsonEscape escapes quotes and backslashes" {
+    const alloc = std.testing.allocator;
+    const e1 = try jsonEscape(alloc, "done \"finally\"");
+    defer alloc.free(e1);
+    try std.testing.expectEqualStrings("done \\\"finally\\\"", e1);
+
+    const e2 = try jsonEscape(alloc, "path\\to\\file");
+    defer alloc.free(e2);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", e2);
+
+    const e3 = try jsonEscape(alloc, "line1\nline2\ttab");
+    defer alloc.free(e3);
+    try std.testing.expectEqualStrings("line1\\nline2\\ttab", e3);
+}
+
+test "jsonEscape escapes all JSON control characters (RFC 8259)" {
+    const alloc = std.testing.allocator;
+
+    // \b (backspace 0x08) and \f (form feed 0x0C) get named escapes
+    const e1 = try jsonEscape(alloc, "a\x08b\x0Cc");
+    defer alloc.free(e1);
+    try std.testing.expectEqualStrings("a\\bb\\fc", e1);
+
+    // Other control chars (e.g. 0x01, 0x1F) get \u00XX escapes
+    const e2 = try jsonEscape(alloc, "a\x01b\x1Fc");
+    defer alloc.free(e2);
+    try std.testing.expectEqualStrings("a\\u0001b\\u001fc", e2);
+
+    // Null byte
+    const e3 = try jsonEscape(alloc, "a\x00b");
+    defer alloc.free(e3);
+    try std.testing.expectEqualStrings("a\\u0000b", e3);
+}
+
+test "jsonEscape fast path for clean strings" {
+    const alloc = std.testing.allocator;
+    const e = try jsonEscape(alloc, "no special chars");
+    defer alloc.free(e);
+    try std.testing.expectEqualStrings("no special chars", e);
+}
+
+test "jsonEscape empty string" {
+    const alloc = std.testing.allocator;
+    const e = try jsonEscape(alloc, "");
+    defer alloc.free(e);
+    try std.testing.expectEqualStrings("", e);
+}
+
+test "tm_worker_complete escapes quotes in summary" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    // Summary with quotes — must not produce malformed JSON
+    const sum_z = try alloc.dupeZ(u8, "done \"finally\"");
+    defer alloc.free(sum_z);
+    try std.testing.expect(tm_worker_complete(engine_ptr, 1, sum_z.ptr, null) == 0);
+
+    const e = engine_ptr.?;
+    const log_path = e.message_bus.?.log_path;
+    e.message_bus.?.log_file.?.close();
+    e.message_bus.?.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    // Verify escaped quotes in payload — not malformed JSON
+    try std.testing.expect(std.mem.indexOf(u8, content, "done \\\"finally\\\"") != null);
+    // Verify the payload does NOT contain unescaped quotes
+    try std.testing.expect(std.mem.indexOf(u8, content, "done \"finally\"") == null);
+}
+
+test "tm_worker_complete routes completion to JSONL log" {
+    const alloc = std.testing.allocator;
+
+    // Set up a temp git repo (required for git commit capture)
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    // Create engine and start session
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Create config file so session start succeeds
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    // Send completion signal
+    const summary_z = try alloc.dupeZ(u8, "auth module done");
+    defer alloc.free(summary_z);
+    const details_z = try alloc.dupeZ(u8, "JWT implementation complete");
+    defer alloc.free(details_z);
+    try std.testing.expect(tm_worker_complete(engine_ptr, 3, summary_z.ptr, details_z.ptr) == 0);
+
+    // Read JSONL log and verify completion message
+    const e = engine_ptr.?;
+    const log_path = e.message_bus.?.log_path;
+    e.message_bus.?.log_file.?.close();
+    e.message_bus.?.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    // Verify the log contains the completion message with correct type and payload
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"type\":\"completion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"from\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"to\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "auth module done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "JWT implementation complete") != null);
+}
+
+test "tm_worker_question routes question to JSONL log" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    const q_z = try alloc.dupeZ(u8, "JWT or session tokens?");
+    defer alloc.free(q_z);
+    const ctx_z = try alloc.dupeZ(u8, "auth module design");
+    defer alloc.free(ctx_z);
+    try std.testing.expect(tm_worker_question(engine_ptr, 5, q_z.ptr, ctx_z.ptr) == 0);
+
+    const e = engine_ptr.?;
+    const log_path = e.message_bus.?.log_path;
+    e.message_bus.?.log_file.?.close();
+    e.message_bus.?.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"type\":\"question\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"from\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"to\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "JWT or session tokens?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "auth module design") != null);
+}
+
+test "tm_worker_complete with null details succeeds" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    const summary_z = try alloc.dupeZ(u8, "task finished");
+    defer alloc.free(summary_z);
+    // null details is allowed
+    try std.testing.expect(tm_worker_complete(engine_ptr, 1, summary_z.ptr, null) == 0);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; }
