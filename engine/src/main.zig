@@ -10,6 +10,7 @@ pub const commands = @import("commands.zig");
 pub const merge = @import("merge.zig");
 pub const ownership = @import("ownership.zig");
 pub const interceptor = @import("interceptor.zig");
+pub const hotreload = @import("hotreload.zig");
 
 // ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
