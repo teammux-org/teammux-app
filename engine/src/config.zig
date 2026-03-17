@@ -24,6 +24,7 @@ pub const WorkerConfig = struct {
     permissions: []const u8,
     default_task: []const u8,
     role: ?[]const u8 = null,
+    /// Resolved at load time by the engine via resolveRolePath — not parsed from TOML.
     role_path: ?[]const u8 = null,
 };
 
@@ -434,7 +435,7 @@ pub const RoleDefinition = struct {
 
 pub const RoleParseError = ParseError || std.fs.File.OpenError || std.fs.File.ReadError || error{StreamTooLong};
 
-/// Parse a role TOML file into a RoleDefinition.
+/// Parse a role TOML file into a RoleDefinition. File must be under 1 MB.
 pub fn parseRoleDefinition(allocator: std.mem.Allocator, role_path: []const u8) RoleParseError!RoleDefinition {
     const file = try std.fs.cwd().openFile(role_path, .{});
     defer file.close();
@@ -536,8 +537,8 @@ pub fn parseRoleContent(allocator: std.mem.Allocator, content: []const u8) Parse
             },
             .capabilities => {
                 if (std.mem.eql(u8, key, "read")) {
-                    // read patterns — acknowledged but not stored in RoleDefinition
-                    // (ownership.zig uses write/deny_write only)
+                    // read patterns — acknowledged but not stored; enforcement
+                    // only checks write/deny_write boundaries
                 } else if (std.mem.eql(u8, key, "write")) {
                     if (write_patterns) |old| freeStringSlice(allocator, old);
                     write_patterns = try parseTomlMultilineArray(allocator, raw_val, &lines);
@@ -623,7 +624,8 @@ pub fn parseRoleContent(allocator: std.mem.Allocator, content: []const u8) Parse
 ///   2. ~/.teammux/roles/{role_id}.toml — user-level custom roles
 ///   3. {exe_dir}/../Resources/roles/{role_id}.toml — app bundle
 ///   4. {exe_dir}/roles/{role_id}.toml — dev build fallback
-/// Returns null if not found in any location. Caller must free the returned path.
+/// Returns null if not found in any location. Returns error on allocation failure.
+/// Caller must free the returned path.
 pub fn resolveRolePath(
     allocator: std.mem.Allocator,
     role_id: []const u8,

@@ -339,12 +339,15 @@ typedef struct {
 } tm_role_t;
 
 // Resolve a role by ID. On success, writes a heap-allocated tm_role_t to *out_role.
-// Caller must call tm_role_free(). Returns TM_ERR_ROLE if not found.
+// Caller must call tm_role_free(). Returns TM_ERR_ROLE if role_id is NULL, not found
+// in any search path, or the role file fails to parse. All string fields in a
+// successfully resolved tm_role_t are non-NULL (may be empty strings).
 tm_result_t  tm_role_resolve(tm_engine_t* engine, const char* role_id, tm_role_t** out_role);
 void         tm_role_free(tm_role_t* role);
 
-// List all available roles from the search path. Returns heap-allocated array.
-// Caller must call tm_roles_list_free(). Writes count to *count.
+// List all available roles from all search paths (project-local, user, bundled).
+// Returns heap-allocated array. Returns NULL if no roles found or engine is NULL
+// (*count will be 0 in both cases). Caller must call tm_roles_list_free().
 tm_role_t**  tm_roles_list(tm_engine_t* engine, uint32_t* count);
 void         tm_roles_list_free(tm_role_t** roles, uint32_t count);
 
