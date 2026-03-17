@@ -336,6 +336,8 @@ typedef struct {
     uint32_t     write_pattern_count;
     const char** deny_write_patterns;
     uint32_t     deny_write_pattern_count;
+    bool         can_push;
+    bool         can_merge;
 } tm_role_t;
 
 // Resolve a role by ID. On success, writes a heap-allocated tm_role_t to *out_role.

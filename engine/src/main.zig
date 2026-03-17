@@ -157,6 +157,7 @@ const CRole = extern struct {
     emoji: ?[*:0]const u8, description: ?[*:0]const u8,
     write_patterns: ?[*]?[*:0]const u8, write_pattern_count: u32,
     deny_write_patterns: ?[*]?[*:0]const u8, deny_write_pattern_count: u32,
+    can_push: bool, can_merge: bool,
 };
 
 // Comptime ABI safety: verify extern struct sizes match expected C layout.
@@ -168,7 +169,7 @@ comptime {
     if (@sizeOf(bus.CMessage) != 48) @compileError("CMessage size mismatch with tm_message_t");
     // CConflict: 4 ptrs = 32 bytes on arm64
     if (@sizeOf(CConflict) != 32) @compileError("CConflict size mismatch with tm_conflict_t");
-    // CRole: 5 ptrs(40) + ptr(8) + u32(4) + pad(4) + ptr(8) + u32(4) + pad(4) = 72 on arm64
+    // CRole: 5 ptrs + 2*(ptr + u32) + 2 bools + pad = 72 bytes on arm64
     if (@sizeOf(CRole) != 72) @compileError("CRole size mismatch with tm_role_t");
 }
 
@@ -733,6 +734,8 @@ fn fillCRole(alloc: std.mem.Allocator, rd: *const config.RoleDefinition) !*CRole
         .write_pattern_count = @intCast(rd.write_patterns.len),
         .deny_write_patterns = if (dwp.len > 0) dwp.ptr else null,
         .deny_write_pattern_count = @intCast(rd.deny_write_patterns.len),
+        .can_push = rd.can_push,
+        .can_merge = rd.can_merge,
     };
     return c_role;
 }
