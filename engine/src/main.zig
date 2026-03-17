@@ -472,7 +472,7 @@ const CQuestion = extern struct {
 };
 
 /// Signal worker completion. Creates TM_MSG_COMPLETION message, routes through
-/// bus to Team Lead (worker 0), persists to JSONL log.
+/// bus to Team Lead (worker 0).
 export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]const u8, details: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
     const sum_str = std.mem.span(summary orelse {
@@ -481,10 +481,21 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
     });
     const det_str = if (details) |d| std.mem.span(d) else "";
 
-    // Build JSON payload: {"worker_id":N,"summary":"...","details":"..."}
+    // Escape JSON-special characters in user-provided strings
+    const sum_esc = jsonEscape(e.allocator, sum_str) catch {
+        e.setError("tm_worker_complete: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(sum_esc);
+    const det_esc = jsonEscape(e.allocator, det_str) catch {
+        e.setError("tm_worker_complete: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(det_esc);
+
     const payload = std.fmt.allocPrint(e.allocator,
         \\{{"worker_id":{d},"summary":"{s}","details":"{s}"}}
-    , .{ worker_id, sum_str, det_str }) catch {
+    , .{ worker_id, sum_esc, det_esc }) catch {
         e.setError("tm_worker_complete: payload allocation failed") catch {};
         return 99;
     };
@@ -495,16 +506,15 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
         return 8;
     });
 
-    // Route to Team Lead (worker 0) with TM_MSG_COMPLETION type
     b.send(0, worker_id, .completion, payload) catch |err| {
-        e.setError(if (err == error.DeliveryFailed) "completion delivery failed after 4 attempts" else "completion bus send failed") catch {};
+        e.setError(if (err == error.DeliveryFailed) "completion delivery failed after retries exhausted" else "completion bus send failed") catch {};
         return 8;
     };
     return 0;
 }
 
 /// Signal worker question. Creates TM_MSG_QUESTION message, routes through
-/// bus to Team Lead (worker 0), persists to JSONL log.
+/// bus to Team Lead (worker 0).
 export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]const u8, ctx: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
     const q_str = std.mem.span(question orelse {
@@ -513,9 +523,20 @@ export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]c
     });
     const ctx_str = if (ctx) |c| std.mem.span(c) else "";
 
+    const q_esc = jsonEscape(e.allocator, q_str) catch {
+        e.setError("tm_worker_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(q_esc);
+    const ctx_esc = jsonEscape(e.allocator, ctx_str) catch {
+        e.setError("tm_worker_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(ctx_esc);
+
     const payload = std.fmt.allocPrint(e.allocator,
         \\{{"worker_id":{d},"question":"{s}","context":"{s}"}}
-    , .{ worker_id, q_str, ctx_str }) catch {
+    , .{ worker_id, q_esc, ctx_esc }) catch {
         e.setError("tm_worker_question: payload allocation failed") catch {};
         return 99;
     };
@@ -527,7 +548,7 @@ export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]c
     });
 
     b.send(0, worker_id, .question, payload) catch |err| {
-        e.setError(if (err == error.DeliveryFailed) "question delivery failed after 4 attempts" else "question bus send failed") catch {};
+        e.setError(if (err == error.DeliveryFailed) "question delivery failed after retries exhausted" else "question bus send failed") catch {};
         return 8;
     };
     return 0;
@@ -1022,6 +1043,68 @@ fn freeCWorkerInfo(info: CWorkerInfo) void {
 
 fn freeNullTerminated(ptr: ?[*:0]const u8) void {
     if (ptr) |p| std.heap.c_allocator.free(std.mem.span(p));
+}
+
+/// Escape JSON-special characters in a string for safe interpolation into JSON values.
+/// Caller must free the returned slice.
+fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    // Fast path: if no special chars, just dupe
+    var needs_escape = false;
+    for (input) |c| {
+        switch (c) {
+            '"', '\\', '\n', '\r', '\t' => {
+                needs_escape = true;
+                break;
+            },
+            else => {},
+        }
+    }
+    if (!needs_escape) return try allocator.dupe(u8, input);
+
+    // Worst case: every char needs escaping (2 bytes each)
+    const buf = try allocator.alloc(u8, input.len * 2);
+    var pos: usize = 0;
+    for (input) |c| {
+        switch (c) {
+            '"' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = '"';
+                pos += 2;
+            },
+            '\\' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = '\\';
+                pos += 2;
+            },
+            '\n' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = 'n';
+                pos += 2;
+            },
+            '\r' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = 'r';
+                pos += 2;
+            },
+            '\t' => {
+                buf[pos] = '\\';
+                buf[pos + 1] = 't';
+                pos += 2;
+            },
+            else => {
+                buf[pos] = c;
+                pos += 1;
+            },
+        }
+    }
+    // Shrink to actual size
+    if (pos < buf.len) {
+        return allocator.realloc(buf, pos) catch {
+            // realloc to smaller should not fail, but if it does, return full buf
+            return buf[0..pos];
+        };
+    }
+    return buf;
 }
 
 fn fillCConflict(alloc: std.mem.Allocator, c: merge.Conflict) !CConflict {
@@ -1846,6 +1929,92 @@ test "tm_worker_question null question returns TM_ERR_UNKNOWN" {
 
 test "tm_completion_free handles null" { tm_completion_free(null); }
 test "tm_question_free handles null" { tm_question_free(null); }
+
+test "jsonEscape escapes quotes and backslashes" {
+    const alloc = std.testing.allocator;
+    const e1 = try jsonEscape(alloc, "done \"finally\"");
+    defer alloc.free(e1);
+    try std.testing.expectEqualStrings("done \\\"finally\\\"", e1);
+
+    const e2 = try jsonEscape(alloc, "path\\to\\file");
+    defer alloc.free(e2);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", e2);
+
+    const e3 = try jsonEscape(alloc, "line1\nline2\ttab");
+    defer alloc.free(e3);
+    try std.testing.expectEqualStrings("line1\\nline2\\ttab", e3);
+}
+
+test "jsonEscape fast path for clean strings" {
+    const alloc = std.testing.allocator;
+    const e = try jsonEscape(alloc, "no special chars");
+    defer alloc.free(e);
+    try std.testing.expectEqualStrings("no special chars", e);
+}
+
+test "jsonEscape empty string" {
+    const alloc = std.testing.allocator;
+    const e = try jsonEscape(alloc, "");
+    defer alloc.free(e);
+    try std.testing.expectEqualStrings("", e);
+}
+
+test "tm_worker_complete escapes quotes in summary" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(cfg_path);
+    const cfg_file = try std.fs.createFileAbsolute(cfg_path, .{});
+    try cfg_file.writeAll("[project]\nname = \"test\"\n");
+    cfg_file.close();
+
+    try std.testing.expect(tm_session_start(engine_ptr) == 0);
+
+    // Summary with quotes — must not produce malformed JSON
+    const sum_z = try alloc.dupeZ(u8, "done \"finally\"");
+    defer alloc.free(sum_z);
+    try std.testing.expect(tm_worker_complete(engine_ptr, 1, sum_z.ptr, null) == 0);
+
+    const e = engine_ptr.?;
+    const log_path = e.message_bus.?.log_path;
+    e.message_bus.?.log_file.?.close();
+    e.message_bus.?.log_file = null;
+
+    const log_content = try std.fs.cwd().openFile(log_path, .{});
+    defer log_content.close();
+    const content = try log_content.readToEndAlloc(alloc, 1024 * 1024);
+    defer alloc.free(content);
+
+    // Verify escaped quotes in payload — not malformed JSON
+    try std.testing.expect(std.mem.indexOf(u8, content, "done \\\"finally\\\"") != null);
+    // Verify the payload does NOT contain unescaped quotes
+    try std.testing.expect(std.mem.indexOf(u8, content, "done \"finally\"") == null);
+}
 
 test "tm_worker_complete routes completion to JSONL log" {
     const alloc = std.testing.allocator;
