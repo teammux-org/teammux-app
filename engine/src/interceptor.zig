@@ -222,7 +222,7 @@ fn generateInterceptorScript(
     // Worker name for error messages
     try appendFmt(&buf, allocator, "WORKER_NAME='{s}'\n", .{worker_name});
 
-    // Known limitations: combined short flags for git-add not parsed
+    // Known limitation: git-add does not detect combined short flags (e.g., -Au); commit -a* forms are handled
     try buf.appendSlice(allocator,
         \\
         \\# Detect git subcommand (skip global flags)
@@ -266,11 +266,19 @@ fn generateInterceptorScript(
         \\  done
         \\elif [[ "$subcmd" == "commit" ]]; then
         \\  # Block commit -a/--all when deny patterns exist (TD12)
+        \\  # Guard: DENY_PATTERNS is always non-empty when this script is emitted,
+        \\  # but we check defensively in case generation logic changes.
+        \\  skip_next=false
         \\  for arg in "$@"; do
+        \\    if $skip_next; then skip_next=false; continue; fi
         \\    case "$arg" in
+        \\      -m|-F|-C|-c|--message|--file|--reuse-message|--reedit-message|--fixup|--squash)
+        \\        skip_next=true ;;
+        \\      --message=*|--file=*|--reuse-message=*|--reedit-message=*|--fixup=*|--squash=*)
+        \\        ;;
         \\      -a|--all|-a*)
         \\        if [[ ${#DENY_PATTERNS[@]} -gt 0 ]]; then
-        \\          echo "[Teammux] Cannot use 'git commit -a' with write restrictions."
+        \\          echo "[Teammux] Cannot use 'git commit -a' with write restrictions ($WORKER_NAME)."
         \\          echo "[Teammux] Stage files explicitly with 'git add' first."
         \\          echo "[Teammux] Your write scope: $WRITE_SCOPE"
         \\          exit 1
@@ -386,11 +394,12 @@ test "interceptor - no deny patterns produces pass-through wrapper" {
     const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
     defer std.testing.allocator.free(content);
 
-    // Pass-through: shebang + exec, no DENY_PATTERNS, no subcommand detection
+    // Pass-through: shebang + exec, no DENY_PATTERNS, no subcommand detection, no commit interception
     try std.testing.expect(std.mem.startsWith(u8, content, "#!/bin/bash\n"));
     try std.testing.expect(std.mem.indexOf(u8, content, "exec \"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "DENY_PATTERNS") == null);
     try std.testing.expect(std.mem.indexOf(u8, content, "subcmd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "commit") == null);
 
     // Should be exactly 2 lines (shebang + exec)
     var line_count: usize = 0;
@@ -569,15 +578,17 @@ test "interceptor - wrapper contains commit -a interception block" {
     const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
     defer std.testing.allocator.free(content);
 
-    // Commit subcommand detection present
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"commit\"") != null);
-    // Flag detection: -a, --all, and combined flags like -am
+    // Pattern includes -a, --all, and -a* glob for combined flags (e.g., -am, -amv)
     try std.testing.expect(std.mem.indexOf(u8, content, "-a|--all|-a*)") != null);
-    // DENY_PATTERNS length check gates the block
+    // Block only fires when DENY_PATTERNS is non-empty
     try std.testing.expect(std.mem.indexOf(u8, content, "${#DENY_PATTERNS[@]} -gt 0") != null);
-    // Error messages
-    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot use 'git commit -a' with write restrictions.") != null);
+    // skip_next logic prevents false positives on -m <msg> values
+    try std.testing.expect(std.mem.indexOf(u8, content, "skip_next=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "-m|-F|-C|-c|--message|--file|--reuse-message|--reedit-message|--fixup|--squash)") != null);
+    // Error messages include WORKER_NAME for diagnostic parity with add block
+    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot use 'git commit -a' with write restrictions ($WORKER_NAME).") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "Stage files explicitly with 'git add' first.") != null);
-    // Uses WRITE_SCOPE for scope display
+    // Uses WRITE_SCOPE (pre-formatted scalar), not WRITE_PATTERNS array
     try std.testing.expect(std.mem.indexOf(u8, content, "Your write scope: $WRITE_SCOPE") != null);
 }
