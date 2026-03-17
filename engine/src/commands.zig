@@ -11,6 +11,10 @@ const std = @import("std");
 //   4. Delete file after processing
 // ─────────────────────────────────────────────────────────
 
+/// Callback for routing messages to the bus.
+/// Args: (to_worker_id, from_worker_id, msg_type_int, payload_json, userdata) → tm_result_t
+pub const BusSendFn = *const fn (u32, u32, c_int, ?[*:0]const u8, ?*anyopaque) callconv(.c) c_int;
+
 pub const CommandWatcher = struct {
     allocator: std.mem.Allocator,
     commands_dir: []const u8,
@@ -18,6 +22,8 @@ pub const CommandWatcher = struct {
     dir_fd: std.posix.fd_t,
     callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
     userdata: ?*anyopaque,
+    bus_send_fn: ?BusSendFn,
+    bus_send_userdata: ?*anyopaque,
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
 
@@ -29,6 +35,8 @@ pub const CommandWatcher = struct {
             .dir_fd = -1,
             .callback = null,
             .userdata = null,
+            .bus_send_fn = null,
+            .bus_send_userdata = null,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
         };
@@ -148,7 +156,33 @@ pub const CommandWatcher = struct {
         defer self.allocator.free(parsed.command);
         defer self.allocator.free(parsed.args);
 
-        // Fire callback
+        // /teammux-complete and /teammux-question are routed internally via bus —
+        // generic callback not fired for these commands.
+        const cmd_slice = std.mem.span(parsed.command.ptr);
+        if (self.bus_send_fn) |send_fn| {
+            if (std.mem.eql(u8, cmd_slice, "/teammux-complete")) {
+                self.routeCompletion(send_fn, parsed.args) catch |err| {
+                    std.log.warn("[teammux] /teammux-complete routing failed: {}", .{err});
+                    return; // Do NOT delete — leave for debugging
+                };
+                dir.deleteFile(filename) catch |err| {
+                    std.log.warn("[teammux] command file delete failed {s}: {}", .{ filename, err });
+                };
+                return;
+            }
+            if (std.mem.eql(u8, cmd_slice, "/teammux-question")) {
+                self.routeQuestion(send_fn, parsed.args) catch |err| {
+                    std.log.warn("[teammux] /teammux-question routing failed: {}", .{err});
+                    return;
+                };
+                dir.deleteFile(filename) catch |err| {
+                    std.log.warn("[teammux] command file delete failed {s}: {}", .{ filename, err });
+                };
+                return;
+            }
+        }
+
+        // All other commands: fire generic callback
         if (self.callback) |cb| {
             cb(parsed.command.ptr, parsed.args.ptr, self.userdata);
         }
@@ -157,6 +191,38 @@ pub const CommandWatcher = struct {
         dir.deleteFile(filename) catch |err| {
             std.log.warn("[teammux] command file delete failed {s}: {}", .{ filename, err });
         };
+    }
+
+    /// Route a /teammux-complete command to the bus as TM_MSG_COMPLETION.
+    /// Extracts worker_id from args JSON, sends to Team Lead (worker 0).
+    fn routeCompletion(self: *CommandWatcher, send_fn: BusSendFn, args: [:0]const u8) !void {
+        const args_slice = std.mem.span(args.ptr);
+        const worker_id = extractJsonUint(args_slice, "worker_id") orelse {
+            std.log.warn("[teammux] /teammux-complete missing worker_id in args", .{});
+            return error.InvalidJson;
+        };
+        // TM_MSG_COMPLETION = 5
+        const rc = send_fn(0, worker_id, 5, args.ptr, self.bus_send_userdata);
+        if (rc != 0) {
+            std.log.warn("[teammux] /teammux-complete bus send failed: rc={d}", .{rc});
+            return error.BusSendFailed;
+        }
+    }
+
+    /// Route a /teammux-question command to the bus as TM_MSG_QUESTION.
+    /// Extracts worker_id from args JSON, sends to Team Lead (worker 0).
+    fn routeQuestion(self: *CommandWatcher, send_fn: BusSendFn, args: [:0]const u8) !void {
+        const args_slice = std.mem.span(args.ptr);
+        const worker_id = extractJsonUint(args_slice, "worker_id") orelse {
+            std.log.warn("[teammux] /teammux-question missing worker_id in args", .{});
+            return error.InvalidJson;
+        };
+        // TM_MSG_QUESTION = 8
+        const rc = send_fn(0, worker_id, 8, args.ptr, self.bus_send_userdata);
+        if (rc != 0) {
+            std.log.warn("[teammux] /teammux-question bus send failed: rc={d}", .{rc});
+            return error.BusSendFailed;
+        }
     }
 };
 
@@ -240,6 +306,30 @@ fn extractJsonObject(json: []const u8, key: []const u8) ?[]const u8 {
 }
 
 const InvalidJson = error{InvalidJson};
+const BusSendFailed = error{BusSendFailed};
+
+/// Extract an unsigned integer value for a given key from JSON.
+/// Handles: "key": 42 (no quotes around number).
+pub fn extractJsonUint(json: []const u8, key: []const u8) ?u32 {
+    const search = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{key}) catch return null;
+    defer std.heap.page_allocator.free(search);
+
+    const key_pos = std.mem.indexOf(u8, json, search) orelse return null;
+    const after_key = json[key_pos + search.len ..];
+
+    // Skip colon and whitespace
+    var i: usize = 0;
+    while (i < after_key.len and (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1) {}
+
+    if (i >= after_key.len) return null;
+
+    // Parse digits
+    const start = i;
+    while (i < after_key.len and after_key[i] >= '0' and after_key[i] <= '9') : (i += 1) {}
+    if (i == start) return null; // no digits found
+
+    return std.fmt.parseInt(u32, after_key[start..i], 10) catch null;
+}
 
 // ─────────────────────────────────────────────────────────
 // Tests
@@ -351,4 +441,214 @@ test "commands - kqueue watcher detects file changes (integration)" {
     };
     if (exists) |f| f.close();
     // File may or may not be deleted depending on timing — just verify detection
+}
+
+test "commands - extractJsonUint parses integer value" {
+    try std.testing.expect(extractJsonUint("{\"worker_id\": 3, \"summary\": \"done\"}", "worker_id").? == 3);
+    try std.testing.expect(extractJsonUint("{\"worker_id\": 0}", "worker_id").? == 0);
+    try std.testing.expect(extractJsonUint("{\"worker_id\": 42}", "worker_id").? == 42);
+    try std.testing.expect(extractJsonUint("{\"summary\": \"done\"}", "worker_id") == null);
+    try std.testing.expect(extractJsonUint("{\"worker_id\": \"abc\"}", "worker_id") == null);
+}
+
+test "commands - /teammux-complete routed to bus, generic callback not fired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    const cmd_json =
+        \\{"command": "/teammux-complete", "args": {"worker_id": 3, "summary": "auth done", "details": "JWT impl"}}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "complete1.json", .data = cmd_json });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    const State = struct {
+        var generic_called: bool = false;
+        var bus_called: bool = false;
+        var bus_to: u32 = 99;
+        var bus_from: u32 = 99;
+        var bus_msg_type: c_int = -1;
+        var bus_payload: [256]u8 = undefined;
+        var bus_payload_len: usize = 0;
+    };
+    State.generic_called = false;
+    State.bus_called = false;
+    State.bus_to = 99;
+    State.bus_from = 99;
+    State.bus_msg_type = -1;
+    State.bus_payload_len = 0;
+
+    const generic_cb = struct {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            State.generic_called = true;
+        }
+    }.cb;
+
+    const bus_send = struct {
+        fn send(to: u32, from: u32, msg_type: c_int, payload: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) c_int {
+            State.bus_called = true;
+            State.bus_to = to;
+            State.bus_from = from;
+            State.bus_msg_type = msg_type;
+            if (payload) |p| {
+                const slice = std.mem.span(p);
+                const len = @min(slice.len, State.bus_payload.len);
+                @memcpy(State.bus_payload[0..len], slice[0..len]);
+                State.bus_payload_len = len;
+            }
+            return 0; // TM_OK
+        }
+    }.send;
+
+    watcher.callback = generic_cb;
+    watcher.bus_send_fn = bus_send;
+
+    watcher.scanAndProcess();
+
+    // Bus callback was fired
+    try std.testing.expect(State.bus_called);
+    try std.testing.expect(State.bus_to == 0); // Team Lead
+    try std.testing.expect(State.bus_from == 3); // worker_id from args
+    try std.testing.expect(State.bus_msg_type == 5); // TM_MSG_COMPLETION
+    // Payload contains the args JSON
+    try std.testing.expect(std.mem.indexOf(u8, State.bus_payload[0..State.bus_payload_len], "auth done") != null);
+
+    // Generic callback was NOT fired
+    try std.testing.expect(!State.generic_called);
+
+    // File was deleted
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("complete1.json", .{}));
+}
+
+test "commands - /teammux-question routed to bus, generic callback not fired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    const cmd_json =
+        \\{"command": "/teammux-question", "args": {"worker_id": 5, "question": "JWT or session?", "context": "auth module"}}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "question1.json", .data = cmd_json });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    const State = struct {
+        var generic_called: bool = false;
+        var bus_called: bool = false;
+        var bus_msg_type: c_int = -1;
+        var bus_from: u32 = 99;
+    };
+    State.generic_called = false;
+    State.bus_called = false;
+    State.bus_msg_type = -1;
+    State.bus_from = 99;
+
+    const generic_cb = struct {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            State.generic_called = true;
+        }
+    }.cb;
+
+    const bus_send = struct {
+        fn send(_: u32, from: u32, msg_type: c_int, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) c_int {
+            State.bus_called = true;
+            State.bus_msg_type = msg_type;
+            State.bus_from = from;
+            return 0;
+        }
+    }.send;
+
+    watcher.callback = generic_cb;
+    watcher.bus_send_fn = bus_send;
+
+    watcher.scanAndProcess();
+
+    try std.testing.expect(State.bus_called);
+    try std.testing.expect(State.bus_msg_type == 8); // TM_MSG_QUESTION
+    try std.testing.expect(State.bus_from == 5); // worker_id from args
+    try std.testing.expect(!State.generic_called);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("question1.json", .{}));
+}
+
+test "commands - other commands still fire generic callback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    const cmd_json =
+        \\{"command": "/teammux-status", "args": "{}"}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "status1.json", .data = cmd_json });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    const State = struct {
+        var generic_called: bool = false;
+        var bus_called: bool = false;
+    };
+    State.generic_called = false;
+    State.bus_called = false;
+
+    const generic_cb = struct {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            State.generic_called = true;
+        }
+    }.cb;
+
+    const bus_send = struct {
+        fn send(_: u32, _: u32, _: c_int, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) c_int {
+            State.bus_called = true;
+            return 0;
+        }
+    }.send;
+
+    watcher.callback = generic_cb;
+    watcher.bus_send_fn = bus_send;
+
+    watcher.scanAndProcess();
+
+    // Generic callback fired for non-completion/question commands
+    try std.testing.expect(State.generic_called);
+    // Bus NOT called for generic commands
+    try std.testing.expect(!State.bus_called);
+}
+
+test "commands - /teammux-complete missing worker_id leaves file for debugging" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    // Missing worker_id in args
+    const cmd_json =
+        \\{"command": "/teammux-complete", "args": {"summary": "no worker id"}}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "bad1.json", .data = cmd_json });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    const bus_send = struct {
+        fn send(_: u32, _: u32, _: c_int, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) c_int {
+            return 0;
+        }
+    }.send;
+
+    watcher.bus_send_fn = bus_send;
+    watcher.scanAndProcess();
+
+    // File NOT deleted — left for debugging
+    const file = tmp.dir.openFile("bad1.json", .{}) catch |err| {
+        try std.testing.expect(err != error.FileNotFound);
+        return;
+    };
+    file.close();
 }
