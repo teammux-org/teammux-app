@@ -111,6 +111,23 @@ pub const Engine = struct {
             self.setError("commands watcher init failed") catch {};
             return err;
         };
+        // Wire bus routing for /teammux-complete and /teammux-question
+        if (self.commands_watcher) |*w| {
+            w.bus_send_fn = busSendBridge;
+            w.bus_send_userdata = self;
+        }
+    }
+
+    /// Bridge function for CommandWatcher → MessageBus routing.
+    /// Called by commands.zig when /teammux-complete or /teammux-question is detected.
+    fn busSendBridge(to: u32, from: u32, msg_type: c_int, payload: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) c_int {
+        const self: *Engine = @ptrCast(@alignCast(userdata orelse return 99));
+        var b = &(self.message_bus orelse return 8);
+        b.send(to, from, @enumFromInt(msg_type), std.mem.span(payload orelse return 8)) catch |err| {
+            self.setError(if (err == error.DeliveryFailed) "completion/question delivery failed after 4 attempts" else "completion/question bus send failed") catch {};
+            return 8;
+        };
+        return 0;
     }
 
     pub fn sessionStop(self: *Engine) void {
@@ -183,6 +200,10 @@ comptime {
     if (@sizeOf(CRole) != 72) @compileError("CRole size mismatch with tm_role_t");
     // COwnershipEntry: ptr(8) + u32(4) + bool(1) + pad(3) = 16 bytes on arm64
     if (@sizeOf(COwnershipEntry) != 16) @compileError("COwnershipEntry size mismatch with tm_ownership_entry_t");
+    // CCompletion: u32(4) + pad(4) + 3 ptrs(24) + u64(8) = 40 bytes on arm64
+    if (@sizeOf(CCompletion) != 40) @compileError("CCompletion size mismatch with tm_completion_t");
+    // CQuestion: u32(4) + pad(4) + 2 ptrs(16) + u64(8) = 32 bytes on arm64
+    if (@sizeOf(CQuestion) != 32) @compileError("CQuestion size mismatch with tm_question_t");
 }
 
 var last_create_error: [*:0]const u8 = "no error";
@@ -430,6 +451,106 @@ export fn tm_commands_watch(engine: ?*Engine, callback: ?*const fn (?[*:0]const 
     return 0;
 }
 export fn tm_commands_unwatch(engine: ?*Engine, sub: u32) void { _ = sub; if (engine) |e| { if (e.commands_watcher) |*w| w.stop(); } }
+
+// ─── Completion + Question signaling ─────────────────────
+
+const CCompletion = extern struct {
+    worker_id: u32,
+    _pad0: u32 = 0,
+    summary: ?[*:0]const u8,
+    git_commit: ?[*:0]const u8,
+    details: ?[*:0]const u8,
+    timestamp: u64,
+};
+
+const CQuestion = extern struct {
+    worker_id: u32,
+    _pad0: u32 = 0,
+    question: ?[*:0]const u8,
+    context: ?[*:0]const u8,
+    timestamp: u64,
+};
+
+/// Signal worker completion. Creates TM_MSG_COMPLETION message, routes through
+/// bus to Team Lead (worker 0), persists to JSONL log.
+export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]const u8, details: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const sum_str = std.mem.span(summary orelse {
+        e.setError("tm_worker_complete: summary must not be NULL") catch {};
+        return 99;
+    });
+    const det_str = if (details) |d| std.mem.span(d) else "";
+
+    // Build JSON payload: {"worker_id":N,"summary":"...","details":"..."}
+    const payload = std.fmt.allocPrint(e.allocator,
+        \\{{"worker_id":{d},"summary":"{s}","details":"{s}"}}
+    , .{ worker_id, sum_str, det_str }) catch {
+        e.setError("tm_worker_complete: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(payload);
+
+    var b = &(e.message_bus orelse {
+        e.setError("tm_worker_complete: message bus not initialized (call tm_session_start first)") catch {};
+        return 8;
+    });
+
+    // Route to Team Lead (worker 0) with TM_MSG_COMPLETION type
+    b.send(0, worker_id, .completion, payload) catch |err| {
+        e.setError(if (err == error.DeliveryFailed) "completion delivery failed after 4 attempts" else "completion bus send failed") catch {};
+        return 8;
+    };
+    return 0;
+}
+
+/// Signal worker question. Creates TM_MSG_QUESTION message, routes through
+/// bus to Team Lead (worker 0), persists to JSONL log.
+export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]const u8, ctx: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const q_str = std.mem.span(question orelse {
+        e.setError("tm_worker_question: question must not be NULL") catch {};
+        return 99;
+    });
+    const ctx_str = if (ctx) |c| std.mem.span(c) else "";
+
+    const payload = std.fmt.allocPrint(e.allocator,
+        \\{{"worker_id":{d},"question":"{s}","context":"{s}"}}
+    , .{ worker_id, q_str, ctx_str }) catch {
+        e.setError("tm_worker_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(payload);
+
+    var b = &(e.message_bus orelse {
+        e.setError("tm_worker_question: message bus not initialized (call tm_session_start first)") catch {};
+        return 8;
+    });
+
+    b.send(0, worker_id, .question, payload) catch |err| {
+        e.setError(if (err == error.DeliveryFailed) "question delivery failed after 4 attempts" else "question bus send failed") catch {};
+        return 8;
+    };
+    return 0;
+}
+
+/// Free a heap-allocated tm_completion_t.
+export fn tm_completion_free(completion: ?*CCompletion) void {
+    if (completion) |c| {
+        freeNullTerminated(c.summary);
+        freeNullTerminated(c.git_commit);
+        freeNullTerminated(c.details);
+        std.heap.c_allocator.destroy(c);
+    }
+}
+
+/// Free a heap-allocated tm_question_t.
+export fn tm_question_free(question: ?*CQuestion) void {
+    if (question) |q| {
+        freeNullTerminated(q.question);
+        freeNullTerminated(q.context);
+        std.heap.c_allocator.destroy(q);
+    }
+}
 
 // ─── Merge coordinator ───────────────────────────────────
 
