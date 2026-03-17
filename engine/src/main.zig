@@ -120,11 +120,22 @@ pub const Engine = struct {
 
     /// Bridge function for CommandWatcher → MessageBus routing.
     /// Called by commands.zig when /teammux-complete or /teammux-question is detected.
+    /// Returns 0 on success, 8 (TM_ERR_BUS) on bus failure, 99 (TM_ERR_UNKNOWN) on invalid input.
     fn busSendBridge(to: u32, from: u32, msg_type: c_int, payload: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) c_int {
         const self: *Engine = @ptrCast(@alignCast(userdata orelse return 99));
-        var b = &(self.message_bus orelse return 8);
-        b.send(to, from, @enumFromInt(msg_type), std.mem.span(payload orelse return 8)) catch |err| {
-            self.setError(if (err == error.DeliveryFailed) "completion/question delivery failed after 4 attempts" else "completion/question bus send failed") catch {};
+        const msg_enum = std.meta.intToEnum(bus.MessageType, msg_type) catch {
+            self.setError("busSendBridge: invalid message type") catch {};
+            return 99;
+        };
+        var b = &(self.message_bus orelse {
+            self.setError("busSendBridge: message bus not initialized") catch {};
+            return 8;
+        });
+        b.send(to, from, msg_enum, std.mem.span(payload orelse {
+            self.setError("busSendBridge: payload is NULL") catch {};
+            return 8;
+        })) catch |err| {
+            self.setError(if (err == error.DeliveryFailed) "completion/question delivery failed after retries exhausted" else "completion/question bus send failed") catch {};
             return 8;
         };
         return 0;
