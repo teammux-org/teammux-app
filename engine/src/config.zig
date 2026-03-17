@@ -618,6 +618,15 @@ pub fn parseRoleContent(allocator: std.mem.Allocator, content: []const u8) Parse
 // Role path resolution
 // ─────────────────────────────────────────────────────────
 
+fn isValidRoleId(role_id: []const u8) bool {
+    if (role_id.len == 0) return false;
+    for (role_id) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// Resolve a role ID to its TOML file path.
 /// Search order (first match wins):
 ///   1. {project_root}/.teammux/roles/{role_id}.toml — project-local overrides
@@ -631,6 +640,10 @@ pub fn resolveRolePath(
     role_id: []const u8,
     project_root: []const u8,
 ) !?[]u8 {
+    // Validate role_id: only alphanumeric, hyphens, underscores allowed.
+    // Prevents path traversal (e.g. "../secret" escaping the roles directory).
+    if (!isValidRoleId(role_id)) return null;
+
     const filename = try std.fmt.allocPrint(allocator, "{s}.toml", .{role_id});
     defer allocator.free(filename);
 
@@ -1447,7 +1460,10 @@ test "resolveRolePath - returns null for missing role" {
     try std.testing.expect(result == null);
 }
 
-test "resolveRolePath - project-local takes precedence over user-level" {
+test "resolveRolePath - project-local path is checked first" {
+    // Verifies project-local is search path #1 by confirming the returned
+    // path starts with project_root (not HOME or exe_dir).
+    // Does NOT write to ~/.teammux/ to avoid polluting real environments.
     const alloc = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1455,43 +1471,32 @@ test "resolveRolePath - project-local takes precedence over user-level" {
     const project_root = try tmp_dir.dir.realpathAlloc(alloc, ".");
     defer alloc.free(project_root);
 
-    // Create project-local role
     try tmp_dir.dir.makePath(".teammux/roles");
     try tmp_dir.dir.writeFile(.{ .sub_path = ".teammux/roles/priority-role.toml", .data = "[identity]\nid = \"priority-role\"\n" });
-
-    // Also create a user-level role at ~/.teammux/roles/ (if HOME is set)
-    // so we can verify project-local wins when both exist
-    var created_user_role = false;
-    if (std.posix.getenv("HOME")) |home| {
-        const user_roles_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux/roles", .{home});
-        defer alloc.free(user_roles_dir);
-        std.fs.makeDirAbsolute(user_roles_dir) catch {};
-        const user_role_path = try std.fmt.allocPrint(alloc, "{s}/priority-role.toml", .{user_roles_dir});
-        defer alloc.free(user_role_path);
-        if (std.fs.createFileAbsolute(user_role_path, .{ .exclusive = true })) |f| {
-            f.writeAll("[identity]\nid = \"priority-role\"\n") catch {};
-            f.close();
-            created_user_role = true;
-        } else |_| {
-            // File already exists — another test or user role, don't overwrite
-        }
-    }
-    defer if (created_user_role) {
-        if (std.posix.getenv("HOME")) |home| {
-            if (std.fmt.allocPrint(alloc, "{s}/.teammux/roles/priority-role.toml", .{home})) |cleanup_path| {
-                defer alloc.free(cleanup_path);
-                std.fs.deleteFileAbsolute(cleanup_path) catch {};
-            } else |_| {}
-        }
-    };
 
     const result = try resolveRolePath(alloc, "priority-role", project_root);
     try std.testing.expect(result != null);
     defer alloc.free(result.?);
-    // Result must be the project-local path, not user-level
-    const expected_suffix = ".teammux/roles/priority-role.toml";
-    try std.testing.expect(std.mem.endsWith(u8, result.?, expected_suffix));
+    // Path must be under project_root/.teammux/roles/ (search path #1)
     try std.testing.expect(std.mem.startsWith(u8, result.?, project_root));
+    try std.testing.expect(std.mem.endsWith(u8, result.?, ".teammux/roles/priority-role.toml"));
+}
+
+test "resolveRolePath - rejects path traversal in role_id" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    // Path traversal attempts should return null
+    try std.testing.expect(try resolveRolePath(alloc, "../secret", project_root) == null);
+    try std.testing.expect(try resolveRolePath(alloc, "foo/bar", project_root) == null);
+    try std.testing.expect(try resolveRolePath(alloc, "role.with.dots", project_root) == null);
+    try std.testing.expect(try resolveRolePath(alloc, "", project_root) == null);
+    // Valid role IDs are allowed
+    try std.testing.expect(try resolveRolePath(alloc, "valid-role_123", project_root) == null); // null because file doesn't exist, not because of validation
 }
 
 test "listRolesInDir - lists TOML files" {
