@@ -1056,24 +1056,23 @@ fn freeNullTerminated(ptr: ?[*:0]const u8) void {
     if (ptr) |p| std.heap.c_allocator.free(std.mem.span(p));
 }
 
-/// Escape JSON-special characters in a string for safe interpolation into JSON values.
+/// Escape all JSON-special characters per RFC 8259 for safe interpolation into JSON values.
+/// Handles: " \ and all control characters U+0000..U+001F.
 /// Caller must free the returned slice.
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     // Fast path: if no special chars, just dupe
     var needs_escape = false;
     for (input) |c| {
-        switch (c) {
-            '"', '\\', '\n', '\r', '\t' => {
-                needs_escape = true;
-                break;
-            },
-            else => {},
+        if (c == '"' or c == '\\' or c <= 0x1F) {
+            needs_escape = true;
+            break;
         }
     }
     if (!needs_escape) return try allocator.dupe(u8, input);
 
-    // Worst case: every char needs escaping (2 bytes each)
-    const buf = try allocator.alloc(u8, input.len * 2);
+    // Worst case: control chars become \uXXXX (6 bytes each)
+    const buf = try allocator.alloc(u8, input.len * 6);
+    const hex = "0123456789abcdef";
     var pos: usize = 0;
     for (input) |c| {
         switch (c) {
@@ -1102,6 +1101,26 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
                 buf[pos + 1] = 't';
                 pos += 2;
             },
+            0x08 => { // \b backspace
+                buf[pos] = '\\';
+                buf[pos + 1] = 'b';
+                pos += 2;
+            },
+            0x0C => { // \f form feed
+                buf[pos] = '\\';
+                buf[pos + 1] = 'f';
+                pos += 2;
+            },
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                // Other control chars: escape as \u00XX
+                buf[pos] = '\\';
+                buf[pos + 1] = 'u';
+                buf[pos + 2] = '0';
+                buf[pos + 3] = '0';
+                buf[pos + 4] = hex[c >> 4];
+                buf[pos + 5] = hex[c & 0x0F];
+                pos += 6;
+            },
             else => {
                 buf[pos] = c;
                 pos += 1;
@@ -1111,7 +1130,6 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     // Shrink to actual size
     if (pos < buf.len) {
         return allocator.realloc(buf, pos) catch {
-            // realloc to smaller should not fail, but if it does, return full buf
             return buf[0..pos];
         };
     }
@@ -1954,6 +1972,25 @@ test "jsonEscape escapes quotes and backslashes" {
     const e3 = try jsonEscape(alloc, "line1\nline2\ttab");
     defer alloc.free(e3);
     try std.testing.expectEqualStrings("line1\\nline2\\ttab", e3);
+}
+
+test "jsonEscape escapes all JSON control characters (RFC 8259)" {
+    const alloc = std.testing.allocator;
+
+    // \b (backspace 0x08) and \f (form feed 0x0C) get named escapes
+    const e1 = try jsonEscape(alloc, "a\x08b\x0Cc");
+    defer alloc.free(e1);
+    try std.testing.expectEqualStrings("a\\bb\\fc", e1);
+
+    // Other control chars (e.g. 0x01, 0x1F) get \u00XX escapes
+    const e2 = try jsonEscape(alloc, "a\x01b\x1Fc");
+    defer alloc.free(e2);
+    try std.testing.expectEqualStrings("a\\u0001b\\u001fc", e2);
+
+    // Null byte
+    const e3 = try jsonEscape(alloc, "a\x00b");
+    defer alloc.free(e3);
+    try std.testing.expectEqualStrings("a\\u0000b", e3);
 }
 
 test "jsonEscape fast path for clean strings" {
