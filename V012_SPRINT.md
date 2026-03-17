@@ -18,16 +18,16 @@
 
 ## 2. Stream Map
 
-| Stream    | Worktree              | Branch                            | Owns                                      | Depends on      | Merges after        |
-|-----------|-----------------------|-----------------------------------|-------------------------------------------|-----------------|---------------------|
-| stream-R1 | ../teammux-stream-r1  | feat/v012-stream-r1-role-library  | 31 role TOML files + roles/README.md      | nothing         | first (parallel R3) |
-| stream-R3 | ../teammux-stream-r3  | feat/v012-stream-r3-config-role   | config.zig role field + validation        | R1 format spec  | first (parallel R1) |
-| stream-R2 | ../teammux-stream-r2  | feat/v012-stream-r2-role-spawn    | worktree.zig rich CLAUDE.md generation    | R1 merged       | after R1            |
-| stream-R4 | ../teammux-stream-r4  | feat/v012-stream-r4-ownership     | ownership.zig + teammux.h additions       | R2 merged       | after R2            |
-| stream-R5 | ../teammux-stream-r5  | feat/v012-stream-r5-role-bridge   | EngineClient role + capability bridge     | R4 merged       | after R4            |
-| stream-R8 | ../teammux-stream-r8  | feat/v012-stream-r8-interceptor   | interceptor.zig + PTY git enforcement     | R4 merged       | after R4 (par. R5)  |
-| stream-R6 | ../teammux-stream-r6  | feat/v012-stream-r6-roster-ui     | roster role badges + spawn role picker    | R5 merged       | after R5            |
-| stream-R7 | ../teammux-stream-r7  | feat/v012-stream-r7-polish        | TD8 resolution + integration polish       | R6 + R8 merged  | last                |
+| Stream    | Worktree              | Branch                            | Owns                                      | Depends on      | Merges after        | Status   |
+|-----------|-----------------------|-----------------------------------|-------------------------------------------|-----------------|---------------------|----------|
+| stream-R1 | ../teammux-stream-r1  | feat/v012-stream-r1-role-library  | 31 role TOML files + roles/README.md      | nothing         | first (parallel R3) | MERGED   |
+| stream-R3 | ../teammux-stream-r3  | feat/v012-stream-r3-config-role   | config.zig role field + validation        | R1 format spec  | first (parallel R1) | MERGED   |
+| stream-R2 | ../teammux-stream-r2  | feat/v012-stream-r2-role-spawn    | worktree.zig rich CLAUDE.md generation    | R1 merged       | after R1            | MERGED   |
+| stream-R4 | ../teammux-stream-r4  | feat/v012-stream-r4-ownership     | ownership.zig + teammux.h additions       | R2 merged       | after R2            | MERGED   |
+| stream-R5 | ../teammux-stream-r5  | feat/v012-stream-r5-role-bridge   | EngineClient role + capability bridge     | R4 merged       | after R4            | MERGED   |
+| stream-R8 | ../teammux-stream-r8  | feat/v012-stream-r8-interceptor   | interceptor.zig + PTY git enforcement     | R4 merged       | after R4 (par. R5)  | MERGED   |
+| stream-R6 | ../teammux-stream-r6  | feat/v012-stream-r6-roster-ui     | roster role badges + spawn role picker    | R5 merged       | after R5            | MERGED   |
+| stream-R7 | ../teammux-stream-r7  | feat/v012-stream-r7-polish        | TD8 resolution + integration polish       | R6 + R8 merged  | last                | PR RAISED |
 
 ---
 

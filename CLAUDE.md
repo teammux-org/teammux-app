@@ -41,4 +41,4 @@ macOS 15 Sequoia, Apple Silicon only — com.teammux.app
 ## Version history
 - v0.1.0 — Ghostty fork, Zig engine, Swift UI, git worktrees, message bus
 - v0.1.1 — bus retry, webhook polling, MergeCoordinator, Team Lead review UI
-- v0.1.2 — in progress: role definitions, capability registry, PTY enforcement
+- v0.1.2 — role definitions, capability registry, PTY enforcement, 31 role library
