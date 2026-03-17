@@ -676,6 +676,123 @@ export fn tm_roles_list_free(roles: ?[*]?*CRole, count: u32) void {
     std.heap.c_allocator.free(ptrs[0..count]);
 }
 
+export fn tm_roles_list_bundled(project_root: ?[*:0]const u8, count: ?*u32) ?[*]?*CRole {
+    if (count) |c| c.* = 0;
+    const alloc = std.heap.c_allocator;
+
+    const root: ?[]const u8 = if (project_root) |pr| std.mem.span(pr) else null;
+
+    // Collect unique role IDs from all search paths
+    var seen = std.StringHashMap(void).init(alloc);
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        seen.deinit();
+    }
+    var role_defs: std.ArrayList(*CRole) = .{};
+    var role_defs_transferred = false;
+    defer {
+        if (!role_defs_transferred) {
+            for (role_defs.items) |cr| {
+                freeCRole(cr);
+                alloc.destroy(cr);
+            }
+        }
+        role_defs.deinit(alloc);
+    }
+
+    // Build search paths — same order as tm_roles_list
+    const project_roles: ?[]const u8 = if (root) |r|
+        (std.fmt.allocPrint(alloc, "{s}/.teammux/roles", .{r}) catch null)
+    else
+        null;
+    defer if (project_roles) |pr| alloc.free(pr);
+
+    const home_roles = if (std.posix.getenv("HOME")) |home|
+        (std.fmt.allocPrint(alloc, "{s}/.teammux/roles", .{home}) catch null)
+    else
+        null;
+    defer if (home_roles) |hr| alloc.free(hr);
+
+    const exe_dir = config.getExeDir(alloc) catch null;
+    defer if (exe_dir) |ed| alloc.free(ed);
+
+    const bundle_roles = if (exe_dir) |ed|
+        (std.fmt.allocPrint(alloc, "{s}/../Resources/roles", .{ed}) catch null)
+    else
+        null;
+    defer if (bundle_roles) |br| alloc.free(br);
+
+    const dev_roles = if (exe_dir) |ed|
+        (std.fmt.allocPrint(alloc, "{s}/roles", .{ed}) catch null)
+    else
+        null;
+    defer if (dev_roles) |dr| alloc.free(dr);
+
+    const paths = [_]?[]const u8{ project_roles, home_roles, bundle_roles, dev_roles };
+
+    // Use a dummy project root for resolveRolePath when project_root is null.
+    // resolveRolePath checks project-local first, but with a nonexistent path
+    // it simply falls through to the other search paths.
+    const resolve_root = root orelse "/nonexistent";
+
+    for (paths) |maybe_path| {
+        const dir_path = maybe_path orelse continue;
+        const role_ids = config.listRolesInDir(alloc, dir_path) catch |err| {
+            if (err == error.OutOfMemory) return null;
+            continue;
+        };
+        defer {
+            for (role_ids) |rid| alloc.free(rid);
+            alloc.free(role_ids);
+        }
+        for (role_ids) |rid| {
+            if (seen.contains(rid)) continue;
+            const role_path = config.resolveRolePath(alloc, rid, resolve_root) catch |err| {
+                if (err == error.OutOfMemory) return null;
+                continue;
+            };
+            if (role_path == null) continue;
+            defer alloc.free(role_path.?);
+
+            var role_def = config.parseRoleDefinition(alloc, role_path.?) catch |err| {
+                if (err == error.OutOfMemory) return null;
+                continue;
+            };
+            defer role_def.deinit(alloc);
+
+            const c_role = fillCRole(alloc, &role_def) catch |err| {
+                if (err == error.OutOfMemory) return null;
+                continue;
+            };
+            role_defs.append(alloc, c_role) catch {
+                freeCRole(c_role);
+                alloc.destroy(c_role);
+                return null;
+            };
+            const owned_key = alloc.dupe(u8, rid) catch return null;
+            seen.put(owned_key, {}) catch {
+                alloc.free(owned_key);
+                return null;
+            };
+        }
+    }
+
+    if (role_defs.items.len == 0) return null;
+
+    const result = alloc.alloc(?*CRole, role_defs.items.len) catch return null;
+    for (role_defs.items, 0..) |ptr, i| {
+        result[i] = ptr;
+    }
+    role_defs_transferred = true;
+    if (count) |c| c.* = @intCast(role_defs.items.len);
+    return result.ptr;
+}
+
+export fn tm_roles_list_bundled_free(roles: ?[*]?*CRole, count: u32) void {
+    tm_roles_list_free(roles, count);
+}
+
 // ─── File ownership ──────────────────────────────────────
 
 export fn tm_ownership_check(engine: ?*Engine, worker_id: u32, file_path: ?[*:0]const u8, out_allowed: ?*bool) c_int {
@@ -1188,6 +1305,166 @@ test "tm_roles_list finds roles in project directory" {
         }
     }
     try std.testing.expect(found);
+}
+
+// ─── Bundled roles API tests ─────────────────────────────
+
+test "tm_roles_list_bundled null count pointer returns null" {
+    try std.testing.expect(tm_roles_list_bundled(null, null) == null);
+}
+
+test "tm_roles_list_bundled null project_root returns null gracefully" {
+    var count: u32 = 42;
+    // No bundled/dev paths exist in test runner — returns null with count=0
+    const result = tm_roles_list_bundled(null, &count);
+    if (result) |r| {
+        defer tm_roles_list_bundled_free(r, count);
+    } else {
+        try std.testing.expect(count == 0);
+    }
+}
+
+test "tm_roles_list_bundled finds roles in project directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+
+    try tmp.dir.makePath(".teammux/roles");
+    const role_toml =
+        \\[identity]
+        \\id = "bundled-test"
+        \\name = "Bundled Test Role"
+        \\division = "testing"
+        \\emoji = "b"
+        \\description = "for bundled listing"
+        \\
+        \\[capabilities]
+        \\write = []
+        \\deny_write = []
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = ".teammux/roles/bundled-test.toml", .data = role_toml });
+
+    var count: u32 = 0;
+    const roles = tm_roles_list_bundled(root_z.ptr, &count);
+    try std.testing.expect(count >= 1);
+    try std.testing.expect(roles != null);
+    defer tm_roles_list_bundled_free(roles, count);
+
+    var found = false;
+    for (0..count) |i| {
+        if (roles.?[i]) |r| {
+            if (r.id) |id| {
+                if (std.mem.eql(u8, std.mem.span(id), "bundled-test")) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "tm_roles_list_bundled_free handles null" {
+    tm_roles_list_bundled_free(null, 0);
+}
+
+test "tm_roles_list_bundled finds multiple roles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+
+    try tmp.dir.makePath(".teammux/roles");
+    const toml_a =
+        \\[identity]
+        \\id = "role-a"
+        \\name = "Role A"
+        \\division = "alpha"
+        \\emoji = "a"
+        \\description = "first role"
+        \\
+        \\[capabilities]
+        \\write = []
+        \\deny_write = []
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+    ;
+    const toml_b =
+        \\[identity]
+        \\id = "role-b"
+        \\name = "Role B"
+        \\division = "beta"
+        \\emoji = "b"
+        \\description = "second role"
+        \\
+        \\[capabilities]
+        \\write = ["src/**"]
+        \\deny_write = ["infra/**"]
+        \\can_push = true
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = ".teammux/roles/role-a.toml", .data = toml_a });
+    try tmp.dir.writeFile(.{ .sub_path = ".teammux/roles/role-b.toml", .data = toml_b });
+
+    var count: u32 = 0;
+    const roles = tm_roles_list_bundled(root_z.ptr, &count);
+    try std.testing.expect(count >= 2);
+    try std.testing.expect(roles != null);
+    defer tm_roles_list_bundled_free(roles, count);
+
+    var found_a = false;
+    var found_b = false;
+    for (0..count) |i| {
+        if (roles.?[i]) |r| {
+            if (r.id) |id| {
+                const name = std.mem.span(id);
+                if (std.mem.eql(u8, name, "role-a")) found_a = true;
+                if (std.mem.eql(u8, name, "role-b")) found_b = true;
+            }
+        }
+    }
+    try std.testing.expect(found_a);
+    try std.testing.expect(found_b);
 }
 
 // ─── Ownership API tests ─────────────────────────────────

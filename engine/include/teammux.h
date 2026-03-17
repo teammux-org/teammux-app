@@ -354,6 +354,14 @@ void         tm_role_free(tm_role_t* role);
 tm_role_t**  tm_roles_list(tm_engine_t* engine, uint32_t* count);
 void         tm_roles_list_free(tm_role_t** roles, uint32_t count);
 
+// List all available roles without an active engine session.
+// Searches project-local (.teammux/roles/), user (~/.teammux/roles/),
+// and bundled paths. Pass NULL for project_root to skip project-local.
+// Returns NULL if no roles found (*count will be 0).
+// Caller must call tm_roles_list_bundled_free().
+tm_role_t**  tm_roles_list_bundled(const char* project_root, uint32_t* count);
+void         tm_roles_list_bundled_free(tm_role_t** roles, uint32_t count);
+
 // -----------------------------------------------------------------
 // File ownership
 // -----------------------------------------------------------------
