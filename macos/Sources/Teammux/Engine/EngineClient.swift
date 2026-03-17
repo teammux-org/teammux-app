@@ -333,10 +333,11 @@ final class EngineClient: ObservableObject {
         // reads deny_write patterns from the ownership registry and embeds them
         // in the wrapper script. Workers with no registered deny patterns
         // (including those with no role) get a pass-through wrapper.
+        let hasResolvedRole = workerRoles[workerId] != nil
         let interceptResult = tm_interceptor_install(engine, workerId)
         if interceptResult != TM_OK {
             let msg = lastEngineError() ?? "tm_interceptor_install failed (\(interceptResult.rawValue))"
-            if roleId != nil {
+            if hasResolvedRole {
                 // Hard failure for role-assigned workers: enforcement is the
                 // whole point of roles. Continuing without it silently drops
                 // write-scope guarantees.
