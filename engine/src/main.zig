@@ -8,6 +8,7 @@ pub const bus = @import("bus.zig");
 pub const github = @import("github.zig");
 pub const commands = @import("commands.zig");
 pub const merge = @import("merge.zig");
+pub const ownership = @import("ownership.zig");
 
 // ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
@@ -19,6 +20,7 @@ pub const Engine = struct {
     cfg: ?config.Config,
     config_watcher: ?config.ConfigWatcher,
     roster: worktree.Roster,
+    ownership_registry: ownership.FileOwnershipRegistry,
     merge_coordinator: merge.MergeCoordinator,
     message_bus: ?bus.MessageBus,
     github_client: github.GitHubClient,
@@ -45,6 +47,7 @@ pub const Engine = struct {
             .cfg = null,
             .config_watcher = null,
             .roster = worktree.Roster.init(allocator),
+            .ownership_registry = ownership.FileOwnershipRegistry.init(allocator),
             .merge_coordinator = merge.MergeCoordinator.init(allocator),
             .message_bus = null,
             .github_client = github.GitHubClient.init(allocator, null),
@@ -70,6 +73,7 @@ pub const Engine = struct {
         if (self.message_bus) |*b| b.deinit();
         self.github_client.deinit();
         self.merge_coordinator.deinit();
+        self.ownership_registry.deinit();
         self.roster.deinit();
         if (self.cfg) |*c| c.deinit(self.allocator);
         if (self.last_error) |e| self.allocator.free(e);
@@ -159,6 +163,11 @@ const CRole = extern struct {
     deny_write_patterns: ?[*]?[*:0]const u8, deny_write_pattern_count: u32,
     can_push: bool, can_merge: bool,
 };
+const COwnershipEntry = extern struct {
+    path_pattern: ?[*:0]const u8,
+    worker_id: u32,
+    allow_write: bool,
+};
 
 // Comptime ABI safety: verify extern struct sizes match expected C layout.
 // If a field is added/removed in teammux.h without updating Zig, this fails at build time.
@@ -171,6 +180,8 @@ comptime {
     if (@sizeOf(CConflict) != 32) @compileError("CConflict size mismatch with tm_conflict_t");
     // CRole: 5 ptrs + 2*(ptr + u32) + 2 bools + pad = 72 bytes on arm64
     if (@sizeOf(CRole) != 72) @compileError("CRole size mismatch with tm_role_t");
+    // COwnershipEntry: ptr(8) + u32(4) + bool(1) + pad(3) = 16 bytes on arm64
+    if (@sizeOf(COwnershipEntry) != 16) @compileError("COwnershipEntry size mismatch with tm_ownership_entry_t");
 }
 
 var last_create_error: [*:0]const u8 = "no error";
@@ -250,6 +261,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
 }
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    e.ownership_registry.release(worker_id);
     e.roster.dismiss(e.project_root, worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
     return 0;
 }
@@ -436,6 +448,7 @@ export fn tm_merge_approve(engine: ?*Engine, worker_id: u32, strategy: ?[*:0]con
 }
 export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    e.ownership_registry.release(worker_id);
     e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
         e.setError(if (err == error.WorkerNotFound) "merge reject failed: worker not found" else "merge reject failed") catch {};
         return if (err == error.WorkerNotFound) 12 else 5;
@@ -650,6 +663,93 @@ export fn tm_roles_list_free(roles: ?[*]?*CRole, count: u32) void {
     std.heap.c_allocator.free(ptrs[0..count]);
 }
 
+// ─── File ownership ──────────────────────────────────────
+
+export fn tm_ownership_check(engine: ?*Engine, worker_id: u32, file_path: ?[*:0]const u8, out_allowed: ?*bool) c_int {
+    const e = engine orelse return 99;
+    const path = std.mem.span(file_path orelse {
+        e.setError("tm_ownership_check: file_path must not be NULL") catch {};
+        return 14;
+    });
+    const out = out_allowed orelse {
+        e.setError("tm_ownership_check: out_allowed must not be NULL") catch {};
+        return 14;
+    };
+    out.* = e.ownership_registry.check(worker_id, path);
+    return 0;
+}
+
+export fn tm_ownership_register(engine: ?*Engine, worker_id: u32, path_pattern: ?[*:0]const u8, allow_write: bool) c_int {
+    const e = engine orelse return 99;
+    const pattern = std.mem.span(path_pattern orelse {
+        e.setError("tm_ownership_register: path_pattern must not be NULL") catch {};
+        return 14;
+    });
+    e.ownership_registry.register(worker_id, pattern, allow_write) catch {
+        e.setError("tm_ownership_register: allocation failed") catch {};
+        return 99;
+    };
+    return 0;
+}
+
+export fn tm_ownership_release(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    e.ownership_registry.release(worker_id);
+    return 0;
+}
+
+export fn tm_ownership_get(engine: ?*Engine, worker_id: u32, count: ?*u32) ?[*]?*COwnershipEntry {
+    if (count) |c| c.* = 0;
+    const e = engine orelse return null;
+    const alloc = e.allocator;
+
+    const rules = e.ownership_registry.getRules(worker_id) orelse return null;
+    if (rules.len == 0) return null;
+
+    const ptrs = alloc.alloc(?*COwnershipEntry, rules.len) catch return null;
+    var filled: usize = 0;
+    errdefer {
+        for (0..filled) |j| freeCOwnershipEntry(ptrs[j]);
+        alloc.free(ptrs);
+    }
+
+    for (rules) |rule| {
+        const entry = alloc.create(COwnershipEntry) catch {
+            for (0..filled) |j| freeCOwnershipEntry(ptrs[j]);
+            alloc.free(ptrs);
+            return null;
+        };
+        const pat_z = alloc.dupeZ(u8, rule.pattern) catch {
+            alloc.destroy(entry);
+            for (0..filled) |j| freeCOwnershipEntry(ptrs[j]);
+            alloc.free(ptrs);
+            return null;
+        };
+        entry.* = .{
+            .path_pattern = pat_z.ptr,
+            .worker_id = worker_id,
+            .allow_write = rule.allow_write,
+        };
+        ptrs[filled] = entry;
+        filled += 1;
+    }
+
+    if (count) |c| c.* = @intCast(rules.len);
+    return ptrs.ptr;
+}
+
+export fn tm_ownership_free(entries: ?[*]?*COwnershipEntry, count: u32) void {
+    const ptrs = entries orelse return;
+    for (0..count) |i| freeCOwnershipEntry(ptrs[i]);
+    std.heap.c_allocator.free(ptrs[0..count]);
+}
+
+fn freeCOwnershipEntry(ptr: ?*COwnershipEntry) void {
+    const entry = ptr orelse return;
+    freeNullTerminated(entry.path_pattern);
+    std.heap.c_allocator.destroy(entry);
+}
+
 // ─── Utility ─────────────────────────────────────────────
 
 export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
@@ -666,6 +766,7 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         4 => "TM_ERR_NO_AGENT", 5 => "TM_ERR_WORKTREE", 6 => "TM_ERR_PTY", 7 => "TM_ERR_CONFIG",
         8 => "TM_ERR_BUS", 9 => "TM_ERR_GITHUB", 10 => "TM_ERR_NOT_IMPLEMENTED",
         11 => "TM_ERR_TIMEOUT", 12 => "TM_ERR_INVALID_WORKER", 13 => "TM_ERR_ROLE",
+        14 => "TM_ERR_OWNERSHIP",
         else => "TM_ERR_UNKNOWN",
     };
 }
@@ -981,4 +1082,213 @@ test "tm_roles_list finds roles in project directory" {
     try std.testing.expect(found);
 }
 
-test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; }
+// ─── Ownership API tests ─────────────────────────────────
+
+test "tm_ownership_check null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_ownership_check(null, 0, null, null) == 99);
+}
+
+test "tm_ownership_register null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_ownership_register(null, 0, null, false) == 99);
+}
+
+test "tm_ownership_release null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_ownership_release(null, 0) == 99);
+}
+
+test "tm_ownership_get null engine returns null" {
+    var count: u32 = 42;
+    try std.testing.expect(tm_ownership_get(null, 0, &count) == null);
+    try std.testing.expect(count == 0);
+}
+
+test "tm_ownership_free handles null" {
+    tm_ownership_free(null, 0);
+}
+
+test "tm_ownership_check null file_path returns TM_ERR_OWNERSHIP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    var allowed: bool = false;
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, null, &allowed) == 14);
+}
+
+test "tm_ownership_register null pattern returns TM_ERR_OWNERSHIP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, null, true) == 14);
+}
+
+test "tm_ownership full cycle: register → check → release → check" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Register write + deny patterns
+    const write_pat = try std.testing.allocator.dupeZ(u8, "src/frontend/**");
+    defer std.testing.allocator.free(write_pat);
+    const deny_pat = try std.testing.allocator.dupeZ(u8, "src/backend/**");
+    defer std.testing.allocator.free(deny_pat);
+
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, write_pat.ptr, true) == 0);
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, deny_pat.ptr, false) == 0);
+
+    // Check allowed path
+    var allowed: bool = false;
+    const allowed_path = try std.testing.allocator.dupeZ(u8, "src/frontend/App.tsx");
+    defer std.testing.allocator.free(allowed_path);
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, allowed_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+
+    // Check denied path
+    const denied_path = try std.testing.allocator.dupeZ(u8, "src/backend/server.ts");
+    defer std.testing.allocator.free(denied_path);
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, denied_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == false);
+
+    // Release
+    try std.testing.expect(tm_ownership_release(engine_ptr, 1) == 0);
+
+    // After release, default allow
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, denied_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+}
+
+test "tm_ownership_get returns correct entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    const pat1 = try std.testing.allocator.dupeZ(u8, "src/**");
+    defer std.testing.allocator.free(pat1);
+    const pat2 = try std.testing.allocator.dupeZ(u8, "infra/**");
+    defer std.testing.allocator.free(pat2);
+
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, pat1.ptr, true) == 0);
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, pat2.ptr, false) == 0);
+
+    var count: u32 = 0;
+    const entries = tm_ownership_get(engine_ptr, 1, &count);
+    try std.testing.expect(count == 2);
+    try std.testing.expect(entries != null);
+    defer tm_ownership_free(entries, count);
+
+    // Verify first entry
+    try std.testing.expect(entries.?[0] != null);
+    try std.testing.expectEqualStrings("src/**", std.mem.span(entries.?[0].?.path_pattern.?));
+    try std.testing.expect(entries.?[0].?.worker_id == 1);
+    try std.testing.expect(entries.?[0].?.allow_write == true);
+
+    // Verify second entry
+    try std.testing.expect(entries.?[1] != null);
+    try std.testing.expectEqualStrings("infra/**", std.mem.span(entries.?[1].?.path_pattern.?));
+    try std.testing.expect(entries.?[1].?.worker_id == 1);
+    try std.testing.expect(entries.?[1].?.allow_write == false);
+}
+
+test "tm_ownership_get returns null when no rules" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    var count: u32 = 42;
+    try std.testing.expect(tm_ownership_get(engine_ptr, 99, &count) == null);
+    try std.testing.expect(count == 0);
+}
+
+test "tm_worker_dismiss releases ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    const e = engine_ptr.?;
+
+    // Set up a git repo so spawn/dismiss works
+    try worktree.runGit(std.testing.allocator, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.email", "test@test.com" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.name", "Test" });
+    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{root});
+    defer std.testing.allocator.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    try worktree.runGit(std.testing.allocator, root, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, root, &.{ "commit", "-m", "initial" });
+
+    // Spawn a worker
+    const name_z = try std.testing.allocator.dupeZ(u8, "/usr/bin/echo");
+    defer std.testing.allocator.free(name_z);
+    const worker_z = try std.testing.allocator.dupeZ(u8, "TestWorker");
+    defer std.testing.allocator.free(worker_z);
+    const task_z = try std.testing.allocator.dupeZ(u8, "test task");
+    defer std.testing.allocator.free(task_z);
+
+    const worker_id = tm_worker_spawn(engine_ptr, name_z.ptr, 0, worker_z.ptr, task_z.ptr);
+    try std.testing.expect(worker_id != 0xFFFFFFFF);
+
+    // Register ownership rules for this worker
+    const pat = try std.testing.allocator.dupeZ(u8, "src/**");
+    defer std.testing.allocator.free(pat);
+    try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, pat.ptr, true) == 0);
+
+    // Verify rules exist
+    var allowed: bool = false;
+    const check_path = try std.testing.allocator.dupeZ(u8, "src/foo.ts");
+    defer std.testing.allocator.free(check_path);
+    try std.testing.expect(tm_ownership_check(engine_ptr, worker_id, check_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+
+    // Dismiss worker — should release ownership
+    try std.testing.expect(tm_worker_dismiss(engine_ptr, worker_id) == 0);
+
+    // After dismiss, ownership released → default allow
+    // Need to check on a fresh engine call (worker no longer in roster but registry is separate)
+    try std.testing.expect(tm_ownership_check(engine_ptr, worker_id, check_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+
+    // Verify rules are gone via getRules
+    try std.testing.expect(e.ownership_registry.getRules(worker_id) == null);
+}
+
+test "tm_result_to_string maps TM_ERR_OWNERSHIP" {
+    try std.testing.expectEqualStrings("TM_ERR_OWNERSHIP", std.mem.span(tm_result_to_string(14)));
+}
+
+test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; }
