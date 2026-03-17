@@ -173,6 +173,7 @@ final class EngineClient: ObservableObject {
 
     /// Start the session (background threads, watchers, etc.).
     /// Wraps `tm_session_start()`. Must be called after `create`.
+    /// Also loads available roles via `loadAvailableRoles()`.
     /// Returns `true` on `TM_OK`.
     func sessionStart() -> Bool {
         guard let engine else {
@@ -330,7 +331,8 @@ final class EngineClient: ObservableObject {
     }
 
     /// Dismiss (tear down) a worker. Removes worktree, cleans up engine state.
-    /// Also unregisters the surface view.
+    /// Also unregisters the surface view and removes the cached role.
+    /// The engine releases ownership rules internally via `tm_ownership_release`.
     /// Wraps `tm_worker_dismiss()`.
     /// Returns `true` on `TM_OK`.
     func dismissWorker(_ workerId: UInt32) -> Bool {
@@ -350,6 +352,7 @@ final class EngineClient: ObservableObject {
         }
 
         unregisterSurface(for: workerId)
+        workerRoles.removeValue(forKey: workerId)
         refreshRoster()
         return true
     }
@@ -704,7 +707,18 @@ final class EngineClient: ObservableObject {
         }
 
         var count: UInt32 = 0
-        guard let rolesPtr = tm_roles_list(engine, &count), count > 0 else {
+        guard let rolesPtr = tm_roles_list(engine, &count) else {
+            if let msg = lastEngineError() {
+                Self.logger.error("loadAvailableRoles: tm_roles_list failed: \(msg)")
+            } else {
+                Self.logger.info("loadAvailableRoles: no roles found")
+            }
+            availableRoles = []
+            return
+        }
+
+        guard count > 0 else {
+            tm_roles_list_free(rolesPtr, count)
             Self.logger.info("loadAvailableRoles: no roles found (count=0)")
             availableRoles = []
             return
@@ -712,7 +726,10 @@ final class EngineClient: ObservableObject {
 
         var roles: [RoleDefinition] = []
         for i in 0..<Int(count) {
-            guard let rolePtr = rolesPtr[i] else { continue }
+            guard let rolePtr = rolesPtr[i] else {
+                Self.logger.warning("loadAvailableRoles: NULL role at index \(i) — skipping")
+                continue
+            }
             roles.append(bridgeRole(rolePtr))
         }
 
@@ -728,13 +745,18 @@ final class EngineClient: ObservableObject {
     }
 
     /// Check whether a worker is allowed to write to `filePath`.
-    /// Wraps `tm_ownership_check()`. Returns `true` when no rules
-    /// are registered (default allow), or when the worker's write
-    /// patterns grant access and no deny pattern matches.
+    /// Wraps `tm_ownership_check()`. Returns `true` when no rules are
+    /// registered (default allow), or when the path is permitted by the
+    /// worker's ownership rules. Deny patterns take precedence over
+    /// write patterns (see `tm_ownership_check` in teammux.h).
+    ///
+    /// On error, defaults to allow because the real enforcement layer is
+    /// stream-R8's git interceptor at the PTY level. This is advisory.
     func checkCapability(workerId: UInt32, filePath: String) -> Bool {
         guard let engine else {
-            Self.logger.warning("checkCapability: engine not created")
-            return true  // default allow when engine unavailable
+            lastError = "Capability check unavailable: engine not created"
+            Self.logger.error("checkCapability: engine not created — defaulting to allow for '\(filePath)'")
+            return true
         }
 
         var allowed = true
@@ -744,8 +766,9 @@ final class EngineClient: ObservableObject {
 
         if result != TM_OK {
             let msg = lastEngineError() ?? "tm_ownership_check failed (\(result.rawValue))"
-            Self.logger.error("checkCapability failed: \(msg)")
-            return true  // default allow on error
+            lastError = "Capability check failed: \(msg)"
+            Self.logger.error("checkCapability failed for worker \(workerId), path '\(filePath)': \(msg) — defaulting to allow")
+            return true
         }
 
         return allowed
@@ -757,7 +780,10 @@ final class EngineClient: ObservableObject {
     /// or fails to parse.
     /// Wraps `tm_role_resolve()` + `tm_role_free()`.
     private func resolveRole(id: String) -> RoleDefinition? {
-        guard let engine else { return nil }
+        guard let engine else {
+            Self.logger.warning("resolveRole: engine not created")
+            return nil
+        }
 
         var rolePtr: UnsafeMutablePointer<tm_role_t>?
         let result = id.withCString { cId in
@@ -765,6 +791,8 @@ final class EngineClient: ObservableObject {
         }
 
         guard result == TM_OK, let rolePtr else {
+            let msg = lastEngineError() ?? "tm_role_resolve failed (\(result.rawValue))"
+            Self.logger.error("resolveRole('\(id)') failed: \(msg)")
             return nil
         }
 
@@ -774,15 +802,19 @@ final class EngineClient: ObservableObject {
     }
 
     /// Bridge a `tm_role_t*` to a Swift `RoleDefinition`.
-    /// Extracts all string fields and iterates the `const char**` pattern arrays.
+    /// Extracts string fields, boolean capabilities, and iterates
+    /// the `const char**` pattern arrays.
     private func bridgeRole(_ rolePtr: UnsafeMutablePointer<tm_role_t>) -> RoleDefinition {
         let role = rolePtr.pointee
+        let roleId = String(cString: role.id)
 
         var writePatterns: [String] = []
         if let patternsPtr = role.write_patterns {
             for i in 0..<Int(role.write_pattern_count) {
                 if let cStr = patternsPtr[i] {
                     writePatterns.append(String(cString: cStr))
+                } else {
+                    Self.logger.warning("bridgeRole: NULL write_pattern at index \(i) for role '\(roleId)'")
                 }
             }
         }
@@ -792,18 +824,22 @@ final class EngineClient: ObservableObject {
             for i in 0..<Int(role.deny_write_pattern_count) {
                 if let cStr = patternsPtr[i] {
                     denyWritePatterns.append(String(cString: cStr))
+                } else {
+                    Self.logger.warning("bridgeRole: NULL deny_write_pattern at index \(i) for role '\(roleId)'")
                 }
             }
         }
 
         return RoleDefinition(
-            id: String(cString: role.id),
+            id: roleId,
             name: String(cString: role.name),
             division: String(cString: role.division),
             emoji: String(cString: role.emoji),
             description: String(cString: role.description),
             writePatterns: writePatterns,
-            denyWritePatterns: denyWritePatterns
+            denyWritePatterns: denyWritePatterns,
+            canPush: role.can_push,
+            canMerge: role.can_merge
         )
     }
 
@@ -811,7 +847,10 @@ final class EngineClient: ObservableObject {
     /// into the engine's ownership registry for a given worker.
     /// Wraps `tm_ownership_register()`.
     private func registerOwnership(workerId: UInt32, role: RoleDefinition) {
-        guard let engine else { return }
+        guard let engine else {
+            Self.logger.error("registerOwnership: engine not created — skipping \(role.writePatterns.count + role.denyWritePatterns.count) patterns for worker \(workerId)")
+            return
+        }
 
         for pattern in role.writePatterns {
             pattern.withCString { cPattern in

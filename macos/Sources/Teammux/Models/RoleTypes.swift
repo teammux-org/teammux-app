@@ -2,8 +2,9 @@ import Foundation
 
 // MARK: - RoleDivision
 
-/// The division a role belongs to, matching the `division` field in role TOML files.
-/// Raw values are the exact strings used in TOML (e.g. "project-management").
+/// The division a role belongs to. Raw values match the division strings
+/// returned by the C engine's `tm_role_t.division` field (e.g. "project-management").
+/// Use `RoleDivision(rawValue: role.division)` to convert from a `RoleDefinition`.
 enum RoleDivision: String, CaseIterable, Sendable {
     case engineering
     case design
@@ -30,6 +31,7 @@ enum RoleDivision: String, CaseIterable, Sendable {
 
 /// A resolved role definition, bridged from `tm_role_t` in teammux.h.
 /// `id` is the role identifier (e.g. "frontend-engineer") and serves as `Identifiable.id`.
+/// `division` is a raw string; use `RoleDivision(rawValue:)` for typed access.
 struct RoleDefinition: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
@@ -38,4 +40,6 @@ struct RoleDefinition: Identifiable, Hashable, Sendable {
     let description: String
     let writePatterns: [String]
     let denyWritePatterns: [String]
+    let canPush: Bool
+    let canMerge: Bool
 }

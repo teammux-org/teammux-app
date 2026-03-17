@@ -805,7 +805,9 @@ struct RoleDefinitionTests {
         emoji: String = "\u{1F3A8}",
         description: String = "React, Vue, UI implementation",
         writePatterns: [String] = ["src/frontend/**", "src/components/**"],
-        denyWritePatterns: [String] = ["src/backend/**", "infrastructure/**"]
+        denyWritePatterns: [String] = ["src/backend/**", "infrastructure/**"],
+        canPush: Bool = false,
+        canMerge: Bool = false
     ) -> RoleDefinition {
         RoleDefinition(
             id: id,
@@ -814,7 +816,9 @@ struct RoleDefinitionTests {
             emoji: emoji,
             description: description,
             writePatterns: writePatterns,
-            denyWritePatterns: denyWritePatterns
+            denyWritePatterns: denyWritePatterns,
+            canPush: canPush,
+            canMerge: canMerge
         )
     }
 
@@ -827,6 +831,18 @@ struct RoleDefinitionTests {
         #expect(role.description == "React, Vue, UI implementation")
         #expect(role.writePatterns == ["src/frontend/**", "src/components/**"])
         #expect(role.denyWritePatterns == ["src/backend/**", "infrastructure/**"])
+        #expect(role.canPush == false)
+        #expect(role.canMerge == false)
+    }
+
+    @Test func roleDefinitionCapabilityFlags() {
+        let lead = makeRole(id: "tech-lead", canPush: true, canMerge: true)
+        #expect(lead.canPush == true)
+        #expect(lead.canMerge == true)
+
+        let worker = makeRole(id: "frontend-engineer", canPush: false, canMerge: false)
+        #expect(worker.canPush == false)
+        #expect(worker.canMerge == false)
     }
 
     @Test func roleDefinitionIdentityById() {
