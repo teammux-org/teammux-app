@@ -27,6 +27,7 @@ pub const Engine = struct {
     message_bus: ?bus.MessageBus,
     github_client: github.GitHubClient,
     commands_watcher: ?commands.CommandWatcher,
+    role_watchers: hotreload.RoleWatcherMap,
     session_id: [8]u8,
     last_error: ?[]const u8,
     last_error_cstr: ?[*:0]u8,
@@ -54,6 +55,7 @@ pub const Engine = struct {
             .message_bus = null,
             .github_client = github.GitHubClient.init(allocator, null),
             .commands_watcher = null,
+            .role_watchers = hotreload.RoleWatcherMap.init(allocator),
             .session_id = sid,
             .last_error = null,
             .last_error_cstr = null,
@@ -70,6 +72,7 @@ pub const Engine = struct {
     }
 
     pub fn destroy(self: *Engine) void {
+        hotreload.destroyAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.deinit();
         if (self.config_watcher) |*w| w.deinit();
         if (self.message_bus) |*b| b.deinit();
@@ -143,6 +146,7 @@ pub const Engine = struct {
     }
 
     pub fn sessionStop(self: *Engine) void {
+        hotreload.stopAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.stop();
         if (self.config_watcher) |*w| w.stop();
         self.github_client.stopWebhooks();
@@ -295,6 +299,10 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
 }
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    // Stop and remove role watcher before dismiss
+    if (e.role_watchers.fetchRemove(worker_id)) |kv| {
+        kv.value.destroy();
+    }
     // Remove interceptor wrapper before worktree is deleted
     if (e.roster.getWorker(worker_id)) |w| {
         interceptor.remove(e.allocator, w.worktree_path) catch |err| {
@@ -1129,6 +1137,80 @@ export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
         return z.ptr;
     }
     return null;
+}
+
+// ─── Role hot-reload ─────────────────────────────────────
+
+export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u8, callback: ?*const fn (u32, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) c_int {
+    const e = engine orelse return 99;
+    const cb = callback orelse {
+        e.setError("tm_role_watch: callback must not be NULL") catch {};
+        return 13;
+    };
+    const rid = std.mem.span(role_id orelse {
+        e.setError("tm_role_watch: role_id must not be NULL") catch {};
+        return 13;
+    });
+
+    // Look up worker to get task_description and branch_name
+    const w = e.roster.getWorker(worker_id) orelse {
+        e.setError("tm_role_watch: worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    };
+
+    // Resolve role path
+    const role_path = config.resolveRolePath(e.allocator, rid, e.project_root) catch {
+        e.setError("tm_role_watch: role path resolution failed") catch {};
+        return 13;
+    };
+    if (role_path == null) {
+        e.setError("tm_role_watch: role not found in any search path") catch {};
+        return 13; // TM_ERR_ROLE
+    }
+    defer e.allocator.free(role_path.?);
+
+    // Remove existing watcher if any (idempotent re-watch)
+    if (e.role_watchers.fetchRemove(worker_id)) |kv| {
+        kv.value.destroy();
+    }
+
+    // Create and start watcher
+    const watcher = hotreload.RoleWatcher.create(
+        e.allocator,
+        worker_id,
+        rid,
+        role_path.?,
+        w.task_description,
+        w.branch_name,
+        e.project_root,
+        cb,
+        userdata,
+    ) catch {
+        e.setError("tm_role_watch: watcher creation failed") catch {};
+        return 99;
+    };
+
+    watcher.start() catch {
+        watcher.destroy();
+        e.setError("tm_role_watch: watcher start failed (cannot open role file)") catch {};
+        return 13;
+    };
+
+    e.role_watchers.put(worker_id, watcher) catch {
+        watcher.destroy();
+        e.setError("tm_role_watch: map insertion failed") catch {};
+        return 99;
+    };
+
+    return 0;
+}
+
+export fn tm_role_unwatch(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    if (e.role_watchers.fetchRemove(worker_id)) |kv| {
+        kv.value.destroy();
+    }
+    return 0; // Idempotent — no error if no watcher existed
 }
 
 // ─── Utility ─────────────────────────────────────────────

@@ -221,10 +221,8 @@ pub fn stopAll(map: *RoleWatcherMap) void {
 // Tests
 // ─────────────────────────────────────────────────────────
 
-fn writeTestRole(dir: std.fs.Dir, filename: []const u8, role_name: []const u8) !void {
-    const file = try dir.createFile(filename, .{});
-    defer file.close();
-    try file.writer().print(
+fn writeTestRole(alloc: std.mem.Allocator, dir: std.fs.Dir, filename: []const u8, role_name: []const u8) !void {
+    const content = try std.fmt.allocPrint(alloc,
         \\[identity]
         \\id = "test-role"
         \\name = "{s}"
@@ -234,6 +232,10 @@ fn writeTestRole(dir: std.fs.Dir, filename: []const u8, role_name: []const u8) !
         \\[context]
         \\mission = "Test mission"
     , .{role_name});
+    defer alloc.free(content);
+    const file = try dir.createFile(filename, .{});
+    defer file.close();
+    try file.writeAll(content);
 }
 
 test "hotreload - RoleWatcher create and destroy without start" {
@@ -264,7 +266,7 @@ test "hotreload - watcher detects NOTE_WRITE" {
     const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(tmp_path);
 
-    try writeTestRole(tmp.dir, "test-role.toml", "Original Role");
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Original Role");
 
     const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
     defer alloc.free(role_path);
@@ -302,7 +304,7 @@ test "hotreload - watcher detects NOTE_WRITE" {
     std.Thread.sleep(50 * std.time.ns_per_ms);
 
     // Write updated role file (NOTE_WRITE trigger)
-    try writeTestRole(tmp.dir, "test-role.toml", "Updated Role");
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Updated Role");
 
     // Wait for callback (up to 3 seconds)
     var waited: usize = 0;
@@ -322,7 +324,7 @@ test "hotreload - watcher detects NOTE_RENAME (vim save pattern)" {
     const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(tmp_path);
 
-    try writeTestRole(tmp.dir, "test-role.toml", "Original Role");
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Original Role");
 
     const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
     defer alloc.free(role_path);
@@ -359,7 +361,7 @@ test "hotreload - watcher detects NOTE_RENAME (vim save pattern)" {
 
     // Simulate vim save: rename old → backup, write new file at original path
     tmp.dir.rename("test-role.toml", "test-role.toml~") catch {};
-    try writeTestRole(tmp.dir, "test-role.toml", "Vim Saved Role");
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Vim Saved Role");
 
     // Wait for callback (up to 5 seconds — rename needs 100ms sleep + re-open)
     var waited: usize = 0;
@@ -379,7 +381,7 @@ test "hotreload - callback receives correct CLAUDE.md content" {
     const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(tmp_path);
 
-    try writeTestRole(tmp.dir, "test-role.toml", "Content Check Role");
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Content Check Role");
 
     const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
     defer alloc.free(role_path);
@@ -433,7 +435,7 @@ test "hotreload - callback receives correct CLAUDE.md content" {
     std.Thread.sleep(50 * std.time.ns_per_ms);
 
     // Trigger a write
-    try writeTestRole(tmp.dir, "test-role.toml", "Content Check Role");
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Content Check Role");
 
     var waited: usize = 0;
     while (waited < 30) : (waited += 1) {
@@ -456,7 +458,7 @@ test "hotreload - stop joins thread cleanly" {
     const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(tmp_path);
 
-    try writeTestRole(tmp.dir, "test-role.toml", "Stop Test");
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Stop Test");
 
     const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
     defer alloc.free(role_path);
@@ -499,8 +501,8 @@ test "hotreload - destroyAll cleans up map" {
     const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(tmp_path);
 
-    try writeTestRole(tmp.dir, "role-a.toml", "Role A");
-    try writeTestRole(tmp.dir, "role-b.toml", "Role B");
+    try writeTestRole(alloc, tmp.dir, "role-a.toml", "Role A");
+    try writeTestRole(alloc, tmp.dir, "role-b.toml", "Role B");
 
     const path_a = try std.fmt.allocPrint(alloc, "{s}/role-a.toml", .{tmp_path});
     defer alloc.free(path_a);
