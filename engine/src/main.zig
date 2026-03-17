@@ -677,7 +677,8 @@ export fn tm_roles_list_free(roles: ?[*]?*CRole, count: u32) void {
 }
 
 export fn tm_roles_list_bundled(project_root: ?[*:0]const u8, count: ?*u32) ?[*]?*CRole {
-    if (count) |c| c.* = 0;
+    const out_count = count orelse return null;
+    out_count.* = 0;
     const alloc = std.heap.c_allocator;
 
     const root: ?[]const u8 = if (project_root) |pr| std.mem.span(pr) else null;
@@ -786,7 +787,7 @@ export fn tm_roles_list_bundled(project_root: ?[*:0]const u8, count: ?*u32) ?[*]
         result[i] = ptr;
     }
     role_defs_transferred = true;
-    if (count) |c| c.* = @intCast(role_defs.items.len);
+    out_count.* = @intCast(role_defs.items.len);
     return result.ptr;
 }
 
@@ -1310,8 +1311,46 @@ test "tm_roles_list finds roles in project directory" {
 
 // ─── Bundled roles API tests ─────────────────────────────
 
-test "tm_roles_list_bundled null count pointer returns null" {
-    try std.testing.expect(tm_roles_list_bundled(null, null) == null);
+test "tm_roles_list_bundled null count pointer returns null even with roles present" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+
+    try tmp.dir.makePath(".teammux/roles");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".teammux/roles/null-count.toml",
+        .data =
+        \\[identity]
+        \\id = "null-count"
+        \\name = "Null Count"
+        \\division = "testing"
+        \\emoji = "n"
+        \\description = "test"
+        \\
+        \\[capabilities]
+        \\write = []
+        \\deny_write = []
+        \\can_push = false
+        \\can_merge = false
+        \\
+        \\[triggers_on]
+        \\events = []
+        \\
+        \\[context]
+        \\mission = "test"
+        \\focus = "test"
+        \\deliverables = []
+        \\rules = []
+        \\workflow = []
+        \\success_metrics = []
+        ,
+    });
+
+    // Roles exist but count is null — must return null (caller can't free without count)
+    try std.testing.expect(tm_roles_list_bundled(root_z.ptr, null) == null);
 }
 
 test "tm_roles_list_bundled null project_root returns null gracefully" {
