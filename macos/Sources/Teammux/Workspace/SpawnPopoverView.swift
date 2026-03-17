@@ -155,7 +155,8 @@ struct SpawnPopoverView: View {
                     ForEach(populatedDivisions, id: \.self) { division in
                         Section(division.displayName) {
                             ForEach(rolesForDivision(division)) { role in
-                                Text("\(role.emoji) \(role.name)").tag(Optional(role.id))
+                                Text(role.emoji.isEmpty ? role.name : "\(role.emoji) \(role.name)")
+                                    .tag(Optional(role.id))
                             }
                         }
                     }
@@ -228,7 +229,8 @@ struct SpawnPopoverView: View {
             }
 
             // Warn if requested role was not applied
-            if let roleId = selectedRoleId, engine.workerRoles[workerId] == nil {
+            if let roleId = selectedRoleId,
+               engine.workerRoles[workerId]?.id != roleId {
                 spawnError = "Worker spawned but role '\(roleId)' could not be applied"
                 return  // don't dismiss — let user see the warning
             }
