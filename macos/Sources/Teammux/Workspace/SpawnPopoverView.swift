@@ -3,8 +3,8 @@ import SwiftUI
 // MARK: - SpawnPopoverView
 
 /// Popover form for spawning a new worker agent.
-/// Collects task description, agent type, and optional worker name,
-/// then calls engine.spawnWorker() on submit.
+/// Collects task description, agent type, optional role ID, and optional
+/// worker name, then calls engine.spawnWorker() on submit.
 struct SpawnPopoverView: View {
     @ObservedObject var engine: EngineClient
     @Binding var isPresented: Bool
@@ -13,6 +13,7 @@ struct SpawnPopoverView: View {
     @State private var workerName: String = ""
     @State private var selectedAgentType: AgentTypeOption = .claudeCode
     @State private var customBinary: String = ""
+    @State private var selectedRoleId: String?
     @State private var isSpawning = false
     @State private var spawnError: String?
 
@@ -93,6 +94,9 @@ struct SpawnPopoverView: View {
                 }
             }
 
+            // Role picker — loaded or empty (loadAvailableRoles is synchronous)
+            rolePicker
+
             // Name field
             VStack(alignment: .leading, spacing: 4) {
                 Text("Name (optional)")
@@ -129,6 +133,69 @@ struct SpawnPopoverView: View {
         }
         .padding(16)
         .frame(width: 300)
+        .onAppear {
+            if engine.availableRoles.isEmpty {
+                engine.loadAvailableRoles()
+            }
+        }
+    }
+
+    // MARK: - Role picker
+
+    private var rolePicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Role")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+            if !engine.availableRoles.isEmpty {
+                // Loaded — grouped picker (only divisions with roles)
+                Picker("Role", selection: $selectedRoleId) {
+                    Text("No role (generic)").tag(Optional<String>.none)
+                    ForEach(populatedDivisions, id: \.self) { division in
+                        Section(division.displayName) {
+                            ForEach(rolesForDivision(division)) { role in
+                                Text(role.emoji.isEmpty ? role.name : "\(role.emoji) \(role.name)")
+                                    .tag(Optional(role.id))
+                            }
+                        }
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            } else {
+                // Empty — no roles found or load failed
+                HStack(spacing: 6) {
+                    Text("No roles available")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Button("Reload") {
+                        engine.loadAvailableRoles()
+                    }
+                    .font(.caption)
+                    .buttonStyle(.plain)
+                    .foregroundColor(.accentColor)
+                }
+            }
+
+            // Role description — shown after selection
+            if let roleId = selectedRoleId,
+               let role = engine.availableRoles.first(where: { $0.id == roleId }) {
+                Text(role.description)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    private var populatedDivisions: [RoleDivision] {
+        RoleDivision.allCases.filter { !rolesForDivision($0).isEmpty }
+    }
+
+    private func rolesForDivision(_ division: RoleDivision) -> [RoleDefinition] {
+        engine.availableRoles.filter { $0.division == division.rawValue }
     }
 
     // MARK: - Spawn action
@@ -137,7 +204,7 @@ struct SpawnPopoverView: View {
         isSpawning = true
         spawnError = nil
 
-        Task {
+        Task { @MainActor in
             let name = workerName.trimmingCharacters(in: .whitespacesAndNewlines)
             let resolvedName = name.isEmpty
                 ? "Worker \(engine.roster.count + 1)"
@@ -150,7 +217,8 @@ struct SpawnPopoverView: View {
                 agentBinary: binary,
                 agentType: agentType,
                 workerName: resolvedName,
-                taskDescription: taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                taskDescription: taskDescription.trimmingCharacters(in: .whitespacesAndNewlines),
+                roleId: selectedRoleId
             )
 
             isSpawning = false
@@ -159,6 +227,14 @@ struct SpawnPopoverView: View {
                 spawnError = engine.lastError ?? "Failed to spawn worker"
                 return  // don't dismiss
             }
+
+            // Warn if requested role was not applied
+            if let roleId = selectedRoleId,
+               engine.workerRoles[workerId]?.id != roleId {
+                spawnError = "Worker spawned but role '\(roleId)' could not be applied"
+                return  // don't dismiss — let user see the warning
+            }
+
             isPresented = false
         }
     }

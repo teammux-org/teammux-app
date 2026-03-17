@@ -6,8 +6,12 @@ import SwiftUI
 /// Shows status dot (color from WorkerStatus), worker name,
 /// truncated task description, and a dismiss button on hover.
 /// Active state shows accent-color left border and background highlight.
+/// When the worker has an assigned role, displays the role emoji before
+/// the name and the role name below the task description. A lock icon
+/// appears when the role has deny_write patterns.
 struct WorkerRow: View {
     let worker: WorkerInfo
+    let role: RoleDefinition?
     let isActive: Bool
     let onTap: () -> Void
     let onDismiss: () -> Void
@@ -26,6 +30,13 @@ struct WorkerRow: View {
                 .fill(worker.status.color)
                 .frame(width: 8, height: 8)
 
+            // Role emoji badge (only when role is assigned with non-empty emoji)
+            if let role, !role.emoji.isEmpty {
+                Text(role.emoji)
+                    .font(.system(size: 14))
+                    .accessibilityLabel("\(role.name) role")
+            }
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(worker.name)
                     .font(.system(size: 12, weight: .medium))
@@ -36,9 +47,25 @@ struct WorkerRow: View {
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+
+                // Role name (only when role is assigned)
+                if let role {
+                    Text(role.name)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
             }
 
             Spacer()
+
+            // Capability lock icon — shown when role has deny_write patterns
+            if let role, !role.denyWritePatterns.isEmpty {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .help("Restricted: \(role.denyWritePatterns.joined(separator: ", "))")
+            }
 
             // Dismiss button — visible on hover
             if isHovering {
