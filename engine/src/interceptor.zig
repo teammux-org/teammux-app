@@ -222,7 +222,7 @@ fn generateInterceptorScript(
     // Worker name for error messages
     try appendFmt(&buf, allocator, "WORKER_NAME='{s}'\n", .{worker_name});
 
-    // Known limitations: git commit -a bypass (TD12), combined short flags not parsed
+    // Known limitations: combined short flags for git-add not parsed
     try buf.appendSlice(allocator,
         \\
         \\# Detect git subcommand (skip global flags)
@@ -263,6 +263,20 @@ fn generateInterceptorScript(
         \\        exit 1
         \\      fi
         \\    done
+        \\  done
+        \\elif [[ "$subcmd" == "commit" ]]; then
+        \\  # Block commit -a/--all when deny patterns exist (TD12)
+        \\  for arg in "$@"; do
+        \\    case "$arg" in
+        \\      -a|--all|-a*)
+        \\        if [[ ${#DENY_PATTERNS[@]} -gt 0 ]]; then
+        \\          echo "[Teammux] Cannot use 'git commit -a' with write restrictions."
+        \\          echo "[Teammux] Stage files explicitly with 'git add' first."
+        \\          echo "[Teammux] Your write scope: $WRITE_SCOPE"
+        \\          exit 1
+        \\        fi
+        \\        ;;
+        \\    esac
         \\  done
         \\fi
         \\exec "$REAL_GIT" "$@"
@@ -536,4 +550,34 @@ test "interceptor - isSafeForShell rejects shell metacharacters" {
     try std.testing.expect(!isSafeForShell("src/a&bg"));
     try std.testing.expect(!isSafeForShell("src/a>redir"));
     try std.testing.expect(!isSafeForShell("src/a\nnewline"));
+}
+
+test "interceptor - wrapper contains commit -a interception block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{ "src/backend/**", "infrastructure/**" };
+    const write = [_][]const u8{ "src/frontend/**", "tests/**" };
+    try install(std.testing.allocator, path, 42, "Frontend Engineer", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Commit subcommand detection present
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"commit\"") != null);
+    // Flag detection: -a, --all, and combined flags like -am
+    try std.testing.expect(std.mem.indexOf(u8, content, "-a|--all|-a*)") != null);
+    // DENY_PATTERNS length check gates the block
+    try std.testing.expect(std.mem.indexOf(u8, content, "${#DENY_PATTERNS[@]} -gt 0") != null);
+    // Error messages
+    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot use 'git commit -a' with write restrictions.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Stage files explicitly with 'git add' first.") != null);
+    // Uses WRITE_SCOPE for scope display
+    try std.testing.expect(std.mem.indexOf(u8, content, "Your write scope: $WRITE_SCOPE") != null);
 }
