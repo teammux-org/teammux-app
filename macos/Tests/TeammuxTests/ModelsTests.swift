@@ -756,3 +756,114 @@ struct PRStateTests {
         #expect(PRState(fromCValue: 99) == .unknown)
     }
 }
+
+// MARK: - RoleDivision Tests
+
+@Suite
+struct RoleDivisionTests {
+
+    @Test func roleDivisionDisplayNames() {
+        #expect(RoleDivision.engineering.displayName == "Engineering")
+        #expect(RoleDivision.design.displayName == "Design")
+        #expect(RoleDivision.product.displayName == "Product")
+        #expect(RoleDivision.testing.displayName == "Testing")
+        #expect(RoleDivision.projectManagement.displayName == "Project Management")
+        #expect(RoleDivision.strategy.displayName == "Strategy")
+        #expect(RoleDivision.specialized.displayName == "Specialized")
+    }
+
+    @Test func roleDivisionRawValues() {
+        #expect(RoleDivision.engineering.rawValue == "engineering")
+        #expect(RoleDivision.design.rawValue == "design")
+        #expect(RoleDivision.product.rawValue == "product")
+        #expect(RoleDivision.testing.rawValue == "testing")
+        #expect(RoleDivision.projectManagement.rawValue == "project-management")
+        #expect(RoleDivision.strategy.rawValue == "strategy")
+        #expect(RoleDivision.specialized.rawValue == "specialized")
+    }
+
+    @Test func roleDivisionFromRawValue() {
+        #expect(RoleDivision(rawValue: "engineering") == .engineering)
+        #expect(RoleDivision(rawValue: "project-management") == .projectManagement)
+        #expect(RoleDivision(rawValue: "nonexistent") == nil)
+    }
+
+    @Test func roleDivisionCaseCount() {
+        #expect(RoleDivision.allCases.count == 7)
+    }
+}
+
+// MARK: - RoleDefinition Tests
+
+@Suite
+struct RoleDefinitionTests {
+
+    private func makeRole(
+        id: String = "frontend-engineer",
+        name: String = "Frontend Engineer",
+        division: String = "engineering",
+        emoji: String = "\u{1F3A8}",
+        description: String = "React, Vue, UI implementation",
+        writePatterns: [String] = ["src/frontend/**", "src/components/**"],
+        denyWritePatterns: [String] = ["src/backend/**", "infrastructure/**"]
+    ) -> RoleDefinition {
+        RoleDefinition(
+            id: id,
+            name: name,
+            division: division,
+            emoji: emoji,
+            description: description,
+            writePatterns: writePatterns,
+            denyWritePatterns: denyWritePatterns
+        )
+    }
+
+    @Test func roleDefinitionFieldAccess() {
+        let role = makeRole()
+        #expect(role.id == "frontend-engineer")
+        #expect(role.name == "Frontend Engineer")
+        #expect(role.division == "engineering")
+        #expect(role.emoji == "\u{1F3A8}")
+        #expect(role.description == "React, Vue, UI implementation")
+        #expect(role.writePatterns == ["src/frontend/**", "src/components/**"])
+        #expect(role.denyWritePatterns == ["src/backend/**", "infrastructure/**"])
+    }
+
+    @Test func roleDefinitionIdentityById() {
+        // Identifiable.id is the role id string
+        let role = makeRole(id: "backend-engineer")
+        #expect(role.id == "backend-engineer")
+    }
+
+    @Test func roleDefinitionEqualityByAllFields() {
+        let r1 = makeRole(id: "a", name: "A")
+        let r2 = makeRole(id: "a", name: "A")
+        #expect(r1 == r2)
+    }
+
+    @Test func roleDefinitionInequalityByDifferentId() {
+        let r1 = makeRole(id: "frontend-engineer")
+        let r2 = makeRole(id: "backend-engineer")
+        #expect(r1 != r2)
+    }
+
+    @Test func roleDefinitionInequalityByDifferentPatterns() {
+        let r1 = makeRole(writePatterns: ["src/**"])
+        let r2 = makeRole(writePatterns: ["lib/**"])
+        #expect(r1 != r2)
+    }
+
+    @Test func roleDefinitionEmptyPatterns() {
+        let role = makeRole(writePatterns: [], denyWritePatterns: [])
+        #expect(role.writePatterns.isEmpty)
+        #expect(role.denyWritePatterns.isEmpty)
+    }
+
+    @Test func roleDefinitionHashable() {
+        let r1 = makeRole(id: "a")
+        let r2 = makeRole(id: "b")
+        let r3 = makeRole(id: "a")
+        let set: Set<RoleDefinition> = [r1, r2, r3]
+        #expect(set.count == 2)
+    }
+}
