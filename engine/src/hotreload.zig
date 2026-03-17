@@ -232,9 +232,17 @@ pub const RoleWatcher = struct {
 // ─────────────────────────────────────────────────────────
 
 /// Stop and destroy all watchers in the map, then deinit the map itself.
+/// Uses two-pass shutdown: signal all watchers first, then join all threads.
+/// This bounds total shutdown time to ~1 second regardless of watcher count.
 pub fn destroyAll(map: *RoleWatcherMap) void {
-    var it = map.iterator();
-    while (it.next()) |entry| {
+    // Pass 1: signal all watchers to stop (non-blocking)
+    var it1 = map.iterator();
+    while (it1.next()) |entry| {
+        entry.value_ptr.*.running.store(false, .release);
+    }
+    // Pass 2: join threads and destroy (each bounded by 1s kevent timeout)
+    var it2 = map.iterator();
+    while (it2.next()) |entry| {
         entry.value_ptr.*.destroy();
     }
     map.deinit();
@@ -242,9 +250,16 @@ pub fn destroyAll(map: *RoleWatcherMap) void {
 
 /// Stop all running watchers without destroying them. Used by sessionStop
 /// to pause file watching while preserving watcher state for session restart.
+/// Uses two-pass shutdown: signal all, then join all.
 pub fn stopAll(map: *RoleWatcherMap) void {
-    var it = map.iterator();
-    while (it.next()) |entry| {
+    // Pass 1: signal all watchers to stop (non-blocking)
+    var it1 = map.iterator();
+    while (it1.next()) |entry| {
+        entry.value_ptr.*.running.store(false, .release);
+    }
+    // Pass 2: join all threads
+    var it2 = map.iterator();
+    while (it2.next()) |entry| {
         entry.value_ptr.*.stop();
     }
 }

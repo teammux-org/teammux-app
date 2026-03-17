@@ -620,6 +620,10 @@ export fn tm_merge_approve(engine: ?*Engine, worker_id: u32, strategy: ?[*:0]con
 }
 export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    // Stop and remove role watcher before reject
+    if (e.role_watchers.fetchRemove(worker_id)) |kv| {
+        kv.value.destroy();
+    }
     // Remove interceptor wrapper before worktree is deleted
     if (e.roster.getWorker(worker_id)) |w| {
         interceptor.remove(e.allocator, w.worktree_path) catch |err| {
