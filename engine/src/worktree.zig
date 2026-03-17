@@ -85,7 +85,9 @@ pub const Roster = struct {
         // 5. Write CLAUDE.md or AGENTS.md into worktree root
         errdefer {
             // Rollback: remove worktree if context file write fails
-            runGit(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }) catch {};
+            runGit(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }) catch |err| {
+                std.log.warn("[teammux] rollback worktree remove failed for {s}: {}", .{ wt_path, err });
+            };
         }
         try writeContextFile(self.allocator, wt_path, agent_type, task_description, null, branch);
 
@@ -221,7 +223,8 @@ pub fn slugify(allocator: std.mem.Allocator, input: []const u8, max_len: usize) 
 /// Write CLAUDE.md (for Claude Code) or AGENTS.md (for all other agents)
 /// into the worktree root with task context. When a RoleDefinition is provided
 /// and agent_type is claude_code, generates a rich role-aware CLAUDE.md instead
-/// of the generic template.
+/// of the generic template. For non-claude_code agents, role_def is ignored
+/// and the generic template is always used.
 pub fn writeContextFile(
     allocator: std.mem.Allocator,
     worktree_path: []const u8,
@@ -250,7 +253,8 @@ pub fn writeContextFile(
 }
 
 /// Generate a rich CLAUDE.md from a role definition, task description, and branch name.
-/// Sections with empty arrays are omitted to produce clean markdown.
+/// Empty sections (arrays with no items, strings with zero length) are omitted to
+/// produce clean markdown.
 fn generateRoleClaude(
     allocator: std.mem.Allocator,
     role_def: config.RoleDefinition,
@@ -314,7 +318,7 @@ fn generateRoleClaude(
         try buf.appendSlice(allocator, "## Rules (non-negotiable)\n");
         for (role_def.rules, 0..) |rule, i| {
             var num_buf: [20]u8 = undefined;
-            const num = std.fmt.bufPrint(&num_buf, "{d}. ", .{i + 1}) catch unreachable;
+            const num = try std.fmt.bufPrint(&num_buf, "{d}. ", .{i + 1});
             try buf.appendSlice(allocator, num);
             try buf.appendSlice(allocator, rule);
             try buf.appendSlice(allocator, "\n");
@@ -327,7 +331,7 @@ fn generateRoleClaude(
         try buf.appendSlice(allocator, "## Workflow\n");
         for (role_def.workflow, 0..) |step, i| {
             var num_buf: [20]u8 = undefined;
-            const num = std.fmt.bufPrint(&num_buf, "{d}. ", .{i + 1}) catch unreachable;
+            const num = try std.fmt.bufPrint(&num_buf, "{d}. ", .{i + 1});
             try buf.appendSlice(allocator, num);
             try buf.appendSlice(allocator, step);
             try buf.appendSlice(allocator, "\n");
@@ -666,6 +670,72 @@ test "worktree - generateRoleClaude omits empty sections" {
     // Empty mission/focus must not produce empty bold markers
     try std.testing.expect(std.mem.indexOf(u8, content, "**Mission:**") == null);
     try std.testing.expect(std.mem.indexOf(u8, content, "**Focus:**") == null);
+}
+
+test "worktree - generateRoleClaude partial ownership deny only" {
+    var empty = [_][]const u8{};
+    var deny_pats = [_][]const u8{ "src/backend/**", "infra/**" };
+
+    const role_def = config.RoleDefinition{
+        .id = "partial-role",
+        .name = "Partial Role",
+        .division = "testing",
+        .emoji = "",
+        .description = "Role with deny patterns but no write patterns",
+        .write_patterns = &empty,
+        .deny_write_patterns = &deny_pats,
+        .can_push = false,
+        .can_merge = false,
+        .trigger_events = &empty,
+        .mission = "",
+        .focus = "",
+        .deliverables = &empty,
+        .rules = &empty,
+        .workflow = &empty,
+        .success_metrics = &empty,
+    };
+
+    const content = try generateRoleClaude(std.testing.allocator, role_def, "task", "branch");
+    defer std.testing.allocator.free(content);
+
+    // Ownership section should appear with deny sub-section only
+    try std.testing.expect(std.mem.indexOf(u8, content, "## What you own in this worktree") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "must NOT modify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- `src/backend/**`") != null);
+    // Write access sub-section should be absent
+    try std.testing.expect(std.mem.indexOf(u8, content, "**Write access:**") == null);
+}
+
+test "worktree - generateRoleClaude partial done deliverables only" {
+    var empty = [_][]const u8{};
+    var deliverables = [_][]const u8{ "Feature complete", "Tests pass" };
+
+    const role_def = config.RoleDefinition{
+        .id = "partial-done",
+        .name = "Partial Done",
+        .division = "testing",
+        .emoji = "",
+        .description = "Role with deliverables but no success metrics",
+        .write_patterns = &empty,
+        .deny_write_patterns = &empty,
+        .can_push = false,
+        .can_merge = false,
+        .trigger_events = &empty,
+        .mission = "",
+        .focus = "",
+        .deliverables = &deliverables,
+        .rules = &empty,
+        .workflow = &empty,
+        .success_metrics = &empty,
+    };
+
+    const content = try generateRoleClaude(std.testing.allocator, role_def, "task", "branch");
+    defer std.testing.allocator.free(content);
+
+    // Definition of done section should appear with deliverables only
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Definition of done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- [ ] Feature complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- [ ] Tests pass") != null);
 }
 
 test "worktree - writeContextFile with role produces role-aware CLAUDE.md" {
