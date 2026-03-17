@@ -564,3 +564,192 @@ test "worktree - dismiss removes directory keeps branch (integration)" {
     try std.testing.expect(roster.getWorker(id) == null);
     try std.testing.expect(roster.count() == 0);
 }
+
+test "worktree - generateRoleClaude contains all role sections" {
+    var write_pats = [_][]const u8{ "src/frontend/**", "tests/frontend/**" };
+    var deny_pats = [_][]const u8{ "src/backend/**", "src/api/**" };
+    var rules = [_][]const u8{ "Never modify backend files", "Always write tests" };
+    var workflow_steps = [_][]const u8{ "Read the task", "Implement the solution", "Write tests" };
+    var deliverables = [_][]const u8{"Working components with tests"};
+    var metrics = [_][]const u8{ "Tests pass", "No regressions" };
+    var triggers = [_][]const u8{};
+
+    const role_def = config.RoleDefinition{
+        .id = "frontend-engineer",
+        .name = "Frontend Engineer",
+        .division = "engineering",
+        .emoji = "",
+        .description = "React, Vue, UI implementation",
+        .write_patterns = &write_pats,
+        .deny_write_patterns = &deny_pats,
+        .can_push = false,
+        .can_merge = false,
+        .trigger_events = &triggers,
+        .mission = "Build pixel-perfect UI components",
+        .focus = "Component architecture and accessibility",
+        .deliverables = &deliverables,
+        .rules = &rules,
+        .workflow = &workflow_steps,
+        .success_metrics = &metrics,
+    };
+
+    const content = try generateRoleClaude(std.testing.allocator, role_def, "Implement the login form", "feat/login-form");
+    defer std.testing.allocator.free(content);
+
+    // Header
+    try std.testing.expect(std.mem.indexOf(u8, content, "# Frontend Engineer") != null);
+    // Role section with description, mission, focus
+    try std.testing.expect(std.mem.indexOf(u8, content, "React, Vue, UI implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "**Mission:** Build pixel-perfect UI components") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "**Focus:** Component architecture and accessibility") != null);
+    // Task description
+    try std.testing.expect(std.mem.indexOf(u8, content, "Implement the login form") != null);
+    // Write patterns as bullet list
+    try std.testing.expect(std.mem.indexOf(u8, content, "- `src/frontend/**`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- `tests/frontend/**`") != null);
+    // Deny write patterns
+    try std.testing.expect(std.mem.indexOf(u8, content, "- `src/backend/**`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- `src/api/**`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "must NOT modify") != null);
+    // Rules (numbered)
+    try std.testing.expect(std.mem.indexOf(u8, content, "1. Never modify backend files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "2. Always write tests") != null);
+    // Workflow (numbered)
+    try std.testing.expect(std.mem.indexOf(u8, content, "1. Read the task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "3. Write tests") != null);
+    // Deliverables and metrics (checkboxes)
+    try std.testing.expect(std.mem.indexOf(u8, content, "- [ ] Working components with tests") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- [ ] Tests pass") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "- [ ] No regressions") != null);
+    // Branch name in coordination section
+    try std.testing.expect(std.mem.indexOf(u8, content, "- Branch: feat/login-form") != null);
+    // Coordination commands
+    try std.testing.expect(std.mem.indexOf(u8, content, "/teammux-complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "/teammux-question") != null);
+}
+
+test "worktree - generateRoleClaude omits empty sections" {
+    var empty = [_][]const u8{};
+
+    const role_def = config.RoleDefinition{
+        .id = "minimal-role",
+        .name = "Minimal Role",
+        .division = "testing",
+        .emoji = "",
+        .description = "A minimal role for testing",
+        .write_patterns = &empty,
+        .deny_write_patterns = &empty,
+        .can_push = false,
+        .can_merge = false,
+        .trigger_events = &empty,
+        .mission = "",
+        .focus = "",
+        .deliverables = &empty,
+        .rules = &empty,
+        .workflow = &empty,
+        .success_metrics = &empty,
+    };
+
+    const content = try generateRoleClaude(std.testing.allocator, role_def, "test task", "test-branch");
+    defer std.testing.allocator.free(content);
+
+    // Core sections always present
+    try std.testing.expect(std.mem.indexOf(u8, content, "# Minimal Role") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Your role") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Your mission for this task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Teammux coordination") != null);
+    // Empty sections must be omitted
+    try std.testing.expect(std.mem.indexOf(u8, content, "## What you own") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Rules") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Workflow") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Definition of done") == null);
+    // Empty mission/focus must not produce empty bold markers
+    try std.testing.expect(std.mem.indexOf(u8, content, "**Mission:**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "**Focus:**") == null);
+}
+
+test "worktree - writeContextFile with role produces role-aware CLAUDE.md" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    var write_pats = [_][]const u8{"src/**"};
+    var deny_pats = [_][]const u8{"infra/**"};
+    var rules = [_][]const u8{"Test everything"};
+    var workflow_steps = [_][]const u8{"Read specs first"};
+    var deliverables = [_][]const u8{"Passing tests"};
+    var empty = [_][]const u8{};
+
+    const role_def = config.RoleDefinition{
+        .id = "test-engineer",
+        .name = "Test Engineer",
+        .division = "testing",
+        .emoji = "",
+        .description = "Testing specialist",
+        .write_patterns = &write_pats,
+        .deny_write_patterns = &deny_pats,
+        .can_push = false,
+        .can_merge = false,
+        .trigger_events = &empty,
+        .mission = "Ensure quality",
+        .focus = "Test coverage",
+        .deliverables = &deliverables,
+        .rules = &rules,
+        .workflow = &workflow_steps,
+        .success_metrics = &empty,
+    };
+
+    try writeContextFile(std.testing.allocator, path, .claude_code, "write unit tests", role_def, "feat/unit-tests");
+
+    const file = try tmp.dir.openFile("CLAUDE.md", .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Should contain role-aware content, not generic
+    try std.testing.expect(std.mem.indexOf(u8, content, "# Test Engineer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Teammux Worker Context") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "feat/unit-tests") != null);
+}
+
+test "worktree - writeContextFile non-claude agent with role gets generic AGENTS.md" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    var write_pats = [_][]const u8{"src/**"};
+    var empty = [_][]const u8{};
+
+    const role_def = config.RoleDefinition{
+        .id = "test-role",
+        .name = "Test Role",
+        .division = "testing",
+        .emoji = "",
+        .description = "test",
+        .write_patterns = &write_pats,
+        .deny_write_patterns = &empty,
+        .can_push = false,
+        .can_merge = false,
+        .trigger_events = &empty,
+        .mission = "",
+        .focus = "",
+        .deliverables = &empty,
+        .rules = &empty,
+        .workflow = &empty,
+        .success_metrics = &empty,
+    };
+
+    try writeContextFile(std.testing.allocator, path, .codex_cli, "codex task", role_def, "test-branch");
+
+    // Should produce AGENTS.md with generic content, role ignored
+    const file = try tmp.dir.openFile("AGENTS.md", .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 1024 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Teammux Worker Context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Test Role") == null);
+    // No CLAUDE.md should exist
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("CLAUDE.md", .{}));
+}
