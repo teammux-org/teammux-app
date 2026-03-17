@@ -329,6 +329,14 @@ final class EngineClient: ObservableObject {
             }
         }
 
+        // Install git interceptor wrapper. The wrapper intercepts `git add`
+        // and blocks files matching deny_write patterns. Workers with no role
+        // or no deny patterns get a pass-through wrapper.
+        let interceptResult = tm_interceptor_install(engine, workerId)
+        if interceptResult != TM_OK {
+            Self.logger.warning("spawnWorker: interceptor install failed for worker \(workerId) (code \(interceptResult.rawValue))")
+        }
+
         // Refresh the roster to pick up the new worker
         refreshRoster()
 
@@ -777,6 +785,19 @@ final class EngineClient: ObservableObject {
         }
 
         return allowed
+    }
+
+    /// Get the absolute path to the interceptor directory for a worker.
+    /// The caller prepends this to PATH in the worker's PTY environment so
+    /// that the wrapper script shadows the real git binary.
+    /// Returns `nil` if no interceptor is installed or the worker is not found.
+    /// Wraps `tm_interceptor_path()` + `tm_free_string()`.
+    func interceptorPath(for workerId: UInt32) -> String? {
+        guard let engine else { return nil }
+        guard let cStr = tm_interceptor_path(engine, workerId) else { return nil }
+        let path = String(cString: cStr)
+        tm_free_string(cStr)
+        return path
     }
 
     // MARK: - Private: Role helpers
