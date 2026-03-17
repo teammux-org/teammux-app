@@ -481,17 +481,27 @@ const char* tm_interceptor_path(tm_engine_t* engine, uint32_t worker_id);
 // -----------------------------------------------------------------
 
 // Callback fired when a watched role TOML file changes.
-// new_claude_md is the regenerated CLAUDE.md content as a C string.
-// Memory ownership: engine allocates, valid only during the callback.
-// Caller must copy if needed beyond callback scope.
+// new_claude_md is the regenerated CLAUDE.md content, or NULL if the role
+// file failed to parse (syntax error, unreadable, etc.).
+//
+// THREADING: Invoked on a per-watcher background thread (NOT the engine's
+// internal thread). Callbacks for different workers may fire concurrently.
+// Caller must dispatch to the main thread for UI updates and must not
+// call back into tm_role_watch/tm_role_unwatch from within the callback.
+//
+// Memory ownership: allocated by the watcher, freed immediately after
+// callback returns. Pointer is valid only for the duration of this call.
+// Caller must copy if the content is needed beyond callback scope.
 typedef void (*tm_role_changed_cb)(uint32_t worker_id,
                                     const char* new_claude_md,
                                     void* userdata);
 
 // Start watching the role TOML file for a worker. When the file changes
-// (write, rename, delete+recreate), the engine re-parses the role definition,
-// regenerates CLAUDE.md, and fires the callback with the new content.
+// (write, rename, delete+recreate, attribute change), the engine re-parses
+// the role definition, regenerates CLAUDE.md, and fires the callback with
+// the new content.
 // role_id is resolved to a file path via the standard search order.
+// callback and role_id must not be NULL; returns TM_ERR_ROLE if either is NULL.
 // Returns TM_ERR_ROLE if role_id cannot be resolved.
 // Returns TM_ERR_INVALID_WORKER if worker_id is not in the roster.
 tm_result_t tm_role_watch(tm_engine_t* engine,

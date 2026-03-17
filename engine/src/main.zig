@@ -153,7 +153,10 @@ pub const Engine = struct {
     }
 
     fn setError(self: *Engine, msg: []const u8) !void {
-        if (self.last_error) |old| self.allocator.free(old);
+        if (self.last_error) |old| {
+            self.allocator.free(old);
+            self.last_error = null; // Prevent use-after-free if dupe fails
+        }
         self.last_error = try self.allocator.dupe(u8, msg);
     }
 
@@ -1144,6 +1147,7 @@ export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
 export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u8, callback: ?*const fn (u32, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) c_int {
     const e = engine orelse return 99;
     const cb = callback orelse {
+        // No dedicated TM_ERR_INVALID_ARG; reusing TM_ERR_ROLE for parameter errors
         e.setError("tm_role_watch: callback must not be NULL") catch {};
         return 13;
     };
@@ -1152,29 +1156,27 @@ export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u
         return 13;
     });
 
-    // Look up worker to get task_description and branch_name
     const w = e.roster.getWorker(worker_id) orelse {
         e.setError("tm_role_watch: worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     };
 
-    // Resolve role path
-    const role_path = config.resolveRolePath(e.allocator, rid, e.project_root) catch {
+    const role_path = config.resolveRolePath(e.allocator, rid, e.project_root) catch |err| {
+        std.log.warn("[teammux] tm_role_watch: role path resolution failed for '{s}': {}", .{ rid, err });
         e.setError("tm_role_watch: role path resolution failed") catch {};
         return 13;
     };
     if (role_path == null) {
+        std.log.warn("[teammux] tm_role_watch: role '{s}' not found in any search path", .{rid});
         e.setError("tm_role_watch: role not found in any search path") catch {};
         return 13; // TM_ERR_ROLE
     }
     defer e.allocator.free(role_path.?);
 
-    // Remove existing watcher if any (idempotent re-watch)
     if (e.role_watchers.fetchRemove(worker_id)) |kv| {
         kv.value.destroy();
     }
 
-    // Create and start watcher
     const watcher = hotreload.RoleWatcher.create(
         e.allocator,
         worker_id,
@@ -1185,19 +1187,22 @@ export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u
         e.project_root,
         cb,
         userdata,
-    ) catch {
+    ) catch |err| {
+        std.log.warn("[teammux] tm_role_watch: watcher creation failed for worker {d}: {}", .{ worker_id, err });
         e.setError("tm_role_watch: watcher creation failed") catch {};
         return 99;
     };
 
-    watcher.start() catch {
+    watcher.start() catch |err| {
         watcher.destroy();
-        e.setError("tm_role_watch: watcher start failed (cannot open role file)") catch {};
+        std.log.warn("[teammux] tm_role_watch: watcher start failed for worker {d} role '{s}': {}", .{ worker_id, rid, err });
+        e.setError("tm_role_watch: watcher start failed") catch {};
         return 13;
     };
 
-    e.role_watchers.put(worker_id, watcher) catch {
+    e.role_watchers.put(worker_id, watcher) catch |err| {
         watcher.destroy();
+        std.log.warn("[teammux] tm_role_watch: map insertion failed for worker {d}: {}", .{ worker_id, err });
         e.setError("tm_role_watch: map insertion failed") catch {};
         return 99;
     };
