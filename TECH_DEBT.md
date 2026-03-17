@@ -22,6 +22,8 @@
 
 | ID   | Module                      | Issue                                                              | Stream        | Breaking | Status |
 |------|-----------------------------|--------------------------------------------------------------------|---------------|----------|--------|
+| TD9  | interceptor.zig             | PTY git wrapper installed but not yet enforced via PATH injection  | stream-R8     | NO       | RESOLVED |
+| TD12 | interceptor.zig             | `git commit -a` bypasses interceptor — not intercepted by wrapper  | v0.2          | NO       | DEFERRED |
 | TD13 | commands.zig / EngineClient | /teammux-complete and /teammux-question have no Swift-side handlers | stream future | NO       | OPEN   |
 
 ## Notes
@@ -29,5 +31,7 @@
 - TD5 adds new functions to teammux.h. stream-B1 owns the header changes. stream-B2 consumes them.
 - TD8: ConflictInfo.conflictType is a raw String. Deferred to v0.2 — only 2 engine values (content/unknown), displayed as-is in ConflictView. Consider an enum once engine's conflict type vocabulary is stable.
 - Merge order: A1 → A2 → B1 → B2 → C1
+- TD9: interceptor.zig writes a bash wrapper to {worktree}/.git-wrapper/git that intercepts `git add` and blocks denied files. The wrapper is installed at spawn and removed at dismiss/reject. PATH injection (prepending .git-wrapper to PATH in Ghostty SurfaceConfiguration) is done via tm_interceptor_path — Swift calls this to get the path, then sets it in the PTY environment.
+- TD12: `git commit -a` (and `git commit --all`) bypasses the interceptor because the wrapper only intercepts `git add`. A worker using `git commit -a` can stage and commit denied files in a single command. Deferred to v0.2 — add `commit` subcommand interception with `-a`/`--all` flag detection.
 - TD13: Worker CLAUDE.md documents /teammux-complete and /teammux-question as coordination commands. The Zig command watcher dispatches them correctly. Swift-side EngineClient handlers that act on these commands are not yet implemented. Add handlers in a future stream once Team Lead coordination workflow is built out.
 

@@ -395,6 +395,30 @@ tm_ownership_entry_t** tm_ownership_get(tm_engine_t* engine,
 // Free entries returned by tm_ownership_get.
 void tm_ownership_free(tm_ownership_entry_t** entries, uint32_t count);
 
+// -----------------------------------------------------------------
+// Git interceptor
+// -----------------------------------------------------------------
+
+// Install a git wrapper script into the worker's worktree that intercepts
+// `git add` and blocks files matching deny patterns. Reads deny and write
+// patterns from rules previously registered via tm_ownership_register().
+// If no deny patterns are registered, installs a pass-through wrapper.
+// Returns TM_ERR_WORKTREE if pattern contains shell metacharacters or
+// git binary cannot be found on PATH.
+tm_result_t tm_interceptor_install(tm_engine_t* engine, uint32_t worker_id);
+
+// Remove the git wrapper script from the worker's worktree.
+// The interceptor is automatically cleaned up by tm_worker_dismiss and
+// tm_merge_reject. This function is available for explicit removal.
+// Idempotent — safe to call even if no interceptor was installed.
+tm_result_t tm_interceptor_remove(tm_engine_t* engine, uint32_t worker_id);
+
+// Get the absolute path to the interceptor directory for a worker.
+// Returns NULL if no interceptor is installed or worker not found.
+// Caller prepends this path to PATH when launching the worker's PTY.
+// Returned string must be freed with tm_free_string().
+const char* tm_interceptor_path(tm_engine_t* engine, uint32_t worker_id);
+
 #ifdef __cplusplus
 }
 #endif
