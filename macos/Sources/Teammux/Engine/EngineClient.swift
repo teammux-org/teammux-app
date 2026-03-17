@@ -329,12 +329,15 @@ final class EngineClient: ObservableObject {
             }
         }
 
-        // Install git interceptor wrapper. The wrapper intercepts `git add`
-        // and blocks files matching deny_write patterns. Workers with no role
-        // or no deny patterns get a pass-through wrapper.
+        // Install git interceptor wrapper. Called unconditionally — the engine
+        // reads deny_write patterns from the ownership registry and embeds them
+        // in the wrapper script. Workers with no registered deny patterns
+        // (including those with no role) get a pass-through wrapper.
         let interceptResult = tm_interceptor_install(engine, workerId)
         if interceptResult != TM_OK {
-            Self.logger.warning("spawnWorker: interceptor install failed for worker \(workerId) (code \(interceptResult.rawValue))")
+            let msg = lastEngineError() ?? "tm_interceptor_install failed (\(interceptResult.rawValue))"
+            lastError = "Worker \(workerId) spawned but file enforcement is disabled: \(msg)"
+            Self.logger.error("spawnWorker: interceptor install failed for worker \(workerId): \(msg) — worker will operate WITHOUT file deny enforcement")
         }
 
         // Refresh the roster to pick up the new worker
@@ -793,7 +796,10 @@ final class EngineClient: ObservableObject {
     /// Returns `nil` if no interceptor is installed or the worker is not found.
     /// Wraps `tm_interceptor_path()` + `tm_free_string()`.
     func interceptorPath(for workerId: UInt32) -> String? {
-        guard let engine else { return nil }
+        guard let engine else {
+            Self.logger.error("interceptorPath: engine not created — worker \(workerId) will have no git interception")
+            return nil
+        }
         guard let cStr = tm_interceptor_path(engine, workerId) else { return nil }
         let path = String(cString: cStr)
         tm_free_string(cStr)

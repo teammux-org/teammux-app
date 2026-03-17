@@ -343,6 +343,12 @@ struct EngineClientTests {
         #expect(client.lastError == "Engine not created")
     }
 
+    @Test func interceptorPathWithoutEngine() {
+        let client = EngineClient()
+        let path = client.interceptorPath(for: 1)
+        #expect(path == nil)
+    }
+
     // MARK: - Double create guard
 
     @Test func doubleCreatePrevented() {

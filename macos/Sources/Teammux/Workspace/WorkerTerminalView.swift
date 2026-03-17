@@ -34,6 +34,8 @@ struct WorkerTerminalView: NSViewRepresentable {
                 ?? ProcessInfo.processInfo.environment["PATH"]
                 ?? "/usr/bin:/usr/local/bin"
             config.environmentVariables["PATH"] = "\(interceptorDir):\(existingPath)"
+        } else {
+            Self.logger.warning("No interceptor path for worker \(worker.id) — git interception will not be active")
         }
 
         // Send the task description as initial input so the agent

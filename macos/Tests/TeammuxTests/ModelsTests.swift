@@ -677,6 +677,13 @@ struct ConflictInfoTests {
         #expect(ConflictType.content.displayName == "Content conflict")
         #expect(ConflictType.unknown.displayName == "Unknown conflict")
     }
+
+    @Test func conflictInfoInequalityByType() {
+        let id = UUID()
+        let c1 = ConflictInfo(id: id, filePath: "a.swift", conflictType: .content)
+        let c2 = ConflictInfo(id: id, filePath: "a.swift", conflictType: .unknown)
+        #expect(c1 != c2)
+    }
 }
 
 // MARK: - Project Tests

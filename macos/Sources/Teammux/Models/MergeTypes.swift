@@ -50,13 +50,24 @@ enum MergeStatus: Int, CaseIterable, Sendable {
 // MARK: - ConflictType
 
 /// Type-safe conflict classification from the engine's `tm_conflict_t.conflict_type` string.
-/// Currently the engine produces "content" and "unknown"; any unrecognised value maps to `.unknown`.
+/// Recognised values have dedicated cases; unrecognised strings fall back to `.unknown`.
+/// Add new cases here as the engine's conflict type vocabulary grows.
 enum ConflictType: String, Sendable {
     case content = "content"
     case unknown = "unknown"
 
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "ConflictType")
+
     init(rawString: String) {
-        self = ConflictType(rawValue: rawString) ?? .unknown
+        if let known = ConflictType(rawValue: rawString) {
+            self = known
+        } else {
+            #if DEBUG
+            assertionFailure("Unknown ConflictType raw string: \(rawString)")
+            #endif
+            Self.logger.warning("Unknown ConflictType raw string: \(rawString), defaulting to .unknown")
+            self = .unknown
+        }
     }
 
     var displayName: String {
