@@ -22,7 +22,7 @@ pub const RoleWatcher = struct {
     task_description: []const u8,
     branch_name: []const u8,
     project_root: []const u8, // non-owning — Engine outlives watcher
-    kq: i32,
+    kq: std.posix.fd_t,
     watch_fd: std.posix.fd_t,
     callback: RoleChangedCb,
     userdata: ?*anyopaque,
@@ -31,6 +31,8 @@ pub const RoleWatcher = struct {
 
     /// Heap-allocate a new RoleWatcher. All string arguments are copied (owned).
     /// project_root is stored as a non-owning reference — Engine must outlive the watcher.
+    /// The allocator must be thread-safe (e.g., c_allocator) — fireCallback uses it
+    /// on the watcher thread.
     pub fn create(
         allocator: std.mem.Allocator,
         worker_id: worktree.WorkerId,
@@ -71,38 +73,51 @@ pub const RoleWatcher = struct {
     }
 
     /// Open the role file for kqueue watching and spawn the watcher thread.
+    /// Returns error.AlreadyStarted if called on a watcher that is already running.
     pub fn start(self: *RoleWatcher) !void {
+        if (self.thread != null) return error.AlreadyStarted;
+
         const file = std.fs.openFileAbsolute(self.role_path, .{}) catch |err| {
             std.log.warn("[teammux] hotreload: cannot open role file '{s}': {}", .{ self.role_path, err });
             return err;
         };
         self.watch_fd = file.handle;
-        // Intentionally NOT closing — we keep the fd for kqueue
+        // Intentionally NOT closing — fd kept open for kqueue; closed by destroy()
+        errdefer {
+            std.posix.close(self.watch_fd);
+            self.watch_fd = -1;
+        }
 
         self.kq = try std.posix.kqueue();
-        self.running.store(true, .release);
+        errdefer {
+            std.posix.close(self.kq);
+            self.kq = -1;
+        }
 
+        self.running.store(true, .release);
         self.thread = try std.Thread.spawn(.{}, watchLoop, .{self});
     }
 
     /// Signal the watcher thread to exit and join it.
+    /// The thread exits via its 1-second kevent timeout (same pattern as ConfigWatcher).
     pub fn stop(self: *RoleWatcher) void {
         self.running.store(false, .release);
+        // Let the thread exit via its 1-second kevent timeout
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
     }
 
-    /// Stop, close file descriptors, free owned strings, destroy self.
+    /// Stop, close file descriptors, free owned strings (project_root is non-owning), destroy self.
     pub fn destroy(self: *RoleWatcher) void {
         self.stop();
         if (self.kq >= 0) {
-            std.posix.close(@intCast(self.kq));
+            std.posix.close(self.kq);
             self.kq = -1;
         }
         if (self.watch_fd >= 0) {
-            std.posix.close(@intCast(self.watch_fd));
+            std.posix.close(self.watch_fd);
             self.watch_fd = -1;
         }
         const allocator = self.allocator;
@@ -115,7 +130,17 @@ pub const RoleWatcher = struct {
 
     fn watchLoop(self: *RoleWatcher) void {
         while (self.running.load(.acquire)) {
-            // Register for VNODE events
+            // Guard: if watch_fd is invalid (after failed re-open), try to recover
+            if (self.watch_fd < 0) {
+                const new_file = std.fs.openFileAbsolute(self.role_path, .{}) catch {
+                    // File still unavailable — back off and retry
+                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    continue;
+                };
+                self.watch_fd = new_file.handle;
+            }
+
+            // Register for VNODE events (also monitors ATTRIB for editors that touch attrs on save)
             const changelist = [1]std.posix.Kevent{.{
                 .ident = @intCast(self.watch_fd),
                 .filter = std.c.EVFILT.VNODE,
@@ -135,8 +160,10 @@ pub const RoleWatcher = struct {
                 &changelist,
                 &eventlist,
                 &timeout,
-            ) catch {
-                // kqueue was closed or error — exit loop
+            ) catch |err| {
+                // Expected: stop() closed kq to unblock us
+                if (!self.running.load(.acquire)) break;
+                std.log.err("[teammux] hotreload: kevent failed for worker {d} on role '{s}': {}", .{ self.worker_id, self.role_id, err });
                 break;
             };
 
@@ -146,13 +173,14 @@ pub const RoleWatcher = struct {
                 // Handle rename/delete: editor saved via temp file rename (vim pattern)
                 if (fflags & std.c.NOTE.DELETE != 0 or fflags & std.c.NOTE.RENAME != 0) {
                     // Close old fd and mark invalid to prevent stale kqueue registration
-                    std.posix.close(@intCast(self.watch_fd));
+                    std.posix.close(self.watch_fd);
                     self.watch_fd = -1;
                     // Small delay for rename to complete
                     std.Thread.sleep(100 * std.time.ns_per_ms);
 
-                    const new_file = std.fs.openFileAbsolute(self.role_path, .{}) catch {
-                        // File not available yet — retry next iteration
+                    const new_file = std.fs.openFileAbsolute(self.role_path, .{}) catch |err| {
+                        std.log.warn("[teammux] hotreload: cannot reopen role file '{s}' after rename/delete for worker {d}: {}", .{ self.role_path, self.worker_id, err });
+                        // watch_fd stays -1; guard at top of loop will retry with backoff
                         continue;
                     };
                     self.watch_fd = new_file.handle;
@@ -167,7 +195,9 @@ pub const RoleWatcher = struct {
     fn fireCallback(self: *RoleWatcher) void {
         // Re-parse the role definition from disk
         var role_def = config.parseRoleDefinition(self.allocator, self.role_path) catch |err| {
-            std.log.warn("[teammux] hotreload: failed to parse role '{s}': {}", .{ self.role_id, err });
+            std.log.warn("[teammux] hotreload: failed to parse role '{s}' for worker {d}: {}", .{ self.role_id, self.worker_id, err });
+            // Signal parse failure to callback so UI can notify user
+            self.callback(self.worker_id, null, self.userdata);
             return;
         };
         defer role_def.deinit(self.allocator);
@@ -191,8 +221,9 @@ pub const RoleWatcher = struct {
         };
         defer self.allocator.free(claude_md_z);
 
-        // Fire callback — engine owns memory, valid only during this call
-        self.callback(self.worker_id, claude_md_z.ptr, self.userdata);
+        // Fire callback — watcher allocates; memory freed after this call returns
+        const ptr: [*:0]const u8 = claude_md_z.ptr;
+        self.callback(self.worker_id, ptr, self.userdata);
     }
 };
 
@@ -209,7 +240,8 @@ pub fn destroyAll(map: *RoleWatcherMap) void {
     map.deinit();
 }
 
-/// Stop all running watchers without destroying them.
+/// Stop all running watchers without destroying them. Used by sessionStop
+/// to pause file watching while preserving watcher state for session restart.
 pub fn stopAll(map: *RoleWatcherMap) void {
     var it = map.iterator();
     while (it.next()) |entry| {
