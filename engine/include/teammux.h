@@ -62,6 +62,7 @@ typedef enum {
     TM_MSG_COMPLETION  = 5,
     TM_MSG_ERROR       = 6,
     TM_MSG_BROADCAST   = 7,
+    TM_MSG_QUESTION    = 8,
 } tm_message_type_t;
 
 typedef enum {
@@ -311,6 +312,52 @@ void tm_merge_conflicts_free(tm_conflict_t** conflicts, uint32_t count);
 
 tm_subscription_t tm_commands_watch(tm_engine_t* engine, tm_command_cb callback, void* userdata);
 void              tm_commands_unwatch(tm_engine_t* engine, tm_subscription_t sub);
+
+// -----------------------------------------------------------------
+// Completion + Question signaling
+//
+// Workers signal completion or ask questions via /teammux-complete
+// and /teammux-question command files. The engine routes these
+// internally through the message bus (TM_MSG_COMPLETION = 5,
+// TM_MSG_QUESTION = 8) to the Team Lead (worker 0).
+// -----------------------------------------------------------------
+
+typedef struct {
+    uint32_t    worker_id;
+    const char* summary;        // brief completion summary
+    const char* git_commit;     // HEAD at time of completion (may be null)
+    const char* details;        // optional extended details (may be null)
+    uint64_t    timestamp;
+} tm_completion_t;
+
+typedef struct {
+    uint32_t    worker_id;
+    const char* question;       // the question text
+    const char* context;        // optional context from worker (may be null)
+    uint64_t    timestamp;
+} tm_question_t;
+
+// Signal worker completion. Creates TM_MSG_COMPLETION message, routes
+// through bus to Team Lead (worker 0), persists to JSONL log.
+// summary must not be NULL. details may be NULL.
+tm_result_t tm_worker_complete(tm_engine_t* engine,
+                                uint32_t worker_id,
+                                const char* summary,
+                                const char* details);
+
+// Signal worker question. Creates TM_MSG_QUESTION message, routes
+// through bus to Team Lead (worker 0), persists to JSONL log.
+// question must not be NULL. context may be NULL.
+tm_result_t tm_worker_question(tm_engine_t* engine,
+                                uint32_t worker_id,
+                                const char* question,
+                                const char* context);
+
+// Free a heap-allocated completion struct.
+void tm_completion_free(tm_completion_t* completion);
+
+// Free a heap-allocated question struct.
+void tm_question_free(tm_question_t* question);
 
 // -----------------------------------------------------------------
 // Utility

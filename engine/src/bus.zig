@@ -14,6 +14,7 @@ pub const MessageType = enum(c_int) {
     completion = 5,
     err = 6,
     broadcast = 7,
+    question = 8,
 
     pub fn toString(self: MessageType) []const u8 {
         return switch (self) {
@@ -25,6 +26,7 @@ pub const MessageType = enum(c_int) {
             .completion => "completion",
             .err => "error",
             .broadcast => "broadcast",
+            .question => "question",
         };
     }
 };
