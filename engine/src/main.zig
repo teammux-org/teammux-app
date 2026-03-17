@@ -210,6 +210,7 @@ const CDispatchEvent = extern struct {
     instruction: ?[*:0]const u8,
     timestamp: u64,
     delivered: bool,
+    kind: u8, // 0 = task, 1 = response
 };
 
 // Comptime ABI safety: verify extern struct sizes match expected C layout.
@@ -229,7 +230,7 @@ comptime {
     if (@sizeOf(CCompletion) != 40) @compileError("CCompletion size mismatch with tm_completion_t");
     // CQuestion: u32(4) + pad(4) + 2 ptrs(16) + u64(8) = 32 bytes on arm64
     if (@sizeOf(CQuestion) != 32) @compileError("CQuestion size mismatch with tm_question_t");
-    // CDispatchEvent: u32(4) + pad(4) + ptr(8) + u64(8) + bool(1) + pad(7) = 32 bytes on arm64
+    // CDispatchEvent: u32(4) + pad(4) + ptr(8) + u64(8) + bool(1) + u8(1) + pad(6) = 32 bytes on arm64
     if (@sizeOf(CDispatchEvent) != 32) @compileError("CDispatchEvent size mismatch with tm_dispatch_event_t");
 }
 
@@ -471,12 +472,16 @@ export fn tm_github_webhooks_stop(engine: ?*Engine, sub: u32) void { _ = sub; if
 
 // ─── Commands ────────────────────────────────────────────
 
-// Command routing wrapper.
-// Add new command-specific routing here.
-// S2 adds /teammux-complete and /teammux-question.
+// Command routing wrapper — add new /teammux-* command handlers as additional branches below.
 fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
-    const engine: *Engine = @ptrCast(@alignCast(userdata orelse return));
-    const cmd = std.mem.span(command_ptr orelse return);
+    const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
+        std.log.warn("[teammux] commandRoutingCallback: null userdata (engine pointer missing)", .{});
+        return;
+    }));
+    const cmd = std.mem.span(command_ptr orelse {
+        std.log.warn("[teammux] commandRoutingCallback: null command pointer", .{});
+        return;
+    });
 
     if (std.mem.eql(u8, cmd, "/teammux-assign")) {
         handleAssignCommand(engine, args_ptr);
@@ -488,7 +493,10 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
 }
 
 fn handleAssignCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
-    const args = std.mem.span(args_ptr orelse return);
+    const args = std.mem.span(args_ptr orelse {
+        std.log.warn("[teammux] /teammux-assign: args is NULL (expected JSON body)", .{});
+        return;
+    });
 
     // Parse target_worker_id (integer or string) from JSON
     const id_str = extractJsonStringValue(args, "target_worker_id") orelse
@@ -512,15 +520,19 @@ fn handleAssignCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         return;
     });
     engine.coordinator.dispatchTask(&engine.roster, b, worker_id, instruction) catch |err| {
-        std.log.warn("[teammux] /teammux-assign dispatch failed: {s}", .{@errorName(err)});
+        if (err == error.WorkerNotFound) {
+            std.log.warn("[teammux] /teammux-assign: worker {d} not found in roster", .{worker_id});
+        } else {
+            std.log.warn("[teammux] /teammux-assign: dispatch to worker {d} failed: {s}", .{ worker_id, @errorName(err) });
+        }
     };
 }
 
 /// Extract a quoted string value for a given key from JSON.
-/// Handles: {"key": "value"}.
+/// Handles: {"key": "value"}. Respects backslash escapes within values.
 fn extractJsonStringValue(json: []const u8, key: []const u8) ?[]const u8 {
-    const search = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{key}) catch return null;
-    defer std.heap.page_allocator.free(search);
+    var buf: [256]u8 = undefined;
+    const search = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return null;
 
     const key_pos = std.mem.indexOf(u8, json, search) orelse return null;
     const after_key = json[key_pos + search.len ..];
@@ -542,11 +554,11 @@ fn extractJsonStringValue(json: []const u8, key: []const u8) ?[]const u8 {
     return after_key[start..i];
 }
 
-/// Extract a bare numeric value for a given key from JSON.
-/// Handles: {"key": 42} (no quotes around the number).
+/// Extract a bare non-negative integer for a given key from JSON.
+/// Handles: {"key": 42} (digits only, no quotes).
 fn extractJsonNumber(json: []const u8, key: []const u8) ?[]const u8 {
-    const search = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{key}) catch return null;
-    defer std.heap.page_allocator.free(search);
+    var buf: [256]u8 = undefined;
+    const search = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return null;
 
     const key_pos = std.mem.indexOf(u8, json, search) orelse return null;
     const after_key = json[key_pos + search.len ..];
@@ -600,7 +612,7 @@ export fn tm_dispatch_task(engine: ?*Engine, target_worker_id: u32, instruction:
     })) catch |err| {
         if (err == error.WorkerNotFound) {
             e.setError("tm_dispatch_task: worker not found") catch {};
-            return 99; // TM_ERR_UNKNOWN (worker not in roster)
+            return 12; // TM_ERR_INVALID_WORKER
         }
         e.setError("tm_dispatch_task: dispatch failed") catch {};
         return 8;
@@ -620,7 +632,7 @@ export fn tm_dispatch_response(engine: ?*Engine, target_worker_id: u32, response
     })) catch |err| {
         if (err == error.WorkerNotFound) {
             e.setError("tm_dispatch_response: worker not found") catch {};
-            return 99;
+            return 12; // TM_ERR_INVALID_WORKER
         }
         e.setError("tm_dispatch_response: dispatch failed") catch {};
         return 8;
@@ -631,24 +643,29 @@ export fn tm_dispatch_response(engine: ?*Engine, target_worker_id: u32, response
 export fn tm_dispatch_history(engine: ?*Engine, count: ?*u32) ?[*]?*CDispatchEvent {
     if (count) |c| c.* = 0;
     const e = engine orelse return null;
-    const alloc = e.allocator;
+    const alloc = std.heap.c_allocator; // must match tm_dispatch_history_free
 
     const history = e.coordinator.getHistory();
     if (history.len == 0) return null;
 
-    const ptrs = alloc.alloc(?*CDispatchEvent, history.len) catch return null;
+    const ptrs = alloc.alloc(?*CDispatchEvent, history.len) catch {
+        e.setError("tm_dispatch_history: allocation failed") catch {};
+        return null;
+    };
     var filled: usize = 0;
 
     for (history) |event| {
         const entry = alloc.create(CDispatchEvent) catch {
             for (0..filled) |j| freeCDispatchEvent(ptrs[j]);
             alloc.free(ptrs);
+            e.setError("tm_dispatch_history: allocation failed") catch {};
             return null;
         };
         const instr_z = alloc.dupeZ(u8, event.instruction) catch {
             alloc.destroy(entry);
             for (0..filled) |j| freeCDispatchEvent(ptrs[j]);
             alloc.free(ptrs);
+            e.setError("tm_dispatch_history: allocation failed") catch {};
             return null;
         };
         entry.* = .{
@@ -656,6 +673,7 @@ export fn tm_dispatch_history(engine: ?*Engine, count: ?*u32) ?[*]?*CDispatchEve
             .instruction = instr_z.ptr,
             .timestamp = event.timestamp,
             .delivered = event.delivered,
+            .kind = @intFromEnum(event.kind),
         };
         ptrs[filled] = entry;
         filled += 1;
@@ -2862,18 +2880,8 @@ test "command routing wrapper routes /teammux-assign to coordinator" {
     defer alloc.free(log_dir);
     e.message_bus = try bus.MessageBus.init(alloc, log_dir, "wraptest", root);
 
-    try e.roster.workers.put(5, .{
-        .id = 5,
-        .name = try alloc.dupe(u8, "test-worker"),
-        .task_description = try alloc.dupe(u8, "test"),
-        .branch_name = try alloc.dupe(u8, "branch"),
-        .worktree_path = try alloc.dupe(u8, "/tmp/w5"),
-        .status = .idle,
-        .agent_type = .claude_code,
-        .agent_binary = try alloc.dupe(u8, "echo"),
-        .model = try alloc.dupe(u8, ""),
-        .spawned_at = 0,
-    });
+    // Add a worker to the roster
+    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
 
     const args_json = "{\"target_worker_id\": 5, \"instruction\": \"refactor auth\"}";
     const args_z = try alloc.dupeZ(u8, args_json);
@@ -2931,6 +2939,80 @@ test "command routing wrapper forwards unknown commands to Swift callback" {
 
     try std.testing.expect(State.forwarded);
     try std.testing.expectEqualStrings("/teammux-status", State.forwarded_cmd[0..State.forwarded_len]);
+}
+
+// ─── JSON helper tests ───────────────────────────────────
+
+test "extractJsonStringValue extracts quoted value" {
+    const result = extractJsonStringValue("{\"instruction\": \"refactor auth\"}", "instruction");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("refactor auth", result.?);
+}
+
+test "extractJsonStringValue returns null for missing key" {
+    try std.testing.expect(extractJsonStringValue("{\"foo\": \"bar\"}", "instruction") == null);
+}
+
+test "extractJsonStringValue handles escaped quotes" {
+    const result = extractJsonStringValue("{\"msg\": \"use \\\"JWT\\\" tokens\"}", "msg");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("use \\\"JWT\\\" tokens", result.?);
+}
+
+test "extractJsonNumber extracts bare integer" {
+    const result = extractJsonNumber("{\"target_worker_id\": 42}", "target_worker_id");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("42", result.?);
+}
+
+test "extractJsonNumber returns null for quoted value" {
+    try std.testing.expect(extractJsonNumber("{\"id\": \"5\"}", "id") == null);
+}
+
+test "extractJsonNumber returns null for missing key" {
+    try std.testing.expect(extractJsonNumber("{\"foo\": 1}", "id") == null);
+}
+
+test "extractJsonNumber handles no space after colon" {
+    const result = extractJsonNumber("{\"id\":7}", "id");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("7", result.?);
+}
+
+// ─── Dispatch history round-trip test ────────────────────
+
+test "tm_dispatch_history round-trip returns correct events" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "histtest", root);
+
+    try e.roster.workers.put(3, try coordinator_mod.makeTestWorker(alloc, 3));
+
+    try e.coordinator.dispatchTask(&e.roster, &(e.message_bus.?), 3, "round-trip test");
+
+    var count: u32 = 0;
+    const events = tm_dispatch_history(e, &count);
+    try std.testing.expect(events != null);
+    try std.testing.expect(count == 1);
+
+    const event = events.?[0].?;
+    try std.testing.expect(event.target_worker_id == 3);
+    try std.testing.expectEqualStrings("round-trip test", std.mem.span(event.instruction.?));
+    try std.testing.expect(event.delivered == true);
+    try std.testing.expect(event.kind == 0); // task
+
+    // Free must not crash — uses c_allocator which matches tm_dispatch_history
+    tm_dispatch_history_free(events, count);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = coordinator_mod; }

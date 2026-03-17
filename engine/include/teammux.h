@@ -63,8 +63,8 @@ typedef enum {
     TM_MSG_ERROR       = 6,
     TM_MSG_BROADCAST   = 7,
     TM_MSG_QUESTION    = 8,
-    TM_MSG_DISPATCH    = 10,  // Team Lead dispatches task to worker (S5)
-    TM_MSG_RESPONSE    = 11,  // Team Lead responds to worker question (S5)
+    TM_MSG_DISPATCH    = 10,  // Team Lead dispatches task to worker
+    TM_MSG_RESPONSE    = 11,  // Team Lead responds to worker question
 } tm_message_type_t;
 
 typedef enum {
@@ -314,13 +314,17 @@ void tm_merge_conflicts_free(tm_conflict_t** conflicts, uint32_t count);
 
 // Dispatch a task instruction to a specific worker. The instruction is
 // routed through the message bus as TM_MSG_DISPATCH and recorded in
-// dispatch history. Returns TM_ERR_UNKNOWN if worker not found.
+// dispatch history. The event is recorded even if bus delivery fails
+// (with delivered=false). Returns TM_ERR_INVALID_WORKER if worker not
+// found. Returns TM_ERR_BUS if message bus not initialized.
 tm_result_t tm_dispatch_task(tm_engine_t* engine,
                               uint32_t target_worker_id,
                               const char* instruction);
 
 // Dispatch a response to a specific worker (e.g. answering a question).
-// Routed through the message bus as TM_MSG_RESPONSE.
+// Routed through the message bus as TM_MSG_RESPONSE and recorded in
+// dispatch history. Returns TM_ERR_INVALID_WORKER if worker not found.
+// Returns TM_ERR_BUS if message bus not initialized.
 tm_result_t tm_dispatch_response(tm_engine_t* engine,
                                   uint32_t target_worker_id,
                                   const char* response);
@@ -330,6 +334,7 @@ typedef struct {
     const char* instruction;
     uint64_t    timestamp;
     bool        delivered;
+    uint8_t     kind;       // 0 = task dispatch, 1 = response dispatch
 } tm_dispatch_event_t;
 
 // Get dispatch history (most recent up to 100 events).

@@ -8,11 +8,17 @@ const bus = @import("bus.zig");
 
 pub const max_history: usize = 100;
 
+pub const DispatchKind = enum(u8) {
+    task = 0,
+    response = 1,
+};
+
 pub const DispatchEvent = struct {
     target_worker_id: worktree.WorkerId,
-    instruction: []const u8, // heap-allocated, owned
+    instruction: []const u8, // heap-allocated, owned by Coordinator
     timestamp: u64,
     delivered: bool,
+    kind: DispatchKind,
 };
 
 // ─────────────────────────────────────────────────────────
@@ -39,7 +45,9 @@ pub const Coordinator = struct {
 
     /// Dispatch a task instruction to a specific worker.
     /// Validates worker exists in roster, routes through bus, records in history.
-    /// If bus delivery fails, the event is still recorded with delivered=false.
+    /// If bus delivery fails, the event is still recorded with delivered=false
+    /// and a warning is logged. The function returns success in this case —
+    /// callers should check dispatch history for delivery status.
     pub fn dispatchTask(
         self: *Coordinator,
         roster: *worktree.Roster,
@@ -47,25 +55,11 @@ pub const Coordinator = struct {
         worker_id: worktree.WorkerId,
         instruction: []const u8,
     ) !void {
-        // Validate worker exists
-        if (roster.getWorker(worker_id) == null) return error.WorkerNotFound;
-
-        // Route through bus
-        var delivered = true;
-        message_bus.send(worker_id, 0, .dispatch, instruction) catch |err| {
-            if (err == error.DeliveryFailed) {
-                delivered = false;
-            } else {
-                return err;
-            }
-        };
-
-        // Record in history
-        try self.recordEvent(worker_id, instruction, delivered);
+        try self.dispatchWith(roster, message_bus, worker_id, .dispatch, .task, instruction);
     }
 
     /// Dispatch a response to a specific worker (e.g. answering a question).
-    /// Same flow as dispatchTask but with .response message type.
+    /// Same semantics as dispatchTask but with .response message type.
     pub fn dispatchResponse(
         self: *Coordinator,
         roster: *worktree.Roster,
@@ -73,18 +67,7 @@ pub const Coordinator = struct {
         worker_id: worktree.WorkerId,
         response: []const u8,
     ) !void {
-        if (roster.getWorker(worker_id) == null) return error.WorkerNotFound;
-
-        var delivered = true;
-        message_bus.send(worker_id, 0, .response, response) catch |err| {
-            if (err == error.DeliveryFailed) {
-                delivered = false;
-            } else {
-                return err;
-            }
-        };
-
-        try self.recordEvent(worker_id, response, delivered);
+        try self.dispatchWith(roster, message_bus, worker_id, .response, .response, response);
     }
 
     /// Get read-only view of dispatch history.
@@ -92,35 +75,74 @@ pub const Coordinator = struct {
         return self.history.items;
     }
 
+    fn dispatchWith(
+        self: *Coordinator,
+        roster: *worktree.Roster,
+        message_bus: *bus.MessageBus,
+        worker_id: worktree.WorkerId,
+        msg_type: bus.MessageType,
+        kind: DispatchKind,
+        content: []const u8,
+    ) !void {
+        if (roster.getWorker(worker_id) == null) return error.WorkerNotFound;
+
+        var delivered = true;
+        message_bus.send(worker_id, 0, msg_type, content) catch |err| {
+            if (err == error.DeliveryFailed) {
+                std.log.warn("[teammux] dispatch to worker {d} recorded but delivery failed after retries", .{worker_id});
+                delivered = false;
+            } else {
+                return err;
+            }
+        };
+
+        try self.recordEvent(worker_id, content, delivered, kind);
+    }
+
     fn recordEvent(
         self: *Coordinator,
         worker_id: worktree.WorkerId,
-        instruction: []const u8,
+        content: []const u8,
         delivered: bool,
+        kind: DispatchKind,
     ) !void {
-        // Cap at max_history — evict oldest
+        // Cap at max_history — evict oldest (O(n) shift, n capped at 100)
         if (self.history.items.len >= max_history) {
             self.allocator.free(self.history.items[0].instruction);
             _ = self.history.orderedRemove(0);
         }
 
-        const owned_instruction = try self.allocator.dupe(u8, instruction);
-        errdefer self.allocator.free(owned_instruction);
+        const owned = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(owned);
 
         try self.history.append(self.allocator, .{
             .target_worker_id = worker_id,
-            .instruction = owned_instruction,
+            .instruction = owned,
             .timestamp = @intCast(std.time.timestamp()),
             .delivered = delivered,
+            .kind = kind,
         });
     }
-
-    pub const WorkerNotFound = error{WorkerNotFound};
 };
 
 // ─────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────
+
+pub fn makeTestWorker(alloc: std.mem.Allocator, id: worktree.WorkerId) !worktree.Worker {
+    return .{
+        .id = id,
+        .name = try alloc.dupe(u8, "w"),
+        .task_description = try alloc.dupe(u8, "t"),
+        .branch_name = try alloc.dupe(u8, "b"),
+        .worktree_path = try alloc.dupe(u8, "/tmp/w"),
+        .status = .idle,
+        .agent_type = .claude_code,
+        .agent_binary = try alloc.dupe(u8, "echo"),
+        .model = try alloc.dupe(u8, ""),
+        .spawned_at = 0,
+    };
+}
 
 test "coordinator - dispatchTask routes message through bus" {
     const alloc = std.testing.allocator;
@@ -133,7 +155,6 @@ test "coordinator - dispatchTask routes message through bus" {
     var message_bus = try bus.MessageBus.init(alloc, log_dir, "coordtst", log_dir);
     defer message_bus.deinit();
 
-    // Track callback invocations
     const State = struct {
         var received: bool = false;
         var received_type: c_int = -1;
@@ -150,26 +171,14 @@ test "coordinator - dispatchTask routes message through bus" {
                 State.received_type = m.msg_type;
                 State.received_to = m.to;
             }
-            return 0; // TM_OK
+            return 0;
         }
     }.cb;
     message_bus.subscribe(callback, null);
 
-    // Set up roster with one worker
     var roster = worktree.Roster.init(alloc);
     defer roster.deinit();
-    try roster.workers.put(1, .{
-        .id = 1,
-        .name = try alloc.dupe(u8, "alice"),
-        .task_description = try alloc.dupe(u8, "task"),
-        .branch_name = try alloc.dupe(u8, "branch"),
-        .worktree_path = try alloc.dupe(u8, "/tmp/w1"),
-        .status = .idle,
-        .agent_type = .claude_code,
-        .agent_binary = try alloc.dupe(u8, "echo"),
-        .model = try alloc.dupe(u8, ""),
-        .spawned_at = 0,
-    });
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
 
     var coord = Coordinator.init(alloc);
     defer coord.deinit();
@@ -177,7 +186,7 @@ test "coordinator - dispatchTask routes message through bus" {
     try coord.dispatchTask(&roster, &message_bus, 1, "implement auth");
 
     try std.testing.expect(State.received);
-    try std.testing.expect(State.received_type == 10); // dispatch
+    try std.testing.expect(State.received_type == @intFromEnum(bus.MessageType.dispatch));
     try std.testing.expect(State.received_to == 1);
 }
 
@@ -227,28 +236,17 @@ test "coordinator - dispatchResponse routes with response type" {
 
     var roster = worktree.Roster.init(alloc);
     defer roster.deinit();
-    try roster.workers.put(2, .{
-        .id = 2,
-        .name = try alloc.dupe(u8, "bob"),
-        .task_description = try alloc.dupe(u8, "task"),
-        .branch_name = try alloc.dupe(u8, "branch"),
-        .worktree_path = try alloc.dupe(u8, "/tmp/w2"),
-        .status = .idle,
-        .agent_type = .claude_code,
-        .agent_binary = try alloc.dupe(u8, "echo"),
-        .model = try alloc.dupe(u8, ""),
-        .spawned_at = 0,
-    });
+    try roster.workers.put(2, try makeTestWorker(alloc, 2));
 
     var coord = Coordinator.init(alloc);
     defer coord.deinit();
 
     try coord.dispatchResponse(&roster, &message_bus, 2, "use JWT tokens");
 
-    try std.testing.expect(State.received_type == 11); // response
+    try std.testing.expect(State.received_type == @intFromEnum(bus.MessageType.response));
 }
 
-test "coordinator - history records events correctly" {
+test "coordinator - history records events with correct kind" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -261,32 +259,23 @@ test "coordinator - history records events correctly" {
 
     var roster = worktree.Roster.init(alloc);
     defer roster.deinit();
-    try roster.workers.put(1, .{
-        .id = 1,
-        .name = try alloc.dupe(u8, "w"),
-        .task_description = try alloc.dupe(u8, "t"),
-        .branch_name = try alloc.dupe(u8, "b"),
-        .worktree_path = try alloc.dupe(u8, "/tmp/w"),
-        .status = .idle,
-        .agent_type = .claude_code,
-        .agent_binary = try alloc.dupe(u8, "echo"),
-        .model = try alloc.dupe(u8, ""),
-        .spawned_at = 0,
-    });
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
 
     var coord = Coordinator.init(alloc);
     defer coord.deinit();
 
     try coord.dispatchTask(&roster, &message_bus, 1, "first task");
-    try coord.dispatchTask(&roster, &message_bus, 1, "second task");
+    try coord.dispatchResponse(&roster, &message_bus, 1, "use JWT");
 
     const history = coord.getHistory();
     try std.testing.expect(history.len == 2);
     try std.testing.expectEqualStrings("first task", history[0].instruction);
-    try std.testing.expectEqualStrings("second task", history[1].instruction);
+    try std.testing.expectEqualStrings("use JWT", history[1].instruction);
     try std.testing.expect(history[0].target_worker_id == 1);
     try std.testing.expect(history[0].delivered == true);
     try std.testing.expect(history[0].timestamp > 0);
+    try std.testing.expect(history[0].kind == .task);
+    try std.testing.expect(history[1].kind == .response);
 }
 
 test "coordinator - history capped at 100" {
@@ -302,23 +291,11 @@ test "coordinator - history capped at 100" {
 
     var roster = worktree.Roster.init(alloc);
     defer roster.deinit();
-    try roster.workers.put(1, .{
-        .id = 1,
-        .name = try alloc.dupe(u8, "w"),
-        .task_description = try alloc.dupe(u8, "t"),
-        .branch_name = try alloc.dupe(u8, "b"),
-        .worktree_path = try alloc.dupe(u8, "/tmp/w"),
-        .status = .idle,
-        .agent_type = .claude_code,
-        .agent_binary = try alloc.dupe(u8, "echo"),
-        .model = try alloc.dupe(u8, ""),
-        .spawned_at = 0,
-    });
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
 
     var coord = Coordinator.init(alloc);
     defer coord.deinit();
 
-    // Add 101 events
     for (0..101) |i| {
         var buf: [32]u8 = undefined;
         const instruction = try std.fmt.bufPrint(&buf, "task-{d}", .{i});
@@ -327,9 +304,7 @@ test "coordinator - history capped at 100" {
 
     const history = coord.getHistory();
     try std.testing.expect(history.len == 100);
-    // Oldest event (task-0) should be evicted; first is task-1
     try std.testing.expectEqualStrings("task-1", history[0].instruction);
-    // Newest is task-100
     try std.testing.expectEqualStrings("task-100", history[99].instruction);
 }
 
@@ -346,18 +321,7 @@ test "coordinator - deinit frees all history strings" {
 
     var roster = worktree.Roster.init(alloc);
     defer roster.deinit();
-    try roster.workers.put(1, .{
-        .id = 1,
-        .name = try alloc.dupe(u8, "w"),
-        .task_description = try alloc.dupe(u8, "t"),
-        .branch_name = try alloc.dupe(u8, "b"),
-        .worktree_path = try alloc.dupe(u8, "/tmp/w"),
-        .status = .idle,
-        .agent_type = .claude_code,
-        .agent_binary = try alloc.dupe(u8, "echo"),
-        .model = try alloc.dupe(u8, ""),
-        .spawned_at = 0,
-    });
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
 
     // Scope coordinator to verify no leaks (testing allocator detects)
     var coord = Coordinator.init(alloc);
@@ -365,4 +329,38 @@ test "coordinator - deinit frees all history strings" {
     try coord.dispatchTask(&roster, &message_bus, 1, "also leaked?");
     coord.deinit();
     // If deinit fails to free, testing allocator will panic with leak report
+}
+
+test "coordinator - delivery failure records event with delivered=false" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(log_dir);
+
+    var message_bus = try bus.MessageBus.init(alloc, log_dir, "coordfai", log_dir);
+    defer message_bus.deinit();
+    message_bus.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const callback = struct {
+        fn cb(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            return 8; // always fail
+        }
+    }.cb;
+    message_bus.subscribe(callback, null);
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
+
+    var coord = Coordinator.init(alloc);
+    defer coord.deinit();
+
+    try coord.dispatchTask(&roster, &message_bus, 1, "will fail delivery");
+
+    const history = coord.getHistory();
+    try std.testing.expect(history.len == 1);
+    try std.testing.expect(history[0].delivered == false);
+    try std.testing.expectEqualStrings("will fail delivery", history[0].instruction);
 }
