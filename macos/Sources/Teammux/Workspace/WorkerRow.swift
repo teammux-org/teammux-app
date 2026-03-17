@@ -30,8 +30,8 @@ struct WorkerRow: View {
                 .fill(worker.status.color)
                 .frame(width: 8, height: 8)
 
-            // Role emoji badge (only when role is assigned)
-            if let role {
+            // Role emoji badge (only when role is assigned with non-empty emoji)
+            if let role, !role.emoji.isEmpty {
                 Text(role.emoji)
                     .font(.system(size: 14))
                     .accessibilityLabel("\(role.name) role")
