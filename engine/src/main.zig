@@ -2715,4 +2715,84 @@ test "tm_worker_complete with null details succeeds" {
     try std.testing.expect(tm_worker_complete(engine_ptr, 1, summary_z.ptr, null) == 0);
 }
 
-test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; }
+// ─── Role hot-reload C API tests ─────────────────────────
+
+test "tm_role_watch null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_role_watch(null, 0, null, null, null) == 99);
+}
+
+test "tm_role_unwatch null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_role_unwatch(null, 0) == 99);
+}
+
+test "tm_role_watch null callback returns TM_ERR_ROLE" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    const role_z = try std.testing.allocator.dupeZ(u8, "test-role");
+    defer std.testing.allocator.free(role_z);
+    // null callback → TM_ERR_ROLE (13)
+    try std.testing.expect(tm_role_watch(engine_ptr, 1, role_z.ptr, null, null) == 13);
+}
+
+test "tm_role_watch null role_id returns TM_ERR_ROLE" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    const noop_cb = &struct {
+        fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+    }.cb;
+    // null role_id → TM_ERR_ROLE (13)
+    try std.testing.expect(tm_role_watch(engine_ptr, 1, null, noop_cb, null) == 13);
+}
+
+test "tm_role_watch invalid worker_id returns TM_ERR_INVALID_WORKER" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    const noop_cb = &struct {
+        fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+    }.cb;
+    const role_z = try std.testing.allocator.dupeZ(u8, "test-role");
+    defer std.testing.allocator.free(role_z);
+    // worker 999 not in roster → TM_ERR_INVALID_WORKER (12)
+    try std.testing.expect(tm_role_watch(engine_ptr, 999, role_z.ptr, noop_cb, null) == 12);
+}
+
+test "tm_role_unwatch idempotent on missing worker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // unwatch on nonexistent watcher → TM_OK (idempotent)
+    try std.testing.expect(tm_role_unwatch(engine_ptr, 999) == 0);
+}
+
+test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; }
