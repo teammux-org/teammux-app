@@ -67,6 +67,14 @@ final class EngineClient: ObservableObject {
     /// Pending conflicts per worker ID after a conflicted merge.
     @Published var pendingConflicts: [UInt32: [ConflictInfo]] = [:]
 
+    /// All available roles discovered from search paths (project-local, user, bundled).
+    /// Populated by `loadAvailableRoles()` during session start.
+    @Published var availableRoles: [RoleDefinition] = []
+
+    /// Maps worker ID to the resolved role assigned at spawn time.
+    /// Populated by `spawnWorker` when `roleId` is non-nil.
+    @Published var workerRoles: [UInt32: RoleDefinition] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -182,6 +190,7 @@ final class EngineClient: ObservableObject {
         }
 
         setupCallbacks()
+        loadAvailableRoles()
         return true
     }
 
@@ -214,6 +223,8 @@ final class EngineClient: ObservableObject {
         stopMergePolling()
         mergeStatuses.removeAll()
         pendingConflicts.removeAll()
+        availableRoles.removeAll()
+        workerRoles.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -241,13 +252,19 @@ final class EngineClient: ObservableObject {
     /// Spawn a new worker: creates worktree + branch + CLAUDE.md.
     /// Does NOT create a PTY — the caller must create a Ghostty SurfaceView.
     ///
+    /// When `roleId` is non-nil, resolves the role via `tm_role_resolve`,
+    /// registers ownership patterns via `tm_ownership_register`, and caches
+    /// the role in `workerRoles`. Role resolution failure logs a warning
+    /// but does not fail the spawn.
+    ///
     /// Returns the new worker ID, or 0 on failure.
     /// Wraps `tm_worker_spawn()`.
     func spawnWorker(
         agentBinary: String,
         agentType: AgentType,
         workerName: String,
-        taskDescription: String
+        taskDescription: String,
+        roleId: String? = nil
     ) -> UInt32 {
         guard let engine else {
             lastError = "Engine not created"
@@ -292,6 +309,18 @@ final class EngineClient: ObservableObject {
         } else {
             lastError = "Worker \(workerId) spawned but tm_worker_get returned nil"
             Self.logger.error("Worker \(workerId) spawned but tm_worker_get returned nil")
+        }
+
+        // Resolve role and register ownership patterns if roleId was provided.
+        // Failure here is non-fatal — the worker still operates, just without
+        // role-based ownership enforcement.
+        if let roleId {
+            if let role = resolveRole(id: roleId) {
+                registerOwnership(workerId: workerId, role: role)
+                workerRoles[workerId] = role
+            } else {
+                Self.logger.warning("spawnWorker: role '\(roleId)' could not be resolved for worker \(workerId)")
+            }
         }
 
         // Refresh the roster to pick up the new worker
@@ -661,6 +690,148 @@ final class EngineClient: ObservableObject {
         return conflicts
     }
 
+    // MARK: - Roles
+
+    /// Load all available roles from the engine's search paths
+    /// (project-local, user, bundled). Populates `availableRoles`.
+    /// Called during `sessionStart()`. Failure logs a warning but
+    /// does not prevent session operation.
+    /// Wraps `tm_roles_list()` + `tm_roles_list_free()`.
+    func loadAvailableRoles() {
+        guard let engine else {
+            Self.logger.warning("loadAvailableRoles: engine not created")
+            return
+        }
+
+        var count: UInt32 = 0
+        guard let rolesPtr = tm_roles_list(engine, &count), count > 0 else {
+            Self.logger.info("loadAvailableRoles: no roles found (count=0)")
+            availableRoles = []
+            return
+        }
+
+        var roles: [RoleDefinition] = []
+        for i in 0..<Int(count) {
+            guard let rolePtr = rolesPtr[i] else { continue }
+            roles.append(bridgeRole(rolePtr))
+        }
+
+        tm_roles_list_free(rolesPtr, count)
+        availableRoles = roles
+        Self.logger.info("loadAvailableRoles: loaded \(roles.count) roles")
+    }
+
+    /// Look up the role assigned to a worker at spawn time.
+    /// Returns `nil` if the worker was spawned without a role.
+    func roleForWorker(_ workerId: UInt32) -> RoleDefinition? {
+        workerRoles[workerId]
+    }
+
+    /// Check whether a worker is allowed to write to `filePath`.
+    /// Wraps `tm_ownership_check()`. Returns `true` when no rules
+    /// are registered (default allow), or when the worker's write
+    /// patterns grant access and no deny pattern matches.
+    func checkCapability(workerId: UInt32, filePath: String) -> Bool {
+        guard let engine else {
+            Self.logger.warning("checkCapability: engine not created")
+            return true  // default allow when engine unavailable
+        }
+
+        var allowed = true
+        let result = filePath.withCString { cPath in
+            tm_ownership_check(engine, workerId, cPath, &allowed)
+        }
+
+        if result != TM_OK {
+            let msg = lastEngineError() ?? "tm_ownership_check failed (\(result.rawValue))"
+            Self.logger.error("checkCapability failed: \(msg)")
+            return true  // default allow on error
+        }
+
+        return allowed
+    }
+
+    // MARK: - Private: Role helpers
+
+    /// Resolve a single role by ID. Returns `nil` if the role cannot be found
+    /// or fails to parse.
+    /// Wraps `tm_role_resolve()` + `tm_role_free()`.
+    private func resolveRole(id: String) -> RoleDefinition? {
+        guard let engine else { return nil }
+
+        var rolePtr: UnsafeMutablePointer<tm_role_t>?
+        let result = id.withCString { cId in
+            tm_role_resolve(engine, cId, &rolePtr)
+        }
+
+        guard result == TM_OK, let rolePtr else {
+            return nil
+        }
+
+        let role = bridgeRole(rolePtr)
+        tm_role_free(rolePtr)
+        return role
+    }
+
+    /// Bridge a `tm_role_t*` to a Swift `RoleDefinition`.
+    /// Extracts all string fields and iterates the `const char**` pattern arrays.
+    private func bridgeRole(_ rolePtr: UnsafeMutablePointer<tm_role_t>) -> RoleDefinition {
+        let role = rolePtr.pointee
+
+        var writePatterns: [String] = []
+        if let patternsPtr = role.write_patterns {
+            for i in 0..<Int(role.write_pattern_count) {
+                if let cStr = patternsPtr[i] {
+                    writePatterns.append(String(cString: cStr))
+                }
+            }
+        }
+
+        var denyWritePatterns: [String] = []
+        if let patternsPtr = role.deny_write_patterns {
+            for i in 0..<Int(role.deny_write_pattern_count) {
+                if let cStr = patternsPtr[i] {
+                    denyWritePatterns.append(String(cString: cStr))
+                }
+            }
+        }
+
+        return RoleDefinition(
+            id: String(cString: role.id),
+            name: String(cString: role.name),
+            division: String(cString: role.division),
+            emoji: String(cString: role.emoji),
+            description: String(cString: role.description),
+            writePatterns: writePatterns,
+            denyWritePatterns: denyWritePatterns
+        )
+    }
+
+    /// Register all write and deny_write patterns from a role definition
+    /// into the engine's ownership registry for a given worker.
+    /// Wraps `tm_ownership_register()`.
+    private func registerOwnership(workerId: UInt32, role: RoleDefinition) {
+        guard let engine else { return }
+
+        for pattern in role.writePatterns {
+            pattern.withCString { cPattern in
+                let result = tm_ownership_register(engine, workerId, cPattern, true)
+                if result != TM_OK {
+                    Self.logger.warning("registerOwnership: failed to register write pattern '\(pattern)' for worker \(workerId)")
+                }
+            }
+        }
+
+        for pattern in role.denyWritePatterns {
+            pattern.withCString { cPattern in
+                let result = tm_ownership_register(engine, workerId, cPattern, false)
+                if result != TM_OK {
+                    Self.logger.warning("registerOwnership: failed to register deny pattern '\(pattern)' for worker \(workerId)")
+                }
+            }
+        }
+    }
+
     // MARK: - Private: Callbacks
 
     /// Register all engine callbacks. Called once after `sessionStart` succeeds.
@@ -861,11 +1032,16 @@ final class EngineClient: ObservableObject {
             let agentTypeRaw = Int32(args["agent_type"] ?? "0") ?? 0
             let agentType = AgentType(fromCValue: agentTypeRaw)
             let name = args["name"] ?? "Worker"
+            let role: String? = {
+                guard let r = args["role"], !r.isEmpty else { return nil }
+                return r
+            }()
             let workerId = spawnWorker(
                 agentBinary: binary,
                 agentType: agentType,
                 workerName: name,
-                taskDescription: task
+                taskDescription: task,
+                roleId: role
             )
             if workerId == 0 {
                 Self.logger.error("handleCommand /teammux-add: spawnWorker returned 0")
