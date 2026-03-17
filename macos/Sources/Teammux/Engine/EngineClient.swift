@@ -336,8 +336,19 @@ final class EngineClient: ObservableObject {
         let interceptResult = tm_interceptor_install(engine, workerId)
         if interceptResult != TM_OK {
             let msg = lastEngineError() ?? "tm_interceptor_install failed (\(interceptResult.rawValue))"
-            lastError = "Worker \(workerId) spawned but file enforcement is disabled: \(msg)"
-            Self.logger.error("spawnWorker: interceptor install failed for worker \(workerId): \(msg) — worker will operate WITHOUT file deny enforcement")
+            if roleId != nil {
+                // Hard failure for role-assigned workers: enforcement is the
+                // whole point of roles. Continuing without it silently drops
+                // write-scope guarantees.
+                lastError = msg
+                Self.logger.error("spawnWorker: \(msg) — dismissing worker to avoid degraded enforcement")
+                _ = tm_worker_dismiss(engine, workerId)
+                workerRoles.removeValue(forKey: workerId)
+                worktreeReadyQueue.removeAll { $0.id == workerId }
+                refreshRoster()
+                return 0
+            }
+            Self.logger.warning("spawnWorker: \(msg) — no role assigned, continuing with pass-through")
         }
 
         // Refresh the roster to pick up the new worker
@@ -801,9 +812,9 @@ final class EngineClient: ObservableObject {
             return nil
         }
         guard let cStr = tm_interceptor_path(engine, workerId) else { return nil }
-        let path = String(cString: cStr)
+        let path = String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
         tm_free_string(cStr)
-        return path
+        return path.isEmpty ? nil : path
     }
 
     // MARK: - Private: Role helpers
