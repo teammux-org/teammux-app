@@ -9,6 +9,7 @@ pub const github = @import("github.zig");
 pub const commands = @import("commands.zig");
 pub const merge = @import("merge.zig");
 pub const ownership = @import("ownership.zig");
+pub const interceptor = @import("interceptor.zig");
 
 // ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
@@ -261,6 +262,10 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
 }
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    // Remove interceptor wrapper before worktree is deleted
+    if (e.roster.getWorker(worker_id)) |w| {
+        interceptor.remove(w.worktree_path);
+    }
     e.roster.dismiss(e.project_root, worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
     e.ownership_registry.release(worker_id);
     return 0;
@@ -448,6 +453,10 @@ export fn tm_merge_approve(engine: ?*Engine, worker_id: u32, strategy: ?[*:0]con
 }
 export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    // Remove interceptor wrapper before worktree is deleted
+    if (e.roster.getWorker(worker_id)) |w| {
+        interceptor.remove(w.worktree_path);
+    }
     e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
         e.setError(if (err == error.WorkerNotFound) "merge reject failed: worker not found" else "merge reject failed") catch {};
         return if (err == error.WorkerNotFound) 12 else 5;
@@ -751,6 +760,85 @@ fn freeCOwnershipEntry(ptr: ?*COwnershipEntry) void {
     const entry = ptr orelse return;
     freeNullTerminated(entry.path_pattern);
     std.heap.c_allocator.destroy(entry);
+}
+
+// ─── Git interceptor ─────────────────────────────────────
+
+export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    const w = e.roster.getWorker(worker_id) orelse {
+        e.setError("tm_interceptor_install: worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    };
+
+    // Get deny and write patterns from ownership registry
+    const rules = e.ownership_registry.getRules(worker_id);
+
+    // Count deny vs write patterns
+    var deny_count: usize = 0;
+    var write_count: usize = 0;
+    if (rules) |r| {
+        for (r) |rule| {
+            if (rule.allow_write) write_count += 1 else deny_count += 1;
+        }
+    }
+
+    // Build pattern arrays
+    const deny_pats = e.allocator.alloc([]const u8, deny_count) catch {
+        e.setError("tm_interceptor_install: allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(deny_pats);
+    const write_pats = e.allocator.alloc([]const u8, write_count) catch {
+        e.setError("tm_interceptor_install: allocation failed") catch {};
+        return 99;
+    };
+    defer e.allocator.free(write_pats);
+
+    var di: usize = 0;
+    var wi: usize = 0;
+    if (rules) |r| {
+        for (r) |rule| {
+            if (rule.allow_write) {
+                write_pats[wi] = rule.pattern;
+                wi += 1;
+            } else {
+                deny_pats[di] = rule.pattern;
+                di += 1;
+            }
+        }
+    }
+
+    interceptor.install(e.allocator, w.worktree_path, worker_id, w.name, deny_pats, write_pats) catch |err| {
+        e.setError(if (err == error.GitNotFound) "tm_interceptor_install: git binary not found on PATH" else "tm_interceptor_install: failed to write wrapper script") catch {};
+        return 5; // TM_ERR_WORKTREE
+    };
+    return 0;
+}
+
+export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    const w = e.roster.getWorker(worker_id) orelse {
+        e.setError("tm_interceptor_remove: worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    };
+    interceptor.remove(w.worktree_path);
+    return 0;
+}
+
+export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
+    const e = engine orelse return null;
+    const w = e.roster.getWorker(worker_id) orelse return null;
+    const path = interceptor.getInterceptorPath(std.heap.c_allocator, w.worktree_path) catch return null;
+    if (path) |p| {
+        const z = std.heap.c_allocator.dupeZ(u8, p) catch {
+            std.heap.c_allocator.free(p);
+            return null;
+        };
+        std.heap.c_allocator.free(p);
+        return z.ptr;
+    }
+    return null;
 }
 
 // ─── Utility ─────────────────────────────────────────────
@@ -1359,4 +1447,139 @@ test "tm_result_to_string maps TM_ERR_OWNERSHIP" {
     try std.testing.expectEqualStrings("TM_ERR_OWNERSHIP", std.mem.span(tm_result_to_string(14)));
 }
 
-test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; }
+test "tm_interceptor_install null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_interceptor_install(null, 0) == 99);
+}
+
+test "tm_interceptor_remove null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_interceptor_remove(null, 0) == 99);
+}
+
+test "tm_interceptor_path null engine returns null" {
+    try std.testing.expect(tm_interceptor_path(null, 0) == null);
+}
+
+test "tm_interceptor_install creates wrapper and dismiss removes it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Set up a git repo
+    try worktree.runGit(std.testing.allocator, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.email", "test@test.com" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.name", "Test" });
+    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{root});
+    defer std.testing.allocator.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    try worktree.runGit(std.testing.allocator, root, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, root, &.{ "commit", "-m", "initial" });
+
+    // Spawn a worker
+    const name_z = try std.testing.allocator.dupeZ(u8, "/usr/bin/echo");
+    defer std.testing.allocator.free(name_z);
+    const worker_z = try std.testing.allocator.dupeZ(u8, "Worker1");
+    defer std.testing.allocator.free(worker_z);
+    const task_z = try std.testing.allocator.dupeZ(u8, "test task");
+    defer std.testing.allocator.free(task_z);
+
+    const worker_id = tm_worker_spawn(engine_ptr, name_z.ptr, 0, worker_z.ptr, task_z.ptr);
+    try std.testing.expect(worker_id != 0xFFFFFFFF);
+
+    // Register deny patterns
+    const deny_pat = try std.testing.allocator.dupeZ(u8, "src/backend/**");
+    defer std.testing.allocator.free(deny_pat);
+    try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, deny_pat.ptr, false) == 0);
+    const write_pat = try std.testing.allocator.dupeZ(u8, "src/frontend/**");
+    defer std.testing.allocator.free(write_pat);
+    try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, write_pat.ptr, true) == 0);
+
+    // Install interceptor
+    try std.testing.expect(tm_interceptor_install(engine_ptr, worker_id) == 0);
+
+    // Verify interceptor path is returned
+    const ipath = tm_interceptor_path(engine_ptr, worker_id);
+    try std.testing.expect(ipath != null);
+    const ipath_str = std.mem.span(ipath.?);
+    try std.testing.expect(std.mem.endsWith(u8, ipath_str, "/.git-wrapper"));
+    tm_free_string(ipath);
+
+    // Verify wrapper file exists with deny patterns
+    const e = engine_ptr.?;
+    const w = e.roster.getWorker(worker_id).?;
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{w.worktree_path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "src/backend/**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "src/frontend/**") != null);
+
+    // Dismiss — should remove wrapper
+    const wt_path_copy = try std.testing.allocator.dupe(u8, w.worktree_path);
+    defer std.testing.allocator.free(wt_path_copy);
+    try std.testing.expect(tm_worker_dismiss(engine_ptr, worker_id) == 0);
+
+    // After dismiss, interceptor path should return null (worker gone)
+    try std.testing.expect(tm_interceptor_path(engine_ptr, worker_id) == null);
+}
+
+test "tm_interceptor_install no patterns creates pass-through" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Set up a git repo
+    try worktree.runGit(std.testing.allocator, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.email", "test@test.com" });
+    try worktree.runGit(std.testing.allocator, root, &.{ "config", "user.name", "Test" });
+    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{root});
+    defer std.testing.allocator.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    try worktree.runGit(std.testing.allocator, root, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, root, &.{ "commit", "-m", "initial" });
+
+    // Spawn a worker with NO ownership rules
+    const name_z = try std.testing.allocator.dupeZ(u8, "/usr/bin/echo");
+    defer std.testing.allocator.free(name_z);
+    const worker_z = try std.testing.allocator.dupeZ(u8, "Worker4");
+    defer std.testing.allocator.free(worker_z);
+    const task_z = try std.testing.allocator.dupeZ(u8, "test task");
+    defer std.testing.allocator.free(task_z);
+
+    const worker_id = tm_worker_spawn(engine_ptr, name_z.ptr, 0, worker_z.ptr, task_z.ptr);
+    try std.testing.expect(worker_id != 0xFFFFFFFF);
+
+    // Install interceptor with no patterns — should create pass-through
+    try std.testing.expect(tm_interceptor_install(engine_ptr, worker_id) == 0);
+
+    // Verify wrapper is pass-through (no DENY_PATTERNS)
+    const e = engine_ptr.?;
+    const w = e.roster.getWorker(worker_id).?;
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{w.worktree_path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "DENY_PATTERNS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "exec \"") != null);
+}
+
+test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; }
