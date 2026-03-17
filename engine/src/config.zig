@@ -1447,7 +1447,7 @@ test "resolveRolePath - returns null for missing role" {
     try std.testing.expect(result == null);
 }
 
-test "resolveRolePath - project-local takes precedence" {
+test "resolveRolePath - project-local takes precedence over user-level" {
     const alloc = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1459,11 +1459,39 @@ test "resolveRolePath - project-local takes precedence" {
     try tmp_dir.dir.makePath(".teammux/roles");
     try tmp_dir.dir.writeFile(.{ .sub_path = ".teammux/roles/priority-role.toml", .data = "[identity]\nid = \"priority-role\"\n" });
 
+    // Also create a user-level role at ~/.teammux/roles/ (if HOME is set)
+    // so we can verify project-local wins when both exist
+    var created_user_role = false;
+    if (std.posix.getenv("HOME")) |home| {
+        const user_roles_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux/roles", .{home});
+        defer alloc.free(user_roles_dir);
+        std.fs.makeDirAbsolute(user_roles_dir) catch {};
+        const user_role_path = try std.fmt.allocPrint(alloc, "{s}/priority-role.toml", .{user_roles_dir});
+        defer alloc.free(user_role_path);
+        if (std.fs.createFileAbsolute(user_role_path, .{ .exclusive = true })) |f| {
+            f.writeAll("[identity]\nid = \"priority-role\"\n") catch {};
+            f.close();
+            created_user_role = true;
+        } else |_| {
+            // File already exists — another test or user role, don't overwrite
+        }
+    }
+    defer if (created_user_role) {
+        if (std.posix.getenv("HOME")) |home| {
+            if (std.fmt.allocPrint(alloc, "{s}/.teammux/roles/priority-role.toml", .{home})) |cleanup_path| {
+                defer alloc.free(cleanup_path);
+                std.fs.deleteFileAbsolute(cleanup_path) catch {};
+            } else |_| {}
+        }
+    };
+
     const result = try resolveRolePath(alloc, "priority-role", project_root);
     try std.testing.expect(result != null);
     defer alloc.free(result.?);
-    // Should contain project root path, not home dir
-    try std.testing.expect(std.mem.indexOf(u8, result.?, project_root) != null);
+    // Result must be the project-local path, not user-level
+    const expected_suffix = ".teammux/roles/priority-role.toml";
+    try std.testing.expect(std.mem.endsWith(u8, result.?, expected_suffix));
+    try std.testing.expect(std.mem.startsWith(u8, result.?, project_root));
 }
 
 test "listRolesInDir - lists TOML files" {
