@@ -9,6 +9,7 @@ struct RosterView: View {
     @Binding var activeWorkerId: UInt32?
 
     @State private var showSpawnPopover = false
+    @State private var selectedDrawerWorkerId: UInt32?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,12 +36,29 @@ struct RosterView: View {
                                 branch: engine.workerBranches[worker.id],
                                 isActive: activeWorkerId == worker.id,
                                 onTap: {
-                                    activeWorkerId = worker.id
+                                    if activeWorkerId == worker.id {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            selectedDrawerWorkerId =
+                                                selectedDrawerWorkerId == worker.id ? nil : worker.id
+                                        }
+                                    } else {
+                                        activeWorkerId = worker.id
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            selectedDrawerWorkerId = worker.id
+                                        }
+                                    }
                                 },
                                 onDismiss: {
                                     let success = engine.dismissWorker(worker.id)
-                                    if success, activeWorkerId == worker.id {
-                                        activeWorkerId = nil
+                                    if success {
+                                        if activeWorkerId == worker.id {
+                                            activeWorkerId = nil
+                                        }
+                                        if selectedDrawerWorkerId == worker.id {
+                                            withAnimation(.easeInOut(duration: 0.2)) {
+                                                selectedDrawerWorkerId = nil
+                                            }
+                                        }
                                     }
                                 }
                             )
@@ -48,6 +66,14 @@ struct RosterView: View {
                     }
                     .padding(.vertical, 4)
                 }
+            }
+
+            // Worker detail drawer — shown when a worker is selected
+            if let drawerId = selectedDrawerWorkerId,
+               let worker = engine.roster.first(where: { $0.id == drawerId }) {
+                Divider()
+                WorkerDetailDrawer(worker: worker, engine: engine)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             Divider()
