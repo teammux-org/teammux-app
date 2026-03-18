@@ -3187,4 +3187,147 @@ test "tm_dispatch_history round-trip returns correct events" {
     tm_dispatch_history_free(events, count);
 }
 
+// ─── S12 integration tests ──────────────────────────────
+// Cross-stream integration tests verifying that components from
+// different v0.1.3 streams work correctly together through the C API.
+
+test "S12 integration: tm_interceptor_install blocks git commit -a (S1 fix)" {
+    // Verifies S1 (interceptor.zig commit -a fix) works through the
+    // full C API path: tm_ownership_register → tm_interceptor_install →
+    // generated wrapper script contains commit -a blocking logic.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    // Set up git repo
+    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.email", "test@test.com" }) catch return;
+    worktree.runGit(alloc, root, &.{ "config", "user.name", "Test" }) catch return;
+    const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
+    defer alloc.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
+    worktree.runGit(alloc, root, &.{ "commit", "-m", "initial" }) catch return;
+
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Spawn worker
+    const binary_z = try alloc.dupeZ(u8, "/usr/bin/echo");
+    defer alloc.free(binary_z);
+    const name_z = try alloc.dupeZ(u8, "FrontendEngineer");
+    defer alloc.free(name_z);
+    const task_z = try alloc.dupeZ(u8, "build login form");
+    defer alloc.free(task_z);
+
+    const worker_id = tm_worker_spawn(engine_ptr, binary_z.ptr, 0, name_z.ptr, task_z.ptr);
+    try std.testing.expect(worker_id != 0xFFFFFFFF);
+
+    // Register deny patterns (worker cannot write to backend)
+    const deny_z = try alloc.dupeZ(u8, "src/backend/**");
+    defer alloc.free(deny_z);
+    try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, deny_z.ptr, false) == 0);
+    const write_z = try alloc.dupeZ(u8, "src/frontend/**");
+    defer alloc.free(write_z);
+    try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, write_z.ptr, true) == 0);
+
+    // Install interceptor via C API
+    try std.testing.expect(tm_interceptor_install(engine_ptr, worker_id) == 0);
+
+    // Read generated wrapper script
+    const e = engine_ptr.?;
+    const w = e.roster.getWorker(worker_id).?;
+    const wrapper_path = try std.fmt.allocPrint(alloc, "{s}/.git-wrapper/git", .{w.worktree_path});
+    defer alloc.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(alloc, 64 * 1024);
+    defer alloc.free(content);
+
+    // S1 fix: commit -a interception must be present
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"commit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "-a|--all|-a*)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot use 'git commit -a'") != null);
+    // Deny patterns embedded
+    try std.testing.expect(std.mem.indexOf(u8, content, "src/backend/**") != null);
+    // Write scope in error message
+    try std.testing.expect(std.mem.indexOf(u8, content, "src/frontend/**") != null);
+    // git add bulk blocking also present
+    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot stage all files") != null);
+}
+
+test "S12 integration: tm_dispatch_task routes through bus to subscriber (S5 path)" {
+    // Verifies the full dispatch path: tm_dispatch_task C API export →
+    // coordinator.dispatchTask → message bus → subscriber callback.
+    // This is the S5 (coordinator engine) path through the C API boundary.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    // Set up message bus
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "s12disp", root);
+
+    // Subscribe to bus — verify dispatch message is received
+    const State = struct {
+        var received: bool = false;
+        var received_to: u32 = 0;
+        var received_type: c_int = -1;
+    };
+    State.received = false;
+    State.received_to = 0;
+    State.received_type = -1;
+
+    const callback = struct {
+        fn cb(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                State.received = true;
+                State.received_to = m.to;
+                State.received_type = m.msg_type;
+            }
+            return 0;
+        }
+    }.cb;
+    e.message_bus.?.subscribe(callback, null);
+
+    // Add worker to roster
+    try e.roster.workers.put(7, try coordinator_mod.makeTestWorker(alloc, 7));
+
+    // Dispatch via C API (same path Swift's EngineClient.dispatchTask calls)
+    const instruction_z = try alloc.dupeZ(u8, "refactor the auth module");
+    defer alloc.free(instruction_z);
+    try std.testing.expect(tm_dispatch_task(e, 7, instruction_z.ptr) == 0);
+
+    // Bus subscriber received the dispatch message
+    try std.testing.expect(State.received);
+    try std.testing.expect(State.received_to == 7);
+    try std.testing.expect(State.received_type == @intFromEnum(bus.MessageType.dispatch));
+
+    // Coordinator history recorded
+    const history = e.coordinator.getHistory();
+    try std.testing.expect(history.len == 1);
+    try std.testing.expectEqualStrings("refactor the auth module", history[0].instruction);
+    try std.testing.expect(history[0].target_worker_id == 7);
+    try std.testing.expect(history[0].delivered == true);
+    try std.testing.expect(history[0].kind == .task);
+
+    // Invalid worker returns TM_ERR_INVALID_WORKER
+    try std.testing.expect(tm_dispatch_task(e, 999, instruction_z.ptr) == 12);
+}
+
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; }

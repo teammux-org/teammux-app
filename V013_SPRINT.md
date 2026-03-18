@@ -18,20 +18,20 @@
 
 ## 2. Stream Map
 
-| Stream | Worktree              | Branch                                  | Owns                                        | Depends on     | Merges after      |
-|--------|-----------------------|-----------------------------------------|---------------------------------------------|----------------|-------------------|
-| S1     | ../teammux-stream-s1  | feat/v013-stream-s1-interceptor-fix     | TD12: git commit -a interception            | nothing        | any time          |
-| S2     | ../teammux-stream-s2  | feat/v013-stream-s2-completion-engine   | TD13 engine: TM_MSG_COMPLETION/QUESTION     | nothing        | Wave 1            |
-| S3     | ../teammux-stream-s3  | feat/v013-stream-s3-bundled-roles       | TD14 C API: tm_roles_list_bundled           | nothing        | Wave 1            |
-| S4     | ../teammux-stream-s4  | feat/v013-stream-s4-hot-reload-engine   | TD10: hotreload.zig, kqueue role watcher    | nothing        | Wave 1            |
-| S5     | ../teammux-stream-s5  | feat/v013-stream-s5-coordinator-engine  | coordinator.zig, tm_dispatch_*              | nothing        | Wave 1            |
-| S6     | ../teammux-stream-s6  | feat/v013-stream-s6-completion-bridge   | TD13 Swift: CompletionReport, QuestionRequest| S2 merged     | after S2          |
-| S7     | ../teammux-stream-s7  | feat/v013-stream-s7-hot-reload-bridge   | role hot-reload Swift bridge                | S4 merged      | after S4          |
-| S8     | ../teammux-stream-s8  | feat/v013-stream-s8-coordinator-bridge  | coordinator Swift bridge, dispatchTask      | S5 merged      | after S5          |
-| S9     | ../teammux-stream-s9  | feat/v013-stream-s9-role-selector-ui    | TeamBuilderView role selector (TD14)        | S3 merged      | after S3          |
-| S10    | ../teammux-stream-s10 | feat/v013-stream-s10-completion-ui      | Completion/Question right pane UI           | S6 merged      | after S6          |
-| S11    | ../teammux-stream-s11 | feat/v013-stream-s11-dispatch-ui        | Dispatch tab, DispatchView.swift            | S8 merged      | after S8          |
-| S12    | ../teammux-stream-s12 | feat/v013-stream-s12-polish             | integration tests, docs, polish             | S9+S10+S11     | last              |
+| Stream | Worktree              | Branch                                  | Owns                                        | Depends on     | Merges after      | Status   |
+|--------|-----------------------|-----------------------------------------|---------------------------------------------|----------------|-------------------|----------|
+| S1     | ../teammux-stream-s1  | feat/v013-stream-s1-interceptor-fix     | TD12: git commit -a interception            | nothing        | any time          | COMPLETE |
+| S2     | ../teammux-stream-s2  | feat/v013-stream-s2-completion-engine   | TD13 engine: TM_MSG_COMPLETION/QUESTION     | nothing        | Wave 1            | COMPLETE |
+| S3     | ../teammux-stream-s3  | feat/v013-stream-s3-bundled-roles       | TD14 C API: tm_roles_list_bundled           | nothing        | Wave 1            | COMPLETE |
+| S4     | ../teammux-stream-s4  | feat/v013-stream-s4-hot-reload-engine   | TD10: hotreload.zig, kqueue role watcher    | nothing        | Wave 1            | COMPLETE |
+| S5     | ../teammux-stream-s5  | feat/v013-stream-s5-coordinator-engine  | coordinator.zig, tm_dispatch_*              | nothing        | Wave 1            | COMPLETE |
+| S6     | ../teammux-stream-s6  | feat/v013-stream-s6-completion-bridge   | TD13 Swift: CompletionReport, QuestionRequest| S2 merged     | after S2          | COMPLETE |
+| S7     | ../teammux-stream-s7  | feat/v013-stream-s7-hot-reload-bridge   | role hot-reload Swift bridge                | S4 merged      | after S4          | COMPLETE |
+| S8     | ../teammux-stream-s8  | feat/v013-stream-s8-coordinator-bridge  | coordinator Swift bridge, dispatchTask      | S5 merged      | after S5          | COMPLETE |
+| S9     | ../teammux-stream-s9  | feat/v013-stream-s9-role-selector-ui    | TeamBuilderView role selector (TD14)        | S3 merged      | after S3          | COMPLETE |
+| S10    | ../teammux-stream-s10 | feat/v013-stream-s10-completion-ui      | Completion/Question right pane UI           | S6 merged      | after S6          | COMPLETE |
+| S11    | ../teammux-stream-s11 | feat/v013-stream-s11-dispatch-ui        | Dispatch tab, DispatchView.swift            | S8 merged      | after S8          | COMPLETE |
+| S12    | ../teammux-stream-s12 | feat/v013-stream-s12-polish             | integration tests, docs, polish             | S9+S10+S11     | last              | COMPLETE |
 
 ---
 

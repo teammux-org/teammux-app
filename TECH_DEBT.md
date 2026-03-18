@@ -19,14 +19,14 @@
 |-----|-----------------|-------------------------------------------------------------------|-----------|----------|----------|
 | TD9 | interceptor.zig | PTY git wrapper installed but PATH injection not wired            | stream-R8 | NO       | RESOLVED |
 
-## v0.1.3 — Current sprint targets
+## v0.1.3 — Resolved
 
 | ID   | Module                      | Issue                                                              | Stream | Breaking | Status   |
 |------|-----------------------------|--------------------------------------------------------------------|--------|----------|----------|
-| TD10 | hotreload.zig               | Role hot-reload for active workers not implemented                 | S4     | NO       | OPEN     |
-| TD11 | SpawnPopoverView            | Role selector UI (browse/preview bundled roles before spawning)    | S9     | NO       | OPEN     |
-| TD12 | interceptor.zig             | git commit -a bypasses interceptor                                 | S1     | NO       | OPEN     |
-| TD13 | commands.zig / EngineClient | /teammux-complete and /teammux-question have no Swift-side handlers| S2/S6  | NO       | OPEN     |
+| TD10 | hotreload.zig               | Role hot-reload for active workers not implemented                 | S4/S7  | NO       | RESOLVED |
+| TD11 | SpawnPopoverView            | Role selector UI (browse/preview bundled roles before spawning)    | S9     | NO       | RESOLVED |
+| TD12 | interceptor.zig             | git commit -a bypasses interceptor                                 | S1     | NO       | RESOLVED |
+| TD13 | commands.zig / EngineClient | /teammux-complete and /teammux-question have no Swift-side handlers| S2/S6  | NO       | RESOLVED |
 | TD14 | TeamBuilderView             | Role picker in setup flow — session not started during setup       | S3/S9  | NO       | RESOLVED |
 
 ## v0.1.3 — New debt introduced this sprint
