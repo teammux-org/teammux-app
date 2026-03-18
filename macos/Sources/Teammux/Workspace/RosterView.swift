@@ -32,6 +32,7 @@ struct RosterView: View {
                             WorkerRow(
                                 worker: worker,
                                 role: engine.workerRoles[worker.id],
+                                branch: engine.workerBranches[worker.id],
                                 isActive: activeWorkerId == worker.id,
                                 onTap: {
                                     activeWorkerId = worker.id
