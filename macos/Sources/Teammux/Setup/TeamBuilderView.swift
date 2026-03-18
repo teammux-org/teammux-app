@@ -10,6 +10,7 @@ import SwiftUI
 /// - GitHub connection status
 struct TeamBuilderView: View {
     @Binding var config: TeamConfig
+    let projectRoot: URL?
     let onNext: () -> Void
     let onBack: () -> Void
 
@@ -22,6 +23,8 @@ struct TeamBuilderView: View {
     ]
 
     @State private var ghStatus: GitHubStatus = .detecting
+    @State private var bundledRoles: [RoleDefinition] = []
+    @State private var rolesLoaded = false
 
     var body: some View {
         ScrollView {
@@ -56,7 +59,13 @@ struct TeamBuilderView: View {
             .padding(24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear { detectGitHubAuth() }
+        .onAppear {
+            detectGitHubAuth()
+            if !rolesLoaded {
+                bundledRoles = EngineClient.listBundledRoles(projectRoot: projectRoot?.path)
+                rolesLoaded = true
+            }
+        }
     }
 
     // MARK: - Team Lead
@@ -118,53 +127,73 @@ struct TeamBuilderView: View {
     }
 
     private func workerRow(at index: Int) -> some View {
-        HStack(spacing: 12) {
-            // Name
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Name")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField("Name", text: $config.workers[index].name)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 150)
-            }
-
-            // Agent
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Agent")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Picker("Agent", selection: $config.workers[index].agent) {
-                    Text("Claude Code").tag(AgentType.claudeCode)
-                    Text("Codex CLI").tag(AgentType.codexCli)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                // Name
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Name")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("Name", text: $config.workers[index].name)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 150)
                 }
-                .labelsHidden()
-                .frame(maxWidth: 150)
-            }
 
-            // Model
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Model")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Picker("Model", selection: $config.workers[index].model) {
-                    ForEach(availableModels, id: \.self) { model in
-                        Text(model).tag(model)
+                // Agent
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Agent")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Picker("Agent", selection: $config.workers[index].agent) {
+                        Text("Claude Code").tag(AgentType.claudeCode)
+                        Text("Codex CLI").tag(AgentType.codexCli)
                     }
+                    .labelsHidden()
+                    .frame(maxWidth: 150)
                 }
-                .labelsHidden()
-                .frame(maxWidth: 200)
+
+                // Model
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Model")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Picker("Model", selection: $config.workers[index].model) {
+                        ForEach(availableModels, id: \.self) { model in
+                            Text(model).tag(model)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 200)
+                }
+
+                // Role
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Role")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    workerRolePicker(at: index)
+                }
+
+                Spacer()
+
+                // Remove
+                Button(action: { removeWorker(at: index) }) {
+                    Image(systemName: "minus.circle")
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
+                .help("Remove this teammate")
             }
 
-            Spacer()
-
-            // Remove
-            Button(action: { removeWorker(at: index) }) {
-                Image(systemName: "minus.circle")
-                    .foregroundColor(.red)
+            // Role description
+            if let roleId = config.workers[index].roleId,
+               let role = bundledRoles.first(where: { $0.id == roleId }) {
+                Text(role.description)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .padding(.leading, 4)
             }
-            .buttonStyle(.plain)
-            .help("Remove this teammate")
         }
         .padding(.vertical, 4)
     }
@@ -182,6 +211,45 @@ struct TeamBuilderView: View {
     private func removeWorker(at index: Int) {
         guard config.workers.indices.contains(index) else { return }
         config.workers.remove(at: index)
+    }
+
+    // MARK: - Role picker
+
+    @ViewBuilder
+    private func workerRolePicker(at index: Int) -> some View {
+        if !rolesLoaded {
+            ProgressView()
+                .controlSize(.small)
+                .frame(maxWidth: 180)
+        } else if !bundledRoles.isEmpty {
+            Picker("Role", selection: $config.workers[index].roleId) {
+                Text("No role (generic)").tag(Optional<String>.none)
+                ForEach(populatedDivisions, id: \.self) { division in
+                    Section(division.displayName) {
+                        ForEach(rolesForDivision(division)) { role in
+                            Text(role.emoji.isEmpty ? role.name : "\(role.emoji) \(role.name)")
+                                .tag(Optional(role.id))
+                        }
+                    }
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(maxWidth: 180)
+        } else {
+            Text("Roles unavailable — you can assign roles after launch")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: 180)
+        }
+    }
+
+    private var populatedDivisions: [RoleDivision] {
+        RoleDivision.allCases.filter { !rolesForDivision($0).isEmpty }
+    }
+
+    private func rolesForDivision(_ division: RoleDivision) -> [RoleDefinition] {
+        bundledRoles.filter { $0.division == division.rawValue }
     }
 
     // MARK: - GitHub

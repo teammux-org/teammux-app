@@ -774,12 +774,50 @@ final class EngineClient: ObservableObject {
                 Self.logger.warning("loadAvailableRoles: NULL role at index \(i) — skipping")
                 continue
             }
-            roles.append(bridgeRole(rolePtr))
+            roles.append(Self.bridgeRole(rolePtr))
         }
 
         tm_roles_list_free(rolesPtr, count)
         availableRoles = roles
         Self.logger.info("loadAvailableRoles: loaded \(roles.count) roles")
+    }
+
+    /// Load bundled roles without an active engine session.
+    /// Wraps `tm_roles_list_bundled()` + `tm_roles_list_bundled_free()`.
+    /// Pass `nil` for `projectRoot` to skip project-local role search.
+    /// Safe to call before `create()` or `sessionStart()`.
+    static func listBundledRoles(projectRoot: String?) -> [RoleDefinition] {
+        var count: UInt32 = 0
+
+        let rolesPtr: UnsafeMutablePointer<UnsafeMutablePointer<tm_role_t>?>?
+        if let projectRoot {
+            rolesPtr = projectRoot.withCString { cRoot in
+                tm_roles_list_bundled(cRoot, &count)
+            }
+        } else {
+            rolesPtr = tm_roles_list_bundled(nil, &count)
+        }
+
+        guard let rolesPtr, count > 0 else {
+            if let rolesPtr {
+                tm_roles_list_bundled_free(rolesPtr, count)
+            }
+            logger.info("listBundledRoles: no roles found")
+            return []
+        }
+
+        var roles: [RoleDefinition] = []
+        for i in 0..<Int(count) {
+            guard let rolePtr = rolesPtr[i] else {
+                logger.warning("listBundledRoles: NULL role at index \(i) — skipping")
+                continue
+            }
+            roles.append(bridgeRole(rolePtr))
+        }
+
+        tm_roles_list_bundled_free(rolesPtr, count)
+        logger.info("listBundledRoles: loaded \(roles.count) roles")
+        return roles
     }
 
     /// Look up the role assigned to a worker at spawn time.
@@ -856,7 +894,7 @@ final class EngineClient: ObservableObject {
             return nil
         }
 
-        let role = bridgeRole(rolePtr)
+        let role = Self.bridgeRole(rolePtr)
         tm_role_free(rolePtr)
         return role
     }
@@ -864,7 +902,7 @@ final class EngineClient: ObservableObject {
     /// Bridge a `tm_role_t*` to a Swift `RoleDefinition`.
     /// Extracts string fields, boolean capabilities, and iterates
     /// the `const char**` pattern arrays.
-    private func bridgeRole(_ rolePtr: UnsafeMutablePointer<tm_role_t>) -> RoleDefinition {
+    private static func bridgeRole(_ rolePtr: UnsafeMutablePointer<tm_role_t>) -> RoleDefinition {
         let role = rolePtr.pointee
         let roleId = String(cString: role.id)
 

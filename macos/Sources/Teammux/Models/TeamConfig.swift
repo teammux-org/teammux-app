@@ -53,17 +53,20 @@ struct WorkerConfig: Identifiable, Equatable {
     var name: String
     var agent: AgentType
     var model: String
+    var roleId: String?
 
     init(
         id: String = UUID().uuidString,
         name: String,
         agent: AgentType,
-        model: String
+        model: String,
+        roleId: String? = nil
     ) {
         self.id = id
         self.name = name
         self.agent = agent
         self.model = model
+        self.roleId = roleId
     }
 
     static var `default`: WorkerConfig {
@@ -123,6 +126,9 @@ struct TeamConfig: Equatable {
             lines.append("agent = \"\(agentTOMLKey(worker.agent))\"")
             lines.append("model = \"\(escapeTOML(worker.model))\"")
             lines.append("permissions = \"full\"")
+            if let roleId = worker.roleId, !roleId.isEmpty {
+                lines.append("role = \"\(escapeTOML(roleId))\"")
+            }
             lines.append("")
         }
 

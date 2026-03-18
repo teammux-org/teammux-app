@@ -27,7 +27,7 @@
 | TD11 | SpawnPopoverView            | Role selector UI (browse/preview bundled roles before spawning)    | S9     | NO       | OPEN     |
 | TD12 | interceptor.zig             | git commit -a bypasses interceptor                                 | S1     | NO       | OPEN     |
 | TD13 | commands.zig / EngineClient | /teammux-complete and /teammux-question have no Swift-side handlers| S2/S6  | NO       | OPEN     |
-| TD14 | TeamBuilderView             | Role picker in setup flow — session not started during setup       | S3/S9  | NO       | OPEN     |
+| TD14 | TeamBuilderView             | Role picker in setup flow — session not started during setup       | S3/S9  | NO       | RESOLVED |
 
 ## v0.1.3 — New debt introduced this sprint
 

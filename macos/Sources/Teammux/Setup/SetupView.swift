@@ -41,7 +41,7 @@ struct SetupView: View {
                     }
 
                 case .team:
-                    TeamBuilderView(config: $teamConfig) {
+                    TeamBuilderView(config: $teamConfig, projectRoot: selectedProject) {
                         step = .initiate
                     } onBack: {
                         step = .project
