@@ -4,48 +4,61 @@ import os
 // MARK: - MessageType
 
 /// Maps to `tm_message_type_t` in teammux.h.
-/// TASK=0, INSTRUCTION=1, CONTEXT=2, STATUS_REQ=3,
-/// STATUS_RPT=4, COMPLETION=5, ERROR=6, BROADCAST=7, QUESTION=8
+/// TASK=0, INSTRUCTION=1, CONTEXT=2, STATUS_REQ=3, STATUS_RPT=4,
+/// COMPLETION=5, ERROR=6, BROADCAST=7, QUESTION=8, DISPATCH=10,
+/// RESPONSE=11, PEER_QUESTION=12, DELEGATION=13
 enum MessageType: Int, CaseIterable, Sendable {
-    case task        = 0
-    case instruction = 1
-    case context     = 2
-    case statusReq   = 3
-    case statusRpt   = 4
-    case completion  = 5
-    case error       = 6
-    case broadcast   = 7
-    case question    = 8
+    case task         = 0
+    case instruction  = 1
+    case context      = 2
+    case statusReq    = 3
+    case statusRpt    = 4
+    case completion   = 5
+    case error        = 6
+    case broadcast    = 7
+    case question     = 8
+    case dispatch     = 10
+    case response     = 11
+    case peerQuestion = 12
+    case delegation   = 13
 
     private static let logger = Logger(subsystem: "com.teammux.app", category: "MessageType")
 
     /// Semantic color for Live Feed badges and message type indicators.
     var color: Color {
         switch self {
-        case .task:        return .blue
-        case .instruction: return .purple
-        case .context:     return .secondary
-        case .statusReq:   return .orange
-        case .statusRpt:   return .green
-        case .completion:  return .green
-        case .error:       return .red
-        case .broadcast:   return .yellow
-        case .question:    return .cyan
+        case .task:         return .blue
+        case .instruction:  return .purple
+        case .context:      return .secondary
+        case .statusReq:    return .orange
+        case .statusRpt:    return .green
+        case .completion:   return .green
+        case .error:        return .red
+        case .broadcast:    return .yellow
+        case .question:     return .cyan
+        case .dispatch:     return .blue
+        case .response:     return .teal
+        case .peerQuestion: return .cyan
+        case .delegation:   return .purple
         }
     }
 
     /// Human-readable label shown in the Live Feed and message inspector.
     var label: String {
         switch self {
-        case .task:        return "Task"
-        case .instruction: return "Instruction"
-        case .context:     return "Context"
-        case .statusReq:   return "Status Request"
-        case .statusRpt:   return "Status Report"
-        case .completion:  return "Completion"
-        case .error:       return "Error"
-        case .broadcast:   return "Broadcast"
-        case .question:    return "Question"
+        case .task:         return "Task"
+        case .instruction:  return "Instruction"
+        case .context:      return "Context"
+        case .statusReq:    return "Status Request"
+        case .statusRpt:    return "Status Report"
+        case .completion:   return "Completion"
+        case .error:        return "Error"
+        case .broadcast:    return "Broadcast"
+        case .question:     return "Question"
+        case .dispatch:     return "Dispatch"
+        case .response:     return "Response"
+        case .peerQuestion: return "Peer Question"
+        case .delegation:   return "Delegation"
         }
     }
 

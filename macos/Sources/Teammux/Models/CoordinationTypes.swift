@@ -98,3 +98,67 @@ struct DispatchEvent: Identifiable, Equatable, Sendable {
         self.kind = kind
     }
 }
+
+// MARK: - PeerQuestion
+
+/// A worker-to-worker question routed via Team Lead relay.
+/// Delivered via `TM_MSG_PEER_QUESTION` (12) on the message bus.
+///
+/// Keyed by `fromWorkerId` in `EngineClient.peerQuestions` — only the latest
+/// question per sending worker is stored. A second question before relay
+/// overwrites the first (latest state wins).
+///
+/// Payload format from engine: `{"worker_id": N, "target_worker_id": M, "message": "..."}`
+struct PeerQuestion: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let fromWorkerId: UInt32
+    let targetWorkerId: UInt32
+    let message: String
+    let timestamp: Date
+
+    init(
+        id: UUID = UUID(),
+        fromWorkerId: UInt32,
+        targetWorkerId: UInt32,
+        message: String,
+        timestamp: Date
+    ) {
+        self.id = id
+        self.fromWorkerId = fromWorkerId
+        self.targetWorkerId = targetWorkerId
+        self.message = message
+        self.timestamp = timestamp
+    }
+}
+
+// MARK: - PeerDelegation
+
+/// A worker-to-worker task delegation routed directly to the target worker.
+/// Delivered via `TM_MSG_DELEGATION` (13) on the message bus.
+///
+/// Stored in `EngineClient.peerDelegations` as an append-only array (cap 100).
+/// Displayed as informational cards in LiveFeedView — no action buttons needed
+/// because the engine has already routed the delegation to the target worker's PTY.
+///
+/// Payload format from engine: `{"worker_id": N, "target_worker_id": M, "task": "..."}`
+struct PeerDelegation: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let fromWorkerId: UInt32
+    let targetWorkerId: UInt32
+    let task: String
+    let timestamp: Date
+
+    init(
+        id: UUID = UUID(),
+        fromWorkerId: UInt32,
+        targetWorkerId: UInt32,
+        task: String,
+        timestamp: Date
+    ) {
+        self.id = id
+        self.fromWorkerId = fromWorkerId
+        self.targetWorkerId = targetWorkerId
+        self.task = task
+        self.timestamp = timestamp
+    }
+}
