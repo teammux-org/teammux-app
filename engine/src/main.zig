@@ -1933,6 +1933,64 @@ fn freeCOwnershipEntry(ptr: ?*COwnershipEntry) void {
     std.heap.c_allocator.destroy(entry);
 }
 
+export fn tm_ownership_update(
+    engine: ?*Engine,
+    worker_id: u32,
+    write_patterns: ?[*]const ?[*:0]const u8,
+    write_count: u32,
+    deny_patterns: ?[*]const ?[*:0]const u8,
+    deny_count: u32,
+) c_int {
+    const e = engine orelse return 99;
+
+    // Convert C string arrays to Zig slices
+    const write_slices = e.allocator.alloc([]const u8, write_count) catch {
+        e.setError("tm_ownership_update: allocation failed") catch {};
+        return 14; // TM_ERR_OWNERSHIP
+    };
+    defer e.allocator.free(write_slices);
+
+    const deny_slices = e.allocator.alloc([]const u8, deny_count) catch {
+        e.setError("tm_ownership_update: allocation failed") catch {};
+        return 14;
+    };
+    defer e.allocator.free(deny_slices);
+
+    if (write_count > 0) {
+        const w_ptrs = write_patterns orelse {
+            e.setError("tm_ownership_update: write_patterns NULL with non-zero count") catch {};
+            return 14;
+        };
+        for (0..write_count) |i| {
+            write_slices[i] = std.mem.span(w_ptrs[i] orelse {
+                e.setError("tm_ownership_update: NULL write pattern") catch {};
+                return 14;
+            });
+        }
+    }
+
+    if (deny_count > 0) {
+        const d_ptrs = deny_patterns orelse {
+            e.setError("tm_ownership_update: deny_patterns NULL with non-zero count") catch {};
+            return 14;
+        };
+        for (0..deny_count) |i| {
+            deny_slices[i] = std.mem.span(d_ptrs[i] orelse {
+                e.setError("tm_ownership_update: NULL deny pattern") catch {};
+                return 14;
+            });
+        }
+    }
+
+    e.ownership_registry.updateWorkerRules(worker_id, write_slices, deny_slices) catch |err| {
+        e.setError(switch (err) {
+            error.OutOfMemory => "tm_ownership_update: allocation failed (out of memory)",
+        }) catch {};
+        return 14;
+    };
+    return 0;
+}
+
 // ─── Git interceptor ─────────────────────────────────────
 
 export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
@@ -2068,6 +2126,9 @@ export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u
         w.task_description,
         w.branch_name,
         e.project_root,
+        w.worktree_path,
+        w.name,
+        &e.ownership_registry,
         cb,
         userdata,
     ) catch |err| {
@@ -2950,6 +3011,95 @@ test "tm_ownership_get returns null when no rules" {
     var count: u32 = 42;
     try std.testing.expect(tm_ownership_get(engine_ptr, 99, &count) == null);
     try std.testing.expect(count == 0);
+}
+
+test "tm_ownership_update null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_ownership_update(null, 0, null, 0, null, 0) == 99);
+}
+
+test "tm_ownership_update null write_patterns with non-zero count returns TM_ERR_OWNERSHIP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    try std.testing.expect(tm_ownership_update(engine_ptr, 1, null, 2, null, 0) == 14);
+}
+
+test "tm_ownership_update null deny_patterns with non-zero count returns TM_ERR_OWNERSHIP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    try std.testing.expect(tm_ownership_update(engine_ptr, 1, null, 0, null, 2) == 14);
+}
+
+test "tm_ownership_update replaces rules and check reflects new state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Register initial rules via register API
+    const write_pat = try std.testing.allocator.dupeZ(u8, "src/frontend/**");
+    defer std.testing.allocator.free(write_pat);
+    const deny_pat = try std.testing.allocator.dupeZ(u8, "src/backend/**");
+    defer std.testing.allocator.free(deny_pat);
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, write_pat.ptr, true) == 0);
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, deny_pat.ptr, false) == 0);
+
+    // Verify initial state
+    var allowed: bool = false;
+    const frontend_path = try std.testing.allocator.dupeZ(u8, "src/frontend/App.tsx");
+    defer std.testing.allocator.free(frontend_path);
+    const backend_path = try std.testing.allocator.dupeZ(u8, "src/backend/server.ts");
+    defer std.testing.allocator.free(backend_path);
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, frontend_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, backend_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == false);
+
+    // Update via tm_ownership_update: swap access
+    const new_write = try std.testing.allocator.dupeZ(u8, "src/backend/**");
+    defer std.testing.allocator.free(new_write);
+    const new_deny = try std.testing.allocator.dupeZ(u8, "src/frontend/**");
+    defer std.testing.allocator.free(new_deny);
+    const w_ptrs = [_]?[*:0]const u8{new_write.ptr};
+    const d_ptrs = [_]?[*:0]const u8{new_deny.ptr};
+    try std.testing.expect(tm_ownership_update(engine_ptr, 1, &w_ptrs, 1, &d_ptrs, 1) == 0);
+
+    // Verify updated state: frontend now denied, backend now allowed
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, frontend_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == false);
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, backend_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+}
+
+test "tm_ownership_update with zero counts and null patterns succeeds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const root_z = try std.testing.allocator.dupeZ(u8, root);
+    defer std.testing.allocator.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    try std.testing.expect(tm_ownership_update(engine_ptr, 1, null, 0, null, 0) == 0);
 }
 
 test "tm_worker_dismiss releases ownership" {

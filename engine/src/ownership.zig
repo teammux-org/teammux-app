@@ -122,6 +122,56 @@ pub const FileOwnershipRegistry = struct {
         return self.rules.get(worker_id);
     }
 
+    /// Replace all ownership rules for a worker under lock. Allocates new
+    /// rules first — on allocation failure, old rules are preserved unchanged.
+    /// On success, old rules are freed and replaced with the new set.
+    /// Passing empty write and deny patterns creates an explicit empty rule
+    /// set (all writes denied). To make a worker unrestricted, use release().
+    pub fn updateWorkerRules(
+        self: *FileOwnershipRegistry,
+        worker_id: WorkerId,
+        write_patterns: []const []const u8,
+        deny_patterns: []const []const u8,
+    ) !void {
+        const total = write_patterns.len + deny_patterns.len;
+
+        // Allocate and populate new rules outside the lock to minimize
+        // contention. On failure, nothing is modified.
+        const new_rules = try self.allocator.alloc(PathRule, total);
+        var duped: usize = 0;
+        errdefer {
+            for (new_rules[0..duped]) |rule| self.allocator.free(rule.pattern);
+            self.allocator.free(new_rules);
+        }
+
+        for (write_patterns) |pat| {
+            new_rules[duped] = .{
+                .pattern = try self.allocator.dupe(u8, pat),
+                .allow_write = true,
+            };
+            duped += 1;
+        }
+        for (deny_patterns) |pat| {
+            new_rules[duped] = .{
+                .pattern = try self.allocator.dupe(u8, pat),
+                .allow_write = false,
+            };
+            duped += 1;
+        }
+
+        // Swap under lock. Use getOrPut to pre-allocate the map slot
+        // BEFORE freeing old rules — if resize fails, old rules are preserved
+        // and new rules are freed by errdefer.
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const gop = try self.rules.getOrPut(worker_id);
+        if (gop.found_existing) {
+            freeRules(self.allocator, gop.value_ptr.*);
+        }
+        gop.value_ptr.* = new_rules;
+    }
+
     fn freeRules(allocator: std.mem.Allocator, rules_slice: []PathRule) void {
         for (rules_slice) |rule| {
             allocator.free(rule.pattern);
@@ -497,6 +547,152 @@ test "registry - concurrent check calls" {
             break;
         };
         started += 1;
+    }
+
+    for (threads[0..started]) |t| t.join();
+}
+
+// ─────────────────────────────────────────────────────────
+// Tests — updateWorkerRules
+// ─────────────────────────────────────────────────────────
+
+test "updateWorkerRules - replaces existing rules" {
+    var reg = FileOwnershipRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    // Register initial rules
+    try reg.register(1, "src/frontend/**", true);
+    try reg.register(1, "src/backend/**", false);
+    try std.testing.expect(reg.check(1, "src/frontend/App.tsx"));
+    try std.testing.expect(!reg.check(1, "src/backend/server.ts"));
+
+    // Update: swap frontend/backend access
+    const new_write = [_][]const u8{"src/backend/**"};
+    const new_deny = [_][]const u8{"src/frontend/**"};
+    try reg.updateWorkerRules(1, &new_write, &new_deny);
+
+    // Old rules gone, new rules active
+    try std.testing.expect(!reg.check(1, "src/frontend/App.tsx")); // now denied
+    try std.testing.expect(reg.check(1, "src/backend/server.ts")); // now allowed
+}
+
+test "updateWorkerRules - old patterns removed" {
+    var reg = FileOwnershipRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try reg.register(1, "src/**", true);
+    try reg.register(1, "infra/**", false);
+
+    const rules_before = reg.getRules(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rules_before.len == 2);
+
+    // Update with completely different patterns
+    const new_write = [_][]const u8{"tests/**"};
+    const new_deny = [_][]const u8{"docs/**"};
+    try reg.updateWorkerRules(1, &new_write, &new_deny);
+
+    const rules_after = reg.getRules(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rules_after.len == 2);
+    try std.testing.expectEqualStrings("tests/**", rules_after[0].pattern);
+    try std.testing.expect(rules_after[0].allow_write == true);
+    try std.testing.expectEqualStrings("docs/**", rules_after[1].pattern);
+    try std.testing.expect(rules_after[1].allow_write == false);
+
+    // Old patterns no longer match
+    try std.testing.expect(!reg.check(1, "src/foo.ts"));
+    try std.testing.expect(!reg.check(1, "infra/main.tf"));
+}
+
+test "updateWorkerRules - creates rules for new worker" {
+    var reg = FileOwnershipRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try std.testing.expect(reg.getRules(42) == null);
+
+    const write = [_][]const u8{"src/**"};
+    const deny = [_][]const u8{"vendor/**"};
+    try reg.updateWorkerRules(42, &write, &deny);
+
+    const rules = reg.getRules(42) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rules.len == 2);
+    try std.testing.expect(reg.check(42, "src/main.zig"));
+    try std.testing.expect(!reg.check(42, "vendor/lib.zig"));
+}
+
+test "updateWorkerRules - empty patterns denies all writes" {
+    var reg = FileOwnershipRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try reg.register(1, "src/**", true);
+    try reg.register(1, "infra/**", false);
+
+    // Update with no patterns — explicit empty rule set (deny-all,
+    // unlike no-rules default-allow from release())
+    const empty = [_][]const u8{};
+    try reg.updateWorkerRules(1, &empty, &empty);
+
+    const rules = reg.getRules(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rules.len == 0);
+    // Empty rule set means implicit deny for all paths
+    try std.testing.expect(!reg.check(1, "src/anything.ts"));
+    try std.testing.expect(!reg.check(1, "any/path/at/all"));
+}
+
+test "updateWorkerRules - does not affect other workers" {
+    var reg = FileOwnershipRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try reg.register(1, "src/frontend/**", true);
+    try reg.register(2, "src/backend/**", true);
+
+    const new_write = [_][]const u8{"tests/**"};
+    const new_deny = [_][]const u8{"src/**"};
+    try reg.updateWorkerRules(1, &new_write, &new_deny);
+
+    // Worker 1 updated
+    try std.testing.expect(!reg.check(1, "src/frontend/App.tsx"));
+    try std.testing.expect(reg.check(1, "tests/foo.test.ts"));
+
+    // Worker 2 unchanged
+    try std.testing.expect(reg.check(2, "src/backend/server.ts"));
+}
+
+test "updateWorkerRules - concurrent update and check" {
+    var reg = FileOwnershipRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    const initial_write = [_][]const u8{"src/**"};
+    const initial_deny = [_][]const u8{"infra/**"};
+    try reg.updateWorkerRules(1, &initial_write, &initial_deny);
+
+    const num_threads = 4;
+    var threads: [num_threads]std.Thread = undefined;
+    var started: usize = 0;
+
+    // Spawn threads that check while main thread updates
+    for (0..num_threads) |i| {
+        threads[i] = std.Thread.spawn(.{}, struct {
+            fn run(r: *FileOwnershipRegistry) void {
+                for (0..50) |_| {
+                    // check() must not crash regardless of concurrent updates
+                    _ = r.check(1, "src/foo.ts");
+                    _ = r.check(1, "infra/main.tf");
+                }
+            }
+        }.run, .{&reg}) catch |err| {
+            std.log.warn("thread spawn failed: {}", .{err});
+            break;
+        };
+        started += 1;
+    }
+
+    // Perform updates concurrently with checks
+    for (0..10) |_| {
+        const w = [_][]const u8{"src/**"};
+        const d = [_][]const u8{"infra/**"};
+        reg.updateWorkerRules(1, &w, &d) catch |err| {
+            std.debug.panic("updateWorkerRules failed unexpectedly: {}", .{err});
+        };
     }
 
     for (threads[0..started]) |t| t.join();

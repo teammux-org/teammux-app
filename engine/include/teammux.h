@@ -593,6 +593,16 @@ tm_ownership_entry_t** tm_ownership_get(tm_engine_t* engine,
 // Free entries returned by tm_ownership_get.
 void tm_ownership_free(tm_ownership_entry_t** entries, uint32_t count);
 
+// Replace all ownership rules for a worker in a single locked swap.
+// On allocation failure, old rules are preserved unchanged. Does NOT
+// reinstall the interceptor — callers must call tm_interceptor_install
+// separately if needed. Provides C API access to the same operation
+// that hot-reload performs internally via the Zig struct directly.
+tm_result_t tm_ownership_update(tm_engine_t* engine,
+                                  uint32_t worker_id,
+                                  const char** write_patterns, uint32_t write_count,
+                                  const char** deny_patterns, uint32_t deny_count);
+
 // -----------------------------------------------------------------
 // Git interceptor
 // -----------------------------------------------------------------
