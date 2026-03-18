@@ -63,7 +63,7 @@ pub fn slugifyTask(allocator: std.mem.Allocator, input: []const u8, max_len: usi
 
     for (input) |c| {
         if (len >= max_len) break;
-        if (c == ' ' or c == '_') {
+        if (c == ' ' or c == '_' or c == '-') {
             if (len > 0 and buf[len - 1] != '-') {
                 buf[len] = '-';
                 len += 1;
@@ -71,11 +71,6 @@ pub fn slugifyTask(allocator: std.mem.Allocator, input: []const u8, max_len: usi
         } else if (std.ascii.isAlphanumeric(c)) {
             buf[len] = std.ascii.toLower(c);
             len += 1;
-        } else if (c == '-') {
-            if (len > 0 and buf[len - 1] != '-') {
-                buf[len] = '-';
-                len += 1;
-            }
         }
     }
 
@@ -180,8 +175,11 @@ pub fn create(
         return error.GitFailed;
     };
 
-    // 6. Store in registry (free old entry if duplicate worker_id)
+    // 6. Store in registry (clean up old entry if duplicate worker_id)
     if (registry.entries.fetchRemove(worker_id)) |old| {
+        worktree.runGit(allocator, project_path, &.{ "worktree", "remove", "--force", old.value.path }) catch |err| {
+            std.log.warn("[teammux] failed to remove old worktree for worker {d} at {s}: {}", .{ worker_id, old.value.path, err });
+        };
         allocator.free(old.value.path);
         allocator.free(old.value.branch);
     }
@@ -190,7 +188,9 @@ pub fn create(
         .branch = branch,
     }) catch |err| {
         // Rollback: remove the git worktree we just created
-        worktree.runGit(allocator, project_path, &.{ "worktree", "remove", "--force", wt_path }) catch {};
+        worktree.runGit(allocator, project_path, &.{ "worktree", "remove", "--force", wt_path }) catch |rollback_err| {
+            std.log.err("[teammux] rollback failed after registry OOM for worker {d} at {s}: {}", .{ worker_id, wt_path, rollback_err });
+        };
         allocator.free(wt_path);
         allocator.free(branch);
         return err;
@@ -218,14 +218,12 @@ pub fn removeWorker(
 
 /// Get worktree path for a worker. Returns null if not registered.
 pub fn getPath(registry: *WorktreeRegistry, worker_id: u32) ?[]const u8 {
-    const entry = registry.entries.get(worker_id) orelse return null;
-    return entry.path;
+    return if (registry.get(worker_id)) |e| e.path else null;
 }
 
 /// Get branch name for a worker. Returns null if not registered.
 pub fn getBranch(registry: *WorktreeRegistry, worker_id: u32) ?[]const u8 {
-    const entry = registry.entries.get(worker_id) orelse return null;
-    return entry.branch;
+    return if (registry.get(worker_id)) |e| e.branch else null;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -306,15 +304,34 @@ test "lifecycle - hashProjectPath produces consistent 64-char hex" {
     try std.testing.expect(!std.mem.eql(u8, &hash1, &hash3));
 }
 
-test "lifecycle - resolveWorktreeRoot with config override" {
-    var cfg = config.Config{
+/// Test helper: build a Config with only worktree_root set (all other fields use minimal defaults).
+fn testConfig(wt_root: ?[]const u8) config.Config {
+    return .{
         .project = .{ .name = "", .github_repo = null },
         .team_lead = .{ .agent = .claude_code, .model = "", .permissions = "" },
         .workers = &.{},
         .github_token = null,
         .bus_delivery = "",
-        .worktree_root = "/custom/path",
+        .worktree_root = wt_root,
     };
+}
+
+/// Test helper: init a git repo with one commit inside an existing tmpDir.
+fn initTestRepo(allocator: std.mem.Allocator, project_root: []const u8) !void {
+    try worktree.runGit(allocator, project_root, &.{ "init", "-b", "main" });
+    try worktree.runGit(allocator, project_root, &.{ "config", "user.email", "test@test.com" });
+    try worktree.runGit(allocator, project_root, &.{ "config", "user.name", "Test" });
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{project_root});
+    defer allocator.free(readme_path);
+    const readme = try std.fs.createFileAbsolute(readme_path, .{});
+    try readme.writeAll("# Test");
+    readme.close();
+    try worktree.runGit(allocator, project_root, &.{ "add", "." });
+    try worktree.runGit(allocator, project_root, &.{ "commit", "-m", "initial" });
+}
+
+test "lifecycle - resolveWorktreeRoot with config override" {
+    var cfg = testConfig("/custom/path");
     const root = try resolveWorktreeRoot(std.testing.allocator, &cfg, "/any/project");
     defer std.testing.allocator.free(root);
     try std.testing.expectEqualStrings("/custom/path", root);
@@ -342,67 +359,35 @@ test "lifecycle - getPath and getBranch return null for missing worker" {
 }
 
 test "lifecycle - create and remove full lifecycle (integration)" {
-    // Set up a temp git repo
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(project_root);
+    try initTestRepo(std.testing.allocator, project_root);
 
-    // git init + initial commit (required for worktree add)
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "init", "-b", "main" });
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "config", "user.email", "test@test.com" });
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "config", "user.name", "Test" });
-    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{project_root});
-    defer std.testing.allocator.free(readme_path);
-    const readme = try std.fs.createFileAbsolute(readme_path, .{});
-    try readme.writeAll("# Test");
-    readme.close();
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "add", "." });
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "commit", "-m", "initial" });
-
-    // Use a custom worktree root inside the tmp dir to avoid polluting ~/.teammux
     const wt_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/worktrees", .{project_root});
     defer std.testing.allocator.free(wt_root);
 
-    var cfg = config.Config{
-        .project = .{ .name = "", .github_repo = null },
-        .team_lead = .{ .agent = .claude_code, .model = "", .permissions = "" },
-        .workers = &.{},
-        .github_token = null,
-        .bus_delivery = "",
-        .worktree_root = wt_root,
-    };
-
+    var cfg = testConfig(wt_root);
     var reg = WorktreeRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    // Create worktree for worker 1
     try create(&reg, &cfg, project_root, 1, "implement auth");
 
-    // Verify path registered
-    const path = getPath(&reg, 1);
-    try std.testing.expect(path != null);
+    // Verify path and branch registered
     const expected_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{wt_root});
     defer std.testing.allocator.free(expected_path);
-    try std.testing.expectEqualStrings(expected_path, path.?);
-
-    // Verify branch registered
-    const branch = getBranch(&reg, 1);
-    try std.testing.expect(branch != null);
-    try std.testing.expectEqualStrings("teammux/1-implement-auth", branch.?);
+    try std.testing.expectEqualStrings(expected_path, getPath(&reg, 1).?);
+    try std.testing.expectEqualStrings("teammux/1-implement-auth", getBranch(&reg, 1).?);
 
     // Verify directory exists on disk
-    var wt_dir = try std.fs.openDirAbsolute(path.?, .{});
+    var wt_dir = try std.fs.openDirAbsolute(getPath(&reg, 1).?, .{});
     wt_dir.close();
 
-    // Remove worktree
+    // Remove and verify cleanup
     removeWorker(&reg, project_root, 1);
-
-    // Verify removed from registry
     try std.testing.expect(getPath(&reg, 1) == null);
     try std.testing.expect(getBranch(&reg, 1) == null);
-
-    // Verify directory removed from disk
     try std.testing.expectError(error.FileNotFound, std.fs.openDirAbsolute(expected_path, .{}));
 }
 
@@ -411,52 +396,28 @@ test "lifecycle - create with config override path" {
     defer tmp.cleanup();
     const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(project_root);
-
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "init", "-b", "main" });
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "config", "user.email", "test@test.com" });
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "config", "user.name", "Test" });
-    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{project_root});
-    defer std.testing.allocator.free(readme_path);
-    const readme = try std.fs.createFileAbsolute(readme_path, .{});
-    try readme.writeAll("# Test");
-    readme.close();
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "add", "." });
-    try worktree.runGit(std.testing.allocator, project_root, &.{ "commit", "-m", "initial" });
+    try initTestRepo(std.testing.allocator, project_root);
 
     const custom_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/custom-wt", .{project_root});
     defer std.testing.allocator.free(custom_root);
 
-    var cfg = config.Config{
-        .project = .{ .name = "", .github_repo = null },
-        .team_lead = .{ .agent = .claude_code, .model = "", .permissions = "" },
-        .workers = &.{},
-        .github_token = null,
-        .bus_delivery = "",
-        .worktree_root = custom_root,
-    };
-
+    var cfg = testConfig(custom_root);
     var reg = WorktreeRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
     try create(&reg, &cfg, project_root, 5, "fix login bug");
 
-    const path = getPath(&reg, 5).?;
     const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/5", .{custom_root});
     defer std.testing.allocator.free(expected);
-    try std.testing.expectEqualStrings(expected, path);
-
-    // Verify branch includes worker ID
+    try std.testing.expectEqualStrings(expected, getPath(&reg, 5).?);
     try std.testing.expectEqualStrings("teammux/5-fix-login-bug", getBranch(&reg, 5).?);
 
-    // Clean up
     removeWorker(&reg, project_root, 5);
 }
 
 test "lifecycle - remove non-existent worker is safe" {
     var reg = WorktreeRegistry.init(std.testing.allocator);
     defer reg.deinit();
-
-    // Should not crash
     removeWorker(&reg, "/tmp", 999);
     try std.testing.expect(getPath(&reg, 999) == null);
 }

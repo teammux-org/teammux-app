@@ -106,6 +106,20 @@ pub const Engine = struct {
         self.allocator.destroy(self);
     }
 
+    /// Return a const pointer to the loaded config, or null if no config loaded.
+    pub fn cfgPtr(self: *Engine) ?*const config.Config {
+        return if (self.cfg) |*c| c else null;
+    }
+
+    /// Cache a Zig slice as a sentinel-terminated C string, freeing the previous value.
+    /// Returns the cached [*:0]const u8 pointer, or null on allocation failure.
+    fn cacheCstr(self: *Engine, slot: *?[*:0]u8, value: []const u8) ?[*:0]const u8 {
+        if (slot.*) |old| { self.allocator.free(std.mem.span(old)); slot.* = null; }
+        const z = self.allocator.dupeZ(u8, value) catch return null;
+        slot.* = z.ptr;
+        return z.ptr;
+    }
+
     pub fn sessionStart(self: *Engine) !void {
         const config_path = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/config.toml", .{self.project_root});
         defer self.allocator.free(config_path);
@@ -329,9 +343,9 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     };
 
     // Create lifecycle worktree AFTER roster spawn using actual ID — graceful degradation on failure
-    const cfg_ptr: ?*const config.Config = if (e.cfg) |*c| c else null;
-    worktree_lifecycle.create(&e.wt_registry, cfg_ptr, e.project_root, id, td) catch |err| {
+    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, id, td) catch |err| {
         std.log.warn("[teammux] worktree lifecycle create failed for worker {d}: {s}", .{ id, @errorName(err) });
+        e.setError("worker spawned but worktree lifecycle create failed") catch {};
     };
 
     return id;
@@ -363,8 +377,7 @@ export fn tm_worktree_create(engine: ?*Engine, worker_id: u32, task_description:
         e.setError("tm_worktree_create: task_description must not be NULL") catch {};
         return 7; // TM_ERR_CONFIG
     });
-    const cfg_ptr: ?*const config.Config = if (e.cfg) |*c| c else null;
-    worktree_lifecycle.create(&e.wt_registry, cfg_ptr, e.project_root, worker_id, td) catch |err| {
+    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, worker_id, td) catch |err| {
         e.setError(switch (err) {
             error.GitFailed => "git worktree add failed",
             error.NoHomeDir => "HOME not set, cannot resolve worktree root",
@@ -387,20 +400,14 @@ export fn tm_worktree_remove(engine: ?*Engine, worker_id: u32) c_int {
 
 export fn tm_worktree_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     const e = engine orelse return null;
-    if (e.last_wt_path_cstr) |old| { e.allocator.free(std.mem.span(old)); e.last_wt_path_cstr = null; }
     const path = worktree_lifecycle.getPath(&e.wt_registry, worker_id) orelse return null;
-    const z = e.allocator.dupeZ(u8, path) catch return null;
-    e.last_wt_path_cstr = z.ptr;
-    return z.ptr;
+    return e.cacheCstr(&e.last_wt_path_cstr, path);
 }
 
 export fn tm_worktree_branch(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     const e = engine orelse return null;
-    if (e.last_wt_branch_cstr) |old| { e.allocator.free(std.mem.span(old)); e.last_wt_branch_cstr = null; }
     const branch = worktree_lifecycle.getBranch(&e.wt_registry, worker_id) orelse return null;
-    const z = e.allocator.dupeZ(u8, branch) catch return null;
-    e.last_wt_branch_cstr = z.ptr;
-    return z.ptr;
+    return e.cacheCstr(&e.last_wt_branch_cstr, branch);
 }
 export fn tm_roster_get(engine: ?*Engine) ?*CRoster {
     const e = engine orelse return null;
