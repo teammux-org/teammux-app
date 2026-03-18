@@ -12,6 +12,7 @@ pub const ownership = @import("ownership.zig");
 pub const interceptor = @import("interceptor.zig");
 pub const hotreload = @import("hotreload.zig");
 pub const coordinator_mod = @import("coordinator.zig");
+pub const worktree_lifecycle = @import("worktree_lifecycle.zig");
 
 // ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
@@ -41,8 +42,11 @@ pub const Engine = struct {
     msg_cb: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int,
     msg_cb_userdata: ?*anyopaque,
     coordinator: coordinator_mod.Coordinator,
+    wt_registry: worktree_lifecycle.WorktreeRegistry,
     cmd_cb: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
     cmd_cb_userdata: ?*anyopaque,
+    last_wt_path_cstr: ?[*:0]u8,
+    last_wt_branch_cstr: ?[*:0]u8,
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
         const engine = try allocator.create(Engine);
@@ -72,8 +76,11 @@ pub const Engine = struct {
             .msg_cb = null,
             .msg_cb_userdata = null,
             .coordinator = coordinator_mod.Coordinator.init(allocator),
+            .wt_registry = worktree_lifecycle.WorktreeRegistry.init(allocator),
             .cmd_cb = null,
             .cmd_cb_userdata = null,
+            .last_wt_path_cstr = null,
+            .last_wt_branch_cstr = null,
         };
         return engine;
     }
@@ -87,13 +94,30 @@ pub const Engine = struct {
         self.coordinator.deinit();
         self.merge_coordinator.deinit();
         self.ownership_registry.deinit();
+        self.wt_registry.deinit();
         self.roster.deinit();
         if (self.cfg) |*c| c.deinit(self.allocator);
         if (self.last_error) |e| self.allocator.free(e);
         if (self.last_error_cstr) |c| self.allocator.free(std.mem.span(c));
         if (self.last_config_get_cstr) |c| self.allocator.free(std.mem.span(c));
+        if (self.last_wt_path_cstr) |c| self.allocator.free(std.mem.span(c));
+        if (self.last_wt_branch_cstr) |c| self.allocator.free(std.mem.span(c));
         self.allocator.free(self.project_root);
         self.allocator.destroy(self);
+    }
+
+    /// Return a const pointer to the loaded config, or null if no config loaded.
+    pub fn cfgPtr(self: *Engine) ?*const config.Config {
+        return if (self.cfg) |*c| c else null;
+    }
+
+    /// Cache a Zig slice as a sentinel-terminated C string, freeing the previous value.
+    /// Returns the cached [*:0]const u8 pointer, or null on allocation failure.
+    fn cacheCstr(self: *Engine, slot: *?[*:0]u8, value: []const u8) ?[*:0]const u8 {
+        if (slot.*) |old| { self.allocator.free(std.mem.span(old)); slot.* = null; }
+        const z = self.allocator.dupeZ(u8, value) catch return null;
+        slot.* = z.ptr;
+        return z.ptr;
     }
 
     pub fn sessionStart(self: *Engine) !void {
@@ -311,10 +335,19 @@ export fn tm_config_get(engine: ?*Engine, key: ?[*:0]const u8) ?[*:0]const u8 {
 
 export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_type: c_int, worker_name: ?[*:0]const u8, task_description: ?[*:0]const u8) u32 {
     const e = engine orelse return 0xFFFFFFFF;
-    const id = e.roster.spawn(e.project_root, std.mem.span(agent_binary orelse return 0xFFFFFFFF), @enumFromInt(agent_type), std.mem.span(worker_name orelse return 0xFFFFFFFF), std.mem.span(task_description orelse return 0xFFFFFFFF)) catch |err| {
+    const td = std.mem.span(task_description orelse return 0xFFFFFFFF);
+
+    const id = e.roster.spawn(e.project_root, std.mem.span(agent_binary orelse return 0xFFFFFFFF), @enumFromInt(agent_type), std.mem.span(worker_name orelse return 0xFFFFFFFF), td) catch |err| {
         e.setError(switch (err) { error.GitFailed => "git worktree add failed", else => "worker spawn failed" }) catch {};
         return 0xFFFFFFFF;
     };
+
+    // Create lifecycle worktree AFTER roster spawn using actual ID — graceful degradation on failure
+    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, id, td) catch |err| {
+        std.log.warn("[teammux] worktree lifecycle create failed for worker {d}: {s}", .{ id, @errorName(err) });
+        e.setError("worker spawned but worktree lifecycle create failed") catch {};
+    };
+
     return id;
 }
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
@@ -331,7 +364,50 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     }
     e.roster.dismiss(e.project_root, worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
     e.ownership_registry.release(worker_id);
+    // Remove lifecycle worktree AFTER roster dismiss
+    worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
     return 0;
+}
+
+// ─── Worktree lifecycle ──────────────────────────────────
+
+export fn tm_worktree_create(engine: ?*Engine, worker_id: u32, task_description: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const td = std.mem.span(task_description orelse {
+        e.setError("tm_worktree_create: task_description must not be NULL") catch {};
+        return 7; // TM_ERR_CONFIG
+    });
+    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, worker_id, td) catch |err| {
+        e.setError(switch (err) {
+            error.GitFailed => "git worktree add failed",
+            error.NoHomeDir => "HOME not set, cannot resolve worktree root",
+            error.MkdirFailed => "failed to create worktree directory",
+            else => "worktree create failed",
+        }) catch {};
+        return switch (err) {
+            error.NoHomeDir, error.MkdirFailed => 7, // TM_ERR_CONFIG
+            else => 5, // TM_ERR_WORKTREE
+        };
+    };
+    return 0;
+}
+
+export fn tm_worktree_remove(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
+    return 0;
+}
+
+export fn tm_worktree_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
+    const e = engine orelse return null;
+    const path = worktree_lifecycle.getPath(&e.wt_registry, worker_id) orelse return null;
+    return e.cacheCstr(&e.last_wt_path_cstr, path);
+}
+
+export fn tm_worktree_branch(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
+    const e = engine orelse return null;
+    const branch = worktree_lifecycle.getBranch(&e.wt_registry, worker_id) orelse return null;
+    return e.cacheCstr(&e.last_wt_branch_cstr, branch);
 }
 export fn tm_roster_get(engine: ?*Engine) ?*CRoster {
     const e = engine orelse return null;
