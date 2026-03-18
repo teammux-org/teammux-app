@@ -85,6 +85,10 @@ final class EngineClient: ObservableObject {
     /// overwrites the first.
     @Published var workerQuestions: [UInt32: QuestionRequest] = [:]
 
+    /// Workers that received a role hot-reload within the last 3 seconds.
+    /// `WorkerTerminalView` uses this to show a transient banner overlay.
+    @Published var hotReloadedWorkers: Set<UInt32> = []
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -93,6 +97,11 @@ final class EngineClient: ObservableObject {
     /// Maps worker ID to its SurfaceView reference (stored as AnyObject
     /// to avoid coupling this file to Ghostty types).
     private var surfaceViews: [UInt32: AnyObject] = [:]
+
+    /// Closures that inject text into a worker's PTY via the registered
+    /// SurfaceView. Set at registration time so EngineClient never imports
+    /// GhosttyKit — the caller captures the concrete SurfaceView type.
+    private var textInjectors: [UInt32: (String) -> Void] = [:]
 
     /// Subscription handles returned by watch/subscribe calls.
     /// Stored so we can unwatch/unsubscribe in teardownCallbacks().
@@ -107,16 +116,19 @@ final class EngineClient: ObservableObject {
 
     // MARK: - Surface registry
 
-    /// Register a SurfaceView for a given worker so the message bus
-    /// can inject text via `sendText()`.
-    func registerSurface(_ surface: AnyObject, for workerId: UInt32) {
+    /// Register a SurfaceView for a given worker so the engine can
+    /// inject text via the provided closure. The caller captures the
+    /// concrete SurfaceView type so this file stays decoupled from GhosttyKit.
+    func registerSurface(_ surface: AnyObject, for workerId: UInt32, injector: @escaping (String) -> Void) {
         surfaceViews[workerId] = surface
+        textInjectors[workerId] = injector
     }
 
-    /// Remove the SurfaceView reference when a worker is dismissed or
-    /// its terminal closes.
+    /// Remove the SurfaceView reference and text injector when a worker
+    /// is dismissed or its terminal closes.
     func unregisterSurface(for workerId: UInt32) {
         surfaceViews.removeValue(forKey: workerId)
+        textInjectors.removeValue(forKey: workerId)
     }
 
     /// Retrieve the SurfaceView for a worker, if one is registered.
@@ -228,6 +240,7 @@ final class EngineClient: ObservableObject {
         engine = nil
         projectRoot = nil
         surfaceViews.removeAll()
+        textInjectors.removeAll()
         roster.removeAll()
         messages.removeAll()
         worktreeReadyQueue.removeAll()
@@ -238,6 +251,7 @@ final class EngineClient: ObservableObject {
         workerRoles.removeAll()
         workerCompletions.removeAll()
         workerQuestions.removeAll()
+        hotReloadedWorkers.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -333,6 +347,7 @@ final class EngineClient: ObservableObject {
             if let role = resolveRole(id: roleId) {
                 let registered = registerOwnership(workerId: workerId, role: role)
                 workerRoles[workerId] = role
+                startRoleWatch(workerId: workerId)
                 if !registered {
                     Self.logger.error("spawnWorker: role '\(roleId)' resolved but ownership registration failed for worker \(workerId) — enforcement degraded")
                 }
@@ -385,6 +400,8 @@ final class EngineClient: ObservableObject {
             Self.logger.error("Engine not created")
             return false
         }
+
+        stopRoleWatch(workerId: workerId)
 
         let result = tm_worker_dismiss(engine, workerId)
 
@@ -1006,6 +1023,88 @@ final class EngineClient: ObservableObject {
         return allSucceeded
     }
 
+    // MARK: - Private: Role Hot-Reload
+
+    /// Start watching the role TOML file for a worker. When the file changes,
+    /// the engine regenerates CLAUDE.md and fires the callback with the new
+    /// content. The callback injects the updated context into the worker's PTY
+    /// and sets a 3-second transient notification in `hotReloadedWorkers`.
+    ///
+    /// Requires `workerRoles[workerId]` to be set (role ID is read from it).
+    /// Wraps `tm_role_watch()`.
+    private func startRoleWatch(workerId: UInt32) {
+        guard let engine else {
+            Self.logger.error("startRoleWatch: engine not created")
+            return
+        }
+
+        guard let roleId = workerRoles[workerId]?.id else {
+            Self.logger.warning("startRoleWatch: no role cached for worker \(workerId)")
+            return
+        }
+
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        let result = roleId.withCString { cRoleId in
+            tm_role_watch(engine, workerId, cRoleId, { cbWorkerId, newClaudeMdPtr, userdata in
+                guard let userdata else {
+                    Logger(subsystem: "com.teammux.app", category: "EngineClient")
+                        .warning("role_changed_cb: nil userdata")
+                    return
+                }
+
+                // Copy string before crossing thread boundary — pointer is only
+                // valid for the duration of this callback (engine frees after return).
+                let newClaudeMd: String? = {
+                    guard let ptr = newClaudeMdPtr, ptr.pointee != 0 else { return nil }
+                    return String(cString: ptr)
+                }()
+
+                let client = Unmanaged<EngineClient>.fromOpaque(userdata).takeUnretainedValue()
+                Task { @MainActor in
+                    client.handleRoleChanged(workerId: cbWorkerId, newClaudeMd: newClaudeMd)
+                }
+            }, selfPtr)
+        }
+
+        if result != TM_OK {
+            let msg = lastEngineError() ?? "tm_role_watch failed (\(result.rawValue))"
+            Self.logger.error("startRoleWatch: \(msg) for worker \(workerId)")
+        }
+    }
+
+    /// Stop watching the role file for a worker. Also removes the worker
+    /// from `hotReloadedWorkers` if present. Idempotent.
+    /// Wraps `tm_role_unwatch()`.
+    private func stopRoleWatch(workerId: UInt32) {
+        guard let engine else { return }
+        let result = tm_role_unwatch(engine, workerId)
+        if result != TM_OK {
+            let msg = lastEngineError() ?? "tm_role_unwatch failed (\(result.rawValue))"
+            Self.logger.warning("stopRoleWatch: \(msg) for worker \(workerId)")
+        }
+        hotReloadedWorkers.remove(workerId)
+    }
+
+    /// Handle a role-changed callback on `@MainActor`. Injects the updated
+    /// CLAUDE.md into the worker's PTY and shows a transient banner.
+    private func handleRoleChanged(workerId: UInt32, newClaudeMd: String?) {
+        guard let newClaudeMd, !newClaudeMd.isEmpty else {
+            Self.logger.warning("handleRoleChanged: new_claude_md is nil or empty for worker \(workerId) — role file parse error?")
+            return
+        }
+
+        let text = "\n[Teammux] role-update: Your role definition has been updated.\n\(newClaudeMd)\n"
+        injectText(text, for: workerId)
+
+        hotReloadedWorkers.insert(workerId)
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            self.hotReloadedWorkers.remove(workerId)
+        }
+    }
+
     // MARK: - Private: Callbacks
 
     /// Register all engine callbacks. Called once after `sessionStart` succeeds.
@@ -1296,6 +1395,18 @@ final class EngineClient: ObservableObject {
         default:
             Self.logger.debug("Unhandled GitHub event type: \(eventType)")
         }
+    }
+
+    // MARK: - Private: Text injection
+
+    /// Inject text into a worker's PTY via the registered injector closure.
+    /// No-op if no surface is registered for the worker.
+    private func injectText(_ text: String, for workerId: UInt32) {
+        guard let injector = textInjectors[workerId] else {
+            Self.logger.warning("injectText: no injector registered for worker \(workerId)")
+            return
+        }
+        injector(text)
     }
 
     // MARK: - Private: Helpers
