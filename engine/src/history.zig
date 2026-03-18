@@ -168,40 +168,16 @@ fn serializeEntry(allocator: std.mem.Allocator, entry: HistoryEntry) ![]u8 {
     const content_esc = try jsonEscape(allocator, entry.content);
     defer allocator.free(content_esc);
 
-    const git_val = if (entry.git_commit) |gc| blk: {
-        const gc_esc = try jsonEscape(allocator, gc);
-        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{gc_esc});
-    } else try allocator.dupe(u8, "null");
-    defer allocator.free(git_val);
-    // Free the inner escaped string if we allocated one
-    if (entry.git_commit) |_| {
-        // git_val is "\"escaped\"" — the inner escape was used inline
-        // Actually we need to free the gc_esc separately. Let me restructure.
-    }
-
-    // Restructured to avoid double-free: build git_commit value directly
-    return serializeEntryInner(allocator, type_esc, entry.worker_id, role_esc, content_esc, entry.git_commit, entry.timestamp);
-}
-
-fn serializeEntryInner(
-    allocator: std.mem.Allocator,
-    type_esc: []const u8,
-    worker_id: u32,
-    role_esc: []const u8,
-    content_esc: []const u8,
-    git_commit: ?[]const u8,
-    timestamp: u64,
-) ![]u8 {
-    if (git_commit) |gc| {
+    if (entry.git_commit) |gc| {
         const gc_esc = try jsonEscape(allocator, gc);
         defer allocator.free(gc_esc);
         return std.fmt.allocPrint(allocator,
             \\{{"type":"{s}","worker_id":{d},"role_id":"{s}","content":"{s}","git_commit":"{s}","timestamp":{d}}}
-        , .{ type_esc, worker_id, role_esc, content_esc, gc_esc, timestamp });
+        , .{ type_esc, entry.worker_id, role_esc, content_esc, gc_esc, entry.timestamp });
     } else {
         return std.fmt.allocPrint(allocator,
             \\{{"type":"{s}","worker_id":{d},"role_id":"{s}","content":"{s}","git_commit":null,"timestamp":{d}}}
-        , .{ type_esc, worker_id, role_esc, content_esc, timestamp });
+        , .{ type_esc, entry.worker_id, role_esc, content_esc, entry.timestamp });
     }
 }
 
@@ -527,7 +503,7 @@ test "history - atomic write temp rename" {
     });
 
     // Verify .tmp is NOT left behind after successful append
-    std.fs.cwd().statFile(logger.tmp_path) catch |err| {
+    _ = std.fs.cwd().statFile(logger.tmp_path) catch |err| {
         try std.testing.expect(err == error.FileNotFound);
         return;
     };
