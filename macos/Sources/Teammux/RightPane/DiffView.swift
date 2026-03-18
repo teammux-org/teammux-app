@@ -9,7 +9,7 @@ import SwiftUI
 struct DiffView: View {
     @ObservedObject var engine: EngineClient
 
-    @State private var selectedWorkerId: UInt32? = nil
+    @Binding var selectedWorkerId: UInt32?
     @State private var diffFiles: [DiffFile] = []
     @State private var isLoading = false
     @State private var diffError: String?
@@ -27,6 +27,11 @@ struct DiffView: View {
             diffContent
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            if selectedWorkerId != nil && diffFiles.isEmpty && !isLoading {
+                loadDiff(for: selectedWorkerId)
+            }
+        }
     }
 
     // MARK: - Worker picker
@@ -170,7 +175,7 @@ struct DiffView: View {
 
         isLoading = true
         diffError = nil
-        Task {
+        Task { @MainActor in
             let result = engine.getDiff(for: workerId)
             diffFiles = result
             // If result is empty and engine reported an error, it was an API failure

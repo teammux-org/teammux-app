@@ -2,13 +2,16 @@ import SwiftUI
 
 // MARK: - LiveFeedView
 
-/// Right-pane tab showing the real-time message bus feed.
+/// Right-pane tab showing the real-time message bus feed, with completion
+/// and question card sections above the message stream.
 ///
-/// Displays all TeamMessages from the engine with auto-scroll to the
-/// latest entry. Each row shows a timestamp, message type dot, sender/receiver
-/// identifiers, and payload text.
+/// Sections appear conditionally: completion cards when workers have signaled
+/// completion, question cards when workers are awaiting Team Lead guidance.
+/// The message feed auto-scrolls to the latest entry below.
 struct LiveFeedView: View {
     @ObservedObject var engine: EngineClient
+    @Binding var activeTab: RightTab
+    @Binding var diffSelectedWorkerId: UInt32?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,14 +20,80 @@ struct LiveFeedView: View {
 
             Divider()
 
+            // Completion cards section
+            if !engine.workerCompletions.isEmpty {
+                completionSection
+            }
+
+            // Question cards section
+            if !engine.workerQuestions.isEmpty {
+                questionSection
+            }
+
             // Feed content
             if engine.messages.isEmpty {
-                emptyState
+                if engine.workerCompletions.isEmpty && engine.workerQuestions.isEmpty {
+                    emptyState
+                }
             } else {
                 feedList
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Completion section
+
+    private var completionSection: some View {
+        ScrollView {
+            VStack(spacing: 6) {
+                ForEach(completionReports) { report in
+                    CompletionCardView(
+                        report: report,
+                        engine: engine,
+                        activeTab: $activeTab,
+                        diffSelectedWorkerId: $diffSelectedWorkerId
+                    )
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+        .frame(maxHeight: 200)
+    }
+
+    // MARK: - Question section
+
+    private var questionSection: some View {
+        ScrollView {
+            VStack(spacing: 6) {
+                ForEach(questionRequests) { request in
+                    QuestionCardView(
+                        request: request,
+                        engine: engine
+                    )
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+        .frame(maxHeight: 200)
+    }
+
+    /// Sorted completion reports for stable ForEach ordering (timestamp, then workerId tiebreak).
+    private var completionReports: [CompletionReport] {
+        engine.workerCompletions.values.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp < $1.timestamp }
+            return $0.workerId < $1.workerId
+        }
+    }
+
+    /// Sorted question requests for stable ForEach ordering (timestamp, then workerId tiebreak).
+    private var questionRequests: [QuestionRequest] {
+        engine.workerQuestions.values.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp < $1.timestamp }
+            return $0.workerId < $1.workerId
+        }
     }
 
     // MARK: - Header

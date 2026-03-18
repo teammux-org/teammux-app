@@ -31,6 +31,7 @@ struct RightPaneView: View {
     @ObservedObject var engine: EngineClient
 
     @State private var activeTab: RightTab = .teamLead
+    @State private var diffSelectedWorkerId: UInt32? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -91,9 +92,9 @@ struct RightPaneView: View {
         case .git:
             GitView(engine: engine)
         case .diff:
-            DiffView(engine: engine)
+            DiffView(engine: engine, selectedWorkerId: $diffSelectedWorkerId)
         case .liveFeed:
-            LiveFeedView(engine: engine)
+            LiveFeedView(engine: engine, activeTab: $activeTab, diffSelectedWorkerId: $diffSelectedWorkerId)
         }
     }
 }
