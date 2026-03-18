@@ -30,9 +30,20 @@ struct LiveFeedView: View {
                 questionSection
             }
 
+            // Peer question cards section
+            if !engine.peerQuestions.isEmpty {
+                peerQuestionSection
+            }
+
+            // Delegation informational cards section
+            if !engine.peerDelegations.isEmpty {
+                delegationSection
+            }
+
             // Feed content
             if engine.messages.isEmpty {
-                if engine.workerCompletions.isEmpty && engine.workerQuestions.isEmpty {
+                if engine.workerCompletions.isEmpty && engine.workerQuestions.isEmpty
+                    && engine.peerQuestions.isEmpty && engine.peerDelegations.isEmpty {
                     emptyState
                 }
             } else {
@@ -94,6 +105,52 @@ struct LiveFeedView: View {
             if $0.timestamp != $1.timestamp { return $0.timestamp < $1.timestamp }
             return $0.workerId < $1.workerId
         }
+    }
+
+    // MARK: - Peer question section
+
+    private var peerQuestionSection: some View {
+        ScrollView {
+            VStack(spacing: 6) {
+                ForEach(sortedPeerQuestions) { question in
+                    PeerQuestionCardView(
+                        question: question,
+                        engine: engine
+                    )
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+        .frame(maxHeight: 200)
+    }
+
+    /// Sorted peer questions for stable ForEach ordering (timestamp, then fromWorkerId tiebreak).
+    private var sortedPeerQuestions: [PeerQuestion] {
+        engine.peerQuestions.values.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp < $1.timestamp }
+            return $0.fromWorkerId < $1.fromWorkerId
+        }
+    }
+
+    // MARK: - Delegation section
+
+    private var delegationSection: some View {
+        ScrollView {
+            VStack(spacing: 6) {
+                ForEach(recentDelegations) { delegation in
+                    DelegationInfoCard(delegation: delegation, engine: engine)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+        .frame(maxHeight: 150)
+    }
+
+    /// Most recent delegations (newest first, max 10 shown in feed).
+    private var recentDelegations: [PeerDelegation] {
+        Array(engine.peerDelegations.suffix(10).reversed())
     }
 
     // MARK: - Header
@@ -226,5 +283,57 @@ struct LiveFeedRow: View {
             return worker.name
         }
         return "#\(id)"
+    }
+}
+
+// MARK: - DelegationInfoCard
+
+/// Informational card for a worker-to-worker task delegation.
+/// No action buttons — the engine has already routed the delegation
+/// directly to the target worker's PTY.
+struct DelegationInfoCard: View {
+    let delegation: PeerDelegation
+    let engine: EngineClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "paperplane.fill")
+                    .foregroundColor(.purple)
+                    .font(.system(size: 12))
+
+                Text("Delegated")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.purple)
+
+                Spacer()
+
+                Text("\(nameForId(delegation.fromWorkerId)) \u{2192} \(nameForId(delegation.targetWorkerId))")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
+
+            Text(delegation.task)
+                .font(.system(size: 11))
+                .foregroundColor(.primary)
+                .lineLimit(3)
+        }
+        .padding(8)
+        .background(Color.purple.opacity(0.04))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.purple.opacity(0.15), lineWidth: 1)
+        )
+        .cornerRadius(6)
+    }
+
+    private func nameForId(_ id: UInt32) -> String {
+        if id == 0 {
+            return "Team Lead"
+        }
+        if let worker = engine.roster.first(where: { $0.id == id }) {
+            return worker.name
+        }
+        return "Worker #\(id)"
     }
 }
