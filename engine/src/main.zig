@@ -575,6 +575,14 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
         handleAssignCommand(engine, args_ptr);
         return;
     }
+    if (std.mem.eql(u8, cmd, "/teammux-ask")) {
+        handlePeerQuestionCommand(engine, args_ptr);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "/teammux-delegate")) {
+        handleDelegationCommand(engine, args_ptr);
+        return;
+    }
 
     // Forward unhandled commands to Swift callback
     if (engine.cmd_cb) |cb| cb(command_ptr, args_ptr, engine.cmd_cb_userdata);
@@ -613,6 +621,138 @@ fn handleAssignCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         } else {
             std.log.warn("[teammux] /teammux-assign: dispatch to worker {d} failed: {s}", .{ worker_id, @errorName(err) });
         }
+    };
+}
+
+fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
+    const args = std.mem.span(args_ptr orelse {
+        std.log.warn("[teammux] /teammux-ask: args is NULL (expected JSON body)", .{});
+        return;
+    });
+
+    const from_id_str = extractJsonStringValue(args, "worker_id") orelse
+        extractJsonNumber(args, "worker_id");
+    if (from_id_str == null) {
+        std.log.warn("[teammux] /teammux-ask: missing worker_id", .{});
+        return;
+    }
+    const from_id = std.fmt.parseInt(u32, from_id_str.?, 10) catch {
+        std.log.warn("[teammux] /teammux-ask: invalid worker_id", .{});
+        return;
+    };
+
+    const target_id_str = extractJsonStringValue(args, "target_worker_id") orelse
+        extractJsonNumber(args, "target_worker_id");
+    if (target_id_str == null) {
+        std.log.warn("[teammux] /teammux-ask: missing target_worker_id", .{});
+        return;
+    }
+    const target_id = std.fmt.parseInt(u32, target_id_str.?, 10) catch {
+        std.log.warn("[teammux] /teammux-ask: invalid target_worker_id", .{});
+        return;
+    };
+
+    if (from_id == 0) {
+        std.log.warn("[teammux] /teammux-ask: Team Lead (worker 0) cannot send peer questions — use tm_dispatch_response", .{});
+        return;
+    }
+
+    if (from_id == target_id) {
+        std.log.warn("[teammux] /teammux-ask: cannot ask yourself (worker {d})", .{from_id});
+        return;
+    }
+
+    if (engine.roster.getWorker(from_id) == null) {
+        std.log.warn("[teammux] /teammux-ask: sender worker {d} not found in roster", .{from_id});
+        return;
+    }
+
+    if (engine.roster.getWorker(target_id) == null) {
+        std.log.warn("[teammux] /teammux-ask: target worker {d} not found in roster", .{target_id});
+        return;
+    }
+
+    // Validate message field exists (value not needed — we forward raw args as payload)
+    _ = extractJsonStringValue(args, "message") orelse {
+        std.log.warn("[teammux] /teammux-ask: missing message", .{});
+        return;
+    };
+
+    var b = &(engine.message_bus orelse {
+        std.log.warn("[teammux] /teammux-ask: message bus not available", .{});
+        return;
+    });
+    // Route to Team Lead (worker 0) — Team Lead relays to target
+    b.send(0, from_id, .peer_question, args) catch |err| {
+        std.log.warn("[teammux] /teammux-ask: bus send failed: {s}", .{@errorName(err)});
+        // Notify sender that delivery failed
+        b.send(from_id, 0, .err, "\"[Teammux] peer message delivery failed\"") catch {};
+    };
+}
+
+fn handleDelegationCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
+    const args = std.mem.span(args_ptr orelse {
+        std.log.warn("[teammux] /teammux-delegate: args is NULL (expected JSON body)", .{});
+        return;
+    });
+
+    const from_id_str = extractJsonStringValue(args, "worker_id") orelse
+        extractJsonNumber(args, "worker_id");
+    if (from_id_str == null) {
+        std.log.warn("[teammux] /teammux-delegate: missing worker_id", .{});
+        return;
+    }
+    const from_id = std.fmt.parseInt(u32, from_id_str.?, 10) catch {
+        std.log.warn("[teammux] /teammux-delegate: invalid worker_id", .{});
+        return;
+    };
+
+    const target_id_str = extractJsonStringValue(args, "target_worker_id") orelse
+        extractJsonNumber(args, "target_worker_id");
+    if (target_id_str == null) {
+        std.log.warn("[teammux] /teammux-delegate: missing target_worker_id", .{});
+        return;
+    }
+    const target_id = std.fmt.parseInt(u32, target_id_str.?, 10) catch {
+        std.log.warn("[teammux] /teammux-delegate: invalid target_worker_id", .{});
+        return;
+    };
+
+    if (from_id == 0) {
+        std.log.warn("[teammux] /teammux-delegate: Team Lead (worker 0) cannot delegate — use tm_dispatch_task", .{});
+        return;
+    }
+
+    if (from_id == target_id) {
+        std.log.warn("[teammux] /teammux-delegate: cannot delegate to yourself (worker {d})", .{from_id});
+        return;
+    }
+
+    if (engine.roster.getWorker(from_id) == null) {
+        std.log.warn("[teammux] /teammux-delegate: sender worker {d} not found in roster", .{from_id});
+        return;
+    }
+
+    if (engine.roster.getWorker(target_id) == null) {
+        std.log.warn("[teammux] /teammux-delegate: target worker {d} not found in roster", .{target_id});
+        return;
+    }
+
+    // Validate task field exists (value not needed — we forward raw args as payload)
+    _ = extractJsonStringValue(args, "task") orelse {
+        std.log.warn("[teammux] /teammux-delegate: missing task", .{});
+        return;
+    };
+
+    var b = &(engine.message_bus orelse {
+        std.log.warn("[teammux] /teammux-delegate: message bus not available", .{});
+        return;
+    });
+    // Route directly to target worker PTY
+    b.send(target_id, from_id, .delegation, args) catch |err| {
+        std.log.warn("[teammux] /teammux-delegate: bus send failed: {s}", .{@errorName(err)});
+        // Notify sender that delivery failed
+        b.send(from_id, 0, .err, "\"[Teammux] peer message delivery failed\"") catch {};
     };
 }
 
@@ -781,6 +921,112 @@ fn freeCDispatchEvent(ptr: ?*CDispatchEvent) void {
     const entry = ptr orelse return;
     freeNullTerminated(entry.instruction);
     std.heap.c_allocator.destroy(entry);
+}
+
+// ─── Peer messaging — worker-to-worker ───────────────────
+
+export fn tm_peer_question(engine: ?*Engine, from_id: u32, target_id: u32, message: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99; // TM_ERR_UNKNOWN
+    const msg = std.mem.span(message orelse {
+        e.setError("tm_peer_question: message is NULL") catch {};
+        return 99;
+    });
+
+    if (from_id == 0) {
+        e.setError("tm_peer_question: Team Lead cannot send peer questions") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    if (from_id == target_id) {
+        e.setError("tm_peer_question: cannot ask yourself") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    if (e.roster.getWorker(from_id) == null) {
+        e.setError("tm_peer_question: sender worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    if (e.roster.getWorker(target_id) == null) {
+        e.setError("tm_peer_question: target worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+
+    var b = &(e.message_bus orelse {
+        e.setError("tm_peer_question: message bus not initialized") catch {};
+        return 8; // TM_ERR_BUS
+    });
+
+    // Build payload JSON: {"worker_id": from, "target_worker_id": target, "message": "..."}
+    const msg_esc = jsonEscape(std.heap.c_allocator, msg) catch {
+        e.setError("tm_peer_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer std.heap.c_allocator.free(msg_esc);
+
+    const payload = std.fmt.allocPrint(std.heap.c_allocator,
+        \\{{"worker_id":{d},"target_worker_id":{d},"message":"{s}"}}
+    , .{ from_id, target_id, msg_esc }) catch {
+        e.setError("tm_peer_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer std.heap.c_allocator.free(payload);
+
+    // Route to Team Lead (worker 0) — Team Lead relays to target
+    b.send(0, from_id, .peer_question, payload) catch |err| {
+        e.setError(if (err == error.DeliveryFailed) "peer question delivery failed" else "peer question bus send failed") catch {};
+        return 8; // TM_ERR_BUS
+    };
+    return 0; // TM_OK
+}
+
+export fn tm_peer_delegate(engine: ?*Engine, from_id: u32, target_id: u32, task: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99; // TM_ERR_UNKNOWN
+    const tsk = std.mem.span(task orelse {
+        e.setError("tm_peer_delegate: task is NULL") catch {};
+        return 99;
+    });
+
+    if (from_id == 0) {
+        e.setError("tm_peer_delegate: Team Lead cannot delegate via peer messaging") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    if (from_id == target_id) {
+        e.setError("tm_peer_delegate: cannot delegate to yourself") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    if (e.roster.getWorker(from_id) == null) {
+        e.setError("tm_peer_delegate: sender worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    if (e.roster.getWorker(target_id) == null) {
+        e.setError("tm_peer_delegate: target worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+
+    var b = &(e.message_bus orelse {
+        e.setError("tm_peer_delegate: message bus not initialized") catch {};
+        return 8; // TM_ERR_BUS
+    });
+
+    // Build payload JSON: {"worker_id": from, "target_worker_id": target, "task": "..."}
+    const tsk_esc = jsonEscape(std.heap.c_allocator, tsk) catch {
+        e.setError("tm_peer_delegate: payload allocation failed") catch {};
+        return 99;
+    };
+    defer std.heap.c_allocator.free(tsk_esc);
+
+    const payload = std.fmt.allocPrint(std.heap.c_allocator,
+        \\{{"worker_id":{d},"target_worker_id":{d},"task":"{s}"}}
+    , .{ from_id, target_id, tsk_esc }) catch {
+        e.setError("tm_peer_delegate: payload allocation failed") catch {};
+        return 99;
+    };
+    defer std.heap.c_allocator.free(payload);
+
+    // Route directly to target worker PTY
+    b.send(target_id, from_id, .delegation, payload) catch |err| {
+        e.setError(if (err == error.DeliveryFailed) "delegation delivery failed" else "delegation bus send failed") catch {};
+        return 8; // TM_ERR_BUS
+    };
+    return 0; // TM_OK
 }
 
 // ─── Completion + Question signaling ─────────────────────
@@ -3187,6 +3433,551 @@ test "command routing wrapper forwards unknown commands to Swift callback" {
 
     try std.testing.expect(State.forwarded);
     try std.testing.expectEqualStrings("/teammux-status", State.forwarded_cmd[0..State.forwarded_len]);
+}
+
+// ─── Peer messaging tests ────────────────────────────────
+
+test "/teammux-ask routes to Team Lead PTY (worker 0), not target" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "asktest1", root);
+
+    // Add workers: sender (2) and target (5)
+    try e.roster.workers.put(2, try coordinator_mod.makeTestWorker(alloc, 2));
+    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
+
+    const BusState = struct {
+        var called: bool = false;
+        var to_id: u32 = 99;
+        var from_id: u32 = 99;
+        var msg_type: c_int = -1;
+        var payload_buf: [512]u8 = undefined;
+        var payload_len: usize = 0;
+    };
+    BusState.called = false;
+    BusState.to_id = 99;
+    BusState.from_id = 99;
+    BusState.msg_type = -1;
+    BusState.payload_len = 0;
+
+    const cb = struct {
+        fn f(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                BusState.called = true;
+                BusState.to_id = m.to;
+                BusState.from_id = m.from;
+                BusState.msg_type = m.msg_type;
+                if (m.payload) |p| {
+                    const slice = std.mem.span(p);
+                    const len = @min(slice.len, BusState.payload_buf.len);
+                    @memcpy(BusState.payload_buf[0..len], slice[0..len]);
+                    BusState.payload_len = len;
+                }
+            }
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 2, \"target_worker_id\": 5, \"message\": \"how should I handle auth?\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(BusState.called);
+    try std.testing.expect(BusState.to_id == 0); // Team Lead
+    try std.testing.expect(BusState.from_id == 2); // sender
+    try std.testing.expect(BusState.msg_type == @intFromEnum(bus.MessageType.peer_question));
+    // Verify payload contains the message text
+    try std.testing.expect(std.mem.indexOf(u8, BusState.payload_buf[0..BusState.payload_len], "how should I handle auth?") != null);
+}
+
+test "/teammux-delegate routes directly to target worker PTY" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "deltest1", root);
+
+    // Add workers: sender (3) and target (7)
+    try e.roster.workers.put(3, try coordinator_mod.makeTestWorker(alloc, 3));
+    try e.roster.workers.put(7, try coordinator_mod.makeTestWorker(alloc, 7));
+
+    const BusState = struct {
+        var called: bool = false;
+        var to_id: u32 = 99;
+        var from_id: u32 = 99;
+        var msg_type: c_int = -1;
+        var payload_buf: [512]u8 = undefined;
+        var payload_len: usize = 0;
+    };
+    BusState.called = false;
+    BusState.to_id = 99;
+    BusState.from_id = 99;
+    BusState.msg_type = -1;
+    BusState.payload_len = 0;
+
+    const cb = struct {
+        fn f(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                BusState.called = true;
+                BusState.to_id = m.to;
+                BusState.from_id = m.from;
+                BusState.msg_type = m.msg_type;
+                if (m.payload) |p| {
+                    const slice = std.mem.span(p);
+                    const len = @min(slice.len, BusState.payload_buf.len);
+                    @memcpy(BusState.payload_buf[0..len], slice[0..len]);
+                    BusState.payload_len = len;
+                }
+            }
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 3, \"target_worker_id\": 7, \"task\": \"write unit tests for auth\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(BusState.called);
+    try std.testing.expect(BusState.to_id == 7); // target worker directly
+    try std.testing.expect(BusState.from_id == 3); // sender
+    try std.testing.expect(BusState.msg_type == @intFromEnum(bus.MessageType.delegation));
+    // Verify payload contains the task text
+    try std.testing.expect(std.mem.indexOf(u8, BusState.payload_buf[0..BusState.payload_len], "write unit tests for auth") != null);
+}
+
+test "/teammux-ask invalid target_worker_id does not send" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "askbad1", root);
+
+    // Only add sender (2), target (99) does NOT exist
+    try e.roster.workers.put(2, try coordinator_mod.makeTestWorker(alloc, 2));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 2, \"target_worker_id\": 99, \"message\": \"hello\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    // Bus should NOT have been called — target not in roster
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-ask self-targeting does not send" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "selfask", root);
+
+    try e.roster.workers.put(2, try coordinator_mod.makeTestWorker(alloc, 2));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    // from_id == target_id == 2
+    const args_json = "{\"worker_id\": 2, \"target_worker_id\": 2, \"message\": \"talking to myself\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-ask null args does not crash" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
+    defer alloc.free(cmd_z);
+
+    // Pass null args — should log warning and return, not crash
+    commandRoutingCallback(cmd_z.ptr, null, e);
+}
+
+test "/teammux-delegate invalid target_worker_id does not send" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "delbad1", root);
+
+    try e.roster.workers.put(3, try coordinator_mod.makeTestWorker(alloc, 3));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 3, \"target_worker_id\": 99, \"task\": \"missing worker\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-delegate self-targeting does not send" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "delself", root);
+
+    try e.roster.workers.put(3, try coordinator_mod.makeTestWorker(alloc, 3));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 3, \"target_worker_id\": 3, \"task\": \"self delegate\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-delegate null args does not crash" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, null, e);
+}
+
+test "tm_peer_question and tm_peer_delegate C API return correct codes" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "capitest", root);
+
+    try e.roster.workers.put(2, try coordinator_mod.makeTestWorker(alloc, 2));
+    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
+
+    // Null engine
+    try std.testing.expect(tm_peer_question(null, 2, 5, "hello") == 99);
+    try std.testing.expect(tm_peer_delegate(null, 2, 5, "task") == 99);
+
+    // Null message/task
+    try std.testing.expect(tm_peer_question(e, 2, 5, null) == 99);
+    try std.testing.expect(tm_peer_delegate(e, 2, 5, null) == 99);
+
+    // Team Lead (from_id == 0) rejected
+    try std.testing.expect(tm_peer_question(e, 0, 5, "nope") == 12); // TM_ERR_INVALID_WORKER
+    try std.testing.expect(tm_peer_delegate(e, 0, 5, "nope") == 12);
+
+    // Self-targeting
+    try std.testing.expect(tm_peer_question(e, 2, 2, "self") == 12); // TM_ERR_INVALID_WORKER
+    try std.testing.expect(tm_peer_delegate(e, 2, 2, "self") == 12);
+
+    // Sender not in roster
+    try std.testing.expect(tm_peer_question(e, 88, 5, "ghost") == 12);
+    try std.testing.expect(tm_peer_delegate(e, 88, 5, "ghost") == 12);
+
+    // Target not in roster
+    try std.testing.expect(tm_peer_question(e, 2, 99, "missing") == 12);
+    try std.testing.expect(tm_peer_delegate(e, 2, 99, "missing") == 12);
+
+    // Valid calls — should succeed
+    const msg_z = try alloc.dupeZ(u8, "how do I handle auth?");
+    defer alloc.free(msg_z);
+    try std.testing.expect(tm_peer_question(e, 2, 5, msg_z.ptr) == 0); // TM_OK
+
+    const task_z = try alloc.dupeZ(u8, "write auth tests");
+    defer alloc.free(task_z);
+    try std.testing.expect(tm_peer_delegate(e, 2, 5, task_z.ptr) == 0); // TM_OK
+}
+
+test "/teammux-ask from_id not in roster does not send" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "askfrom", root);
+
+    // Only target (5) in roster — sender (88) is NOT
+    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 88, \"target_worker_id\": 5, \"message\": \"ghost sender\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-ask from Team Lead (worker 0) rejected" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "asktl01", root);
+
+    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    // from_id == 0 (Team Lead) should be rejected
+    const args_json = "{\"worker_id\": 0, \"target_worker_id\": 5, \"message\": \"Team Lead trying peer ask\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-ask bus send failure injects error to sender PTY" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "askfail", root);
+    e.message_bus.?.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    try e.roster.workers.put(2, try coordinator_mod.makeTestWorker(alloc, 2));
+    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
+
+    const BusState = struct {
+        var call_count: u32 = 0;
+        var error_to: u32 = 99;
+        var error_msg_type: c_int = -1;
+    };
+    BusState.call_count = 0;
+    BusState.error_to = 99;
+    BusState.error_msg_type = -1;
+
+    const cb = struct {
+        fn f(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.call_count += 1;
+            if (msg) |m| {
+                // First message is the peer_question — fail it
+                if (m.msg_type == @intFromEnum(bus.MessageType.peer_question)) {
+                    return 8; // TM_ERR_BUS — force failure
+                }
+                // Second message should be the error notification to sender
+                if (m.msg_type == @intFromEnum(bus.MessageType.err)) {
+                    BusState.error_to = m.to;
+                    BusState.error_msg_type = m.msg_type;
+                }
+            }
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 2, \"target_worker_id\": 5, \"message\": \"will fail\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    // Error notification should have been sent to the sender (worker 2)
+    try std.testing.expect(BusState.error_to == 2);
+    try std.testing.expect(BusState.error_msg_type == @intFromEnum(bus.MessageType.err));
 }
 
 // ─── JSON helper tests ───────────────────────────────────

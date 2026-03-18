@@ -63,8 +63,10 @@ typedef enum {
     TM_MSG_ERROR       = 6,
     TM_MSG_BROADCAST   = 7,
     TM_MSG_QUESTION    = 8,
-    TM_MSG_DISPATCH    = 10,  // Team Lead dispatches task to worker
-    TM_MSG_RESPONSE    = 11,  // Team Lead responds to worker question
+    TM_MSG_DISPATCH       = 10,  // Team Lead dispatches task to worker
+    TM_MSG_RESPONSE       = 11,  // Team Lead responds to worker question
+    TM_MSG_PEER_QUESTION  = 12,  // Worker-to-worker question via Team Lead relay
+    TM_MSG_DELEGATION     = 13,  // Worker-to-worker task delegation direct
 } tm_message_type_t;
 
 typedef enum {
@@ -430,6 +432,30 @@ void tm_completion_free(tm_completion_t* completion);
 
 // Free a heap-allocated question struct.
 void tm_question_free(tm_question_t* question);
+
+// -----------------------------------------------------------------
+// Peer messaging — worker-to-worker
+// -----------------------------------------------------------------
+
+// Send a peer question from one worker to another, routed via Team Lead
+// (worker 0). Creates TM_MSG_PEER_QUESTION message, routes through bus
+// to Team Lead PTY. Returns TM_ERR_UNKNOWN if engine or message is NULL.
+// Returns TM_ERR_INVALID_WORKER if target_id is not in roster or equals
+// from_id. Returns TM_ERR_BUS if bus not initialized.
+tm_result_t tm_peer_question(tm_engine_t* engine,
+                              uint32_t from_id,
+                              uint32_t target_id,
+                              const char* message);
+
+// Delegate a task directly to a target worker. Creates TM_MSG_DELEGATION
+// message, routes through bus directly to target worker PTY.
+// Returns TM_ERR_UNKNOWN if engine or task is NULL.
+// Returns TM_ERR_INVALID_WORKER if target_id is not in roster or equals
+// from_id. Returns TM_ERR_BUS if bus not initialized.
+tm_result_t tm_peer_delegate(tm_engine_t* engine,
+                              uint32_t from_id,
+                              uint32_t target_id,
+                              const char* task);
 
 // -----------------------------------------------------------------
 // Utility
