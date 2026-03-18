@@ -7,6 +7,7 @@ import SwiftUI
 /// Allows configuration of:
 /// - Team Lead agent + model
 /// - Worker agents (add/remove/configure)
+/// - Role assignment per worker (from bundled role library)
 /// - GitHub connection status
 struct TeamBuilderView: View {
     @Binding var config: TeamConfig
@@ -62,8 +63,20 @@ struct TeamBuilderView: View {
         .onAppear {
             detectGitHubAuth()
             if !rolesLoaded {
-                bundledRoles = EngineClient.listBundledRoles(projectRoot: projectRoot?.path)
-                rolesLoaded = true
+                let path = projectRoot?.path
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let roles = EngineClient.listBundledRoles(projectRoot: path)
+                    DispatchQueue.main.async {
+                        bundledRoles = roles
+                        rolesLoaded = true
+                        if roles.isEmpty {
+                            // Clear stale role selections — cannot verify them
+                            for i in config.workers.indices {
+                                config.workers[i].roleId = nil
+                            }
+                        }
+                    }
+                }
             }
         }
     }

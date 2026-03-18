@@ -53,6 +53,8 @@ struct WorkerConfig: Identifiable, Equatable {
     var name: String
     var agent: AgentType
     var model: String
+    /// Optional role identifier from the bundled role library (e.g. "frontend-engineer").
+    /// Nil means generic worker with no role constraint. Serialized as `role = "..."` in TOML.
     var roleId: String?
 
     init(

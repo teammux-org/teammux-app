@@ -774,7 +774,9 @@ final class EngineClient: ObservableObject {
                 Self.logger.warning("loadAvailableRoles: NULL role at index \(i) — skipping")
                 continue
             }
-            roles.append(Self.bridgeRole(rolePtr))
+            if let role = Self.bridgeRole(rolePtr) {
+                roles.append(role)
+            }
         }
 
         tm_roles_list_free(rolesPtr, count)
@@ -782,10 +784,13 @@ final class EngineClient: ObservableObject {
         Self.logger.info("loadAvailableRoles: loaded \(roles.count) roles")
     }
 
-    /// Load bundled roles without an active engine session.
+    /// List bundled roles without an active engine session.
     /// Wraps `tm_roles_list_bundled()` + `tm_roles_list_bundled_free()`.
-    /// Pass `nil` for `projectRoot` to skip project-local role search.
-    /// Safe to call before `create()` or `sessionStart()`.
+    /// Returns an empty array if no roles are found or if the C API returns NULL.
+    /// Pass `nil` for `projectRoot` to skip the project-local (`.teammux/roles/`)
+    /// search path; user, bundle, and dev-build paths are still searched.
+    /// Safe to call before `create()` or `sessionStart()` — does not require
+    /// an engine instance (uses the standalone C API `tm_roles_list_bundled`).
     static func listBundledRoles(projectRoot: String?) -> [RoleDefinition] {
         var count: UInt32 = 0
 
@@ -798,11 +803,16 @@ final class EngineClient: ObservableObject {
             rolesPtr = tm_roles_list_bundled(nil, &count)
         }
 
-        guard let rolesPtr, count > 0 else {
-            if let rolesPtr {
-                tm_roles_list_bundled_free(rolesPtr, count)
-            }
-            logger.info("listBundledRoles: no roles found")
+        guard let rolesPtr else {
+            // NULL pointer could mean no roles OR an internal failure (OOM).
+            // No engine instance to query for error details.
+            logger.warning("listBundledRoles: tm_roles_list_bundled returned NULL — roles may have failed to load")
+            return []
+        }
+
+        guard count > 0 else {
+            tm_roles_list_bundled_free(rolesPtr, count)
+            logger.info("listBundledRoles: engine returned empty list")
             return []
         }
 
@@ -812,7 +822,9 @@ final class EngineClient: ObservableObject {
                 logger.warning("listBundledRoles: NULL role at index \(i) — skipping")
                 continue
             }
-            roles.append(bridgeRole(rolePtr))
+            if let role = bridgeRole(rolePtr) {
+                roles.append(role)
+            }
         }
 
         tm_roles_list_bundled_free(rolesPtr, count)
@@ -896,15 +908,30 @@ final class EngineClient: ObservableObject {
 
         let role = Self.bridgeRole(rolePtr)
         tm_role_free(rolePtr)
+        if role == nil {
+            Self.logger.error("resolveRole('\(id)'): bridgeRole returned nil — corrupted role data")
+        }
         return role
     }
 
     /// Bridge a `tm_role_t*` to a Swift `RoleDefinition`.
     /// Extracts string fields, boolean capabilities, and iterates
-    /// the `const char**` pattern arrays.
-    private static func bridgeRole(_ rolePtr: UnsafeMutablePointer<tm_role_t>) -> RoleDefinition {
+    /// the `const char**` pattern arrays. Returns `nil` if required
+    /// string fields (`id`, `name`, `division`, `emoji`, `description`)
+    /// are NULL — defensive guard for pre-session codepath.
+    private static func bridgeRole(_ rolePtr: UnsafeMutablePointer<tm_role_t>) -> RoleDefinition? {
         let role = rolePtr.pointee
-        let roleId = String(cString: role.id)
+
+        guard let idPtr = role.id,
+              let namePtr = role.name,
+              let divPtr = role.division,
+              let emojiPtr = role.emoji,
+              let descPtr = role.description else {
+            logger.error("bridgeRole: NULL required string field in tm_role_t — skipping")
+            return nil
+        }
+
+        let roleId = String(cString: idPtr)
 
         var writePatterns: [String] = []
         if let patternsPtr = role.write_patterns {
@@ -912,7 +939,7 @@ final class EngineClient: ObservableObject {
                 if let cStr = patternsPtr[i] {
                     writePatterns.append(String(cString: cStr))
                 } else {
-                    Self.logger.warning("bridgeRole: NULL write_pattern at index \(i) for role '\(roleId)'")
+                    logger.warning("bridgeRole: NULL write_pattern at index \(i) for role '\(roleId)'")
                 }
             }
         }
@@ -923,17 +950,17 @@ final class EngineClient: ObservableObject {
                 if let cStr = patternsPtr[i] {
                     denyWritePatterns.append(String(cString: cStr))
                 } else {
-                    Self.logger.warning("bridgeRole: NULL deny_write_pattern at index \(i) for role '\(roleId)'")
+                    logger.warning("bridgeRole: NULL deny_write_pattern at index \(i) for role '\(roleId)'")
                 }
             }
         }
 
         return RoleDefinition(
             id: roleId,
-            name: String(cString: role.name),
-            division: String(cString: role.division),
-            emoji: String(cString: role.emoji),
-            description: String(cString: role.description),
+            name: String(cString: namePtr),
+            division: String(cString: divPtr),
+            emoji: String(cString: emojiPtr),
+            description: String(cString: descPtr),
             writePatterns: writePatterns,
             denyWritePatterns: denyWritePatterns,
             canPush: role.can_push,
