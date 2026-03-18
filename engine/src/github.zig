@@ -109,7 +109,7 @@ pub const GitHubClient = struct {
     }
 
     /// Create a GitHub PR for a worker's branch → main.
-    /// Uses --json url to get structured JSON output with the PR URL.
+    /// gh pr create outputs the PR URL as plain text to stdout on success.
     pub fn createPr(
         self: *GitHubClient,
         allocator: std.mem.Allocator,
@@ -119,34 +119,21 @@ pub const GitHubClient = struct {
     ) !Pr {
         const repo = self.repo orelse return error.NoRepo;
 
-        // Use gh CLI to create PR with --json url for structured output
         const result = try runGhCommand(allocator, &.{
             "pr",     "create",
             "--repo",  repo,
             "--head",  branch,
             "--title", title,
             "--body",  body,
-            "--json",  "url",
         });
         defer allocator.free(result);
 
-        // Parse PR URL from JSON output: {"url": "https://..."}
-        const trimmed = std.mem.trim(u8, result, &[_]u8{ '\n', '\r', ' ' });
-        const url_value = extractJsonStringSimple(trimmed, "url") orelse {
-            // Fallback: treat entire output as URL (gh without --json support)
-            const url = try allocator.dupe(u8, trimmed);
-            return .{
-                .pr_number = 0,
-                .url = url,
-                .title = try allocator.dupe(u8, title),
-                .state = try allocator.dupe(u8, "open"),
-                .diff_url = try allocator.dupe(u8, ""),
-            };
-        };
+        // gh pr create outputs the PR URL as plain text
+        const url = try allocator.dupe(u8, std.mem.trim(u8, result, &[_]u8{ '\n', '\r', ' ' }));
 
         return .{
             .pr_number = 0,
-            .url = try allocator.dupe(u8, url_value),
+            .url = url,
             .title = try allocator.dupe(u8, title),
             .state = try allocator.dupe(u8, "open"),
             .diff_url = try allocator.dupe(u8, ""),
