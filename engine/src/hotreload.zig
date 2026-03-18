@@ -240,7 +240,7 @@ pub const RoleWatcher = struct {
                     role_def.deny_write_patterns,
                     role_def.write_patterns,
                 ) catch |err| {
-                    std.log.warn("[teammux] hotreload: ownership updated but interceptor reinstall failed for worker {d} — will retry on next role change: {}", .{ self.worker_id, err });
+                    std.log.warn("[teammux] hotreload: ownership updated but interceptor reinstall failed for worker {d} — git wrapper has stale patterns until next role file change: {}", .{ self.worker_id, err });
                 };
             }
         }
@@ -688,10 +688,11 @@ test "hotreload TD18 - ownership registry updated on role change" {
     const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
     defer alloc.free(role_path);
 
-    // Set up ownership registry with initial rules
+    // Set up ownership registry with initial rules matching the role file
     var registry = ownership.FileOwnershipRegistry.init(alloc);
     defer registry.deinit();
     try registry.register(1, "src/frontend/**", true);
+    try registry.register(1, "tests/**", true);
     try registry.register(1, "src/backend/**", false);
 
     var callback_fired = std.atomic.Value(bool).init(false);

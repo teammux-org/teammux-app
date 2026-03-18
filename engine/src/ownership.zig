@@ -122,9 +122,11 @@ pub const FileOwnershipRegistry = struct {
         return self.rules.get(worker_id);
     }
 
-    /// Atomically replace all ownership rules for a worker. Allocates new
+    /// Replace all ownership rules for a worker under lock. Allocates new
     /// rules first — on allocation failure, old rules are preserved unchanged.
     /// On success, old rules are freed and replaced with the new set.
+    /// Passing empty write and deny patterns creates an explicit empty rule
+    /// set (all writes denied). To make a worker unrestricted, use release().
     pub fn updateWorkerRules(
         self: *FileOwnershipRegistry,
         worker_id: WorkerId,
@@ -157,20 +159,17 @@ pub const FileOwnershipRegistry = struct {
             duped += 1;
         }
 
-        // Swap under lock — all allocations succeeded, so this cannot fail.
+        // Swap under lock. Use getOrPut to pre-allocate the map slot
+        // BEFORE freeing old rules — if resize fails, old rules are preserved
+        // and new rules are freed by errdefer.
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.rules.fetchRemove(worker_id)) |kv| {
-            freeRules(self.allocator, kv.value);
+        const gop = try self.rules.getOrPut(worker_id);
+        if (gop.found_existing) {
+            freeRules(self.allocator, gop.value_ptr.*);
         }
-        self.rules.put(worker_id, new_rules) catch {
-            // HashMap put can only fail on resize allocation. Free new rules
-            // to avoid leak — old rules are already gone, so this worker
-            // becomes unrestricted (default allow). Caller should retry.
-            freeRules(self.allocator, new_rules);
-            return error.OutOfMemory;
-        };
+        gop.value_ptr.* = new_rules;
     }
 
     fn freeRules(allocator: std.mem.Allocator, rules_slice: []PathRule) void {
@@ -620,19 +619,23 @@ test "updateWorkerRules - creates rules for new worker" {
     try std.testing.expect(!reg.check(42, "vendor/lib.zig"));
 }
 
-test "updateWorkerRules - empty patterns clears restrictions" {
+test "updateWorkerRules - empty patterns denies all writes" {
     var reg = FileOwnershipRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
     try reg.register(1, "src/**", true);
     try reg.register(1, "infra/**", false);
 
-    // Update with no patterns — worker gets empty rule set
+    // Update with no patterns — explicit empty rule set (deny-all,
+    // unlike no-rules default-allow from release())
     const empty = [_][]const u8{};
     try reg.updateWorkerRules(1, &empty, &empty);
 
     const rules = reg.getRules(1) orelse return error.TestUnexpectedResult;
     try std.testing.expect(rules.len == 0);
+    // Empty rule set means implicit deny for all paths
+    try std.testing.expect(!reg.check(1, "src/anything.ts"));
+    try std.testing.expect(!reg.check(1, "any/path/at/all"));
 }
 
 test "updateWorkerRules - does not affect other workers" {
@@ -687,7 +690,9 @@ test "updateWorkerRules - concurrent update and check" {
     for (0..10) |_| {
         const w = [_][]const u8{"src/**"};
         const d = [_][]const u8{"infra/**"};
-        reg.updateWorkerRules(1, &w, &d) catch {};
+        reg.updateWorkerRules(1, &w, &d) catch |err| {
+            std.debug.panic("updateWorkerRules failed unexpectedly: {}", .{err});
+        };
     }
 
     for (threads[0..started]) |t| t.join();

@@ -1335,8 +1335,10 @@ export fn tm_ownership_update(
         }
     }
 
-    e.ownership_registry.updateWorkerRules(worker_id, write_slices, deny_slices) catch {
-        e.setError("tm_ownership_update: update failed") catch {};
+    e.ownership_registry.updateWorkerRules(worker_id, write_slices, deny_slices) catch |err| {
+        e.setError(switch (err) {
+            error.OutOfMemory => "tm_ownership_update: allocation failed (out of memory)",
+        }) catch {};
         return 14;
     };
     return 0;
