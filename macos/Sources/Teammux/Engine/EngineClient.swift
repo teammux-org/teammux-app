@@ -125,6 +125,14 @@ final class EngineClient: ObservableObject {
     /// only the latest PR per worker is tracked.
     @Published var workerPRs: [UInt32: PREvent] = [:]
 
+    /// Autonomous dispatch metadata, keyed by worker ID. Only the latest
+    /// auto-dispatch per worker is stored — a second auto-dispatch for
+    /// the same worker overwrites the previous one (latest state wins).
+    /// The actual dispatched task lives in `dispatchHistory`; this dict
+    /// tracks which dispatches were triggered autonomously.
+    /// Not Codable — ephemeral metadata, not persisted across sessions.
+    @Published var autonomousDispatches: [UInt32: AutonomousDispatch] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -304,6 +312,7 @@ final class EngineClient: ObservableObject {
         peerDelegations.removeAll()
         completionHistory.removeAll()
         workerPRs.removeAll()
+        autonomousDispatches.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -2047,6 +2056,7 @@ final class EngineClient: ObservableObject {
                 timestamp: timestamp
             )
             workerCompletions[workerId] = report
+            triggerAutonomousDispatch(for: report)
         } catch {
             let msg = "handleCompletionMessage: JSON parse failed for worker \(workerId): \(error.localizedDescription)"
             Self.logger.error("\(msg)")
@@ -2358,6 +2368,69 @@ final class EngineClient: ObservableObject {
             Self.logger.error("\(msg)")
             lastError = msg
         }
+    }
+
+    // MARK: - Autonomous Dispatch
+
+    /// Immediately dispatch a follow-up task for a completed worker.
+    /// Called inline from `handleCompletionMessage` after
+    /// `workerCompletions[workerId]` is set — no human approval step,
+    /// no cancel window. Fully autonomous Team Lead behavior.
+    ///
+    /// Saves and restores `lastError` around the dispatch call so the
+    /// autonomous path does not clobber error state from unrelated operations.
+    private func triggerAutonomousDispatch(for completion: CompletionReport) {
+        let role = workerRoles[completion.workerId]
+        let instruction = suggestFollowUp(completion: completion, role: role)
+
+        let dispatch = AutonomousDispatch(
+            workerId: completion.workerId,
+            instruction: instruction,
+            triggerSummary: completion.summary,
+            timestamp: Date()
+        )
+
+        // Save lastError so the autonomous dispatch path does not clobber
+        // error state from a prior manual operation (dispatchTask clears it).
+        let savedError = lastError
+
+        let success = dispatchTask(workerId: completion.workerId, instruction: instruction)
+        if success {
+            if let existing = autonomousDispatches[completion.workerId] {
+                Self.logger.warning("triggerAutonomousDispatch: overwriting prior auto-dispatch for worker \(completion.workerId), previous: \(existing.instruction)")
+            }
+            autonomousDispatches[completion.workerId] = dispatch
+            Self.logger.info("triggerAutonomousDispatch: auto-dispatched to worker \(completion.workerId): \(instruction)")
+        } else {
+            let engineError = lastError ?? "unknown engine error"
+            Self.logger.error("triggerAutonomousDispatch: dispatch failed for worker \(completion.workerId), instruction: \(instruction), error: \(engineError)")
+        }
+
+        // Restore lastError — autonomous dispatch should not corrupt
+        // user-visible error state from unrelated operations.
+        lastError = savedError
+    }
+
+    /// Deterministic heuristic for follow-up task suggestion based on
+    /// completion summary keywords. No LLM — pure keyword matching.
+    /// `role` parameter unused in current implementation; reserved for
+    /// future role-aware differentiation.
+    private func suggestFollowUp(completion: CompletionReport, role: RoleDefinition?) -> String {
+        let summary = completion.summary.lowercased()
+
+        if summary.contains("implement") || summary.contains("built") || summary.contains("added") {
+            return "Review the implementation and write tests"
+        }
+        if summary.contains("fix") || summary.contains("bug") || summary.contains("patch") {
+            return "Verify the fix resolves the issue and add a regression test"
+        }
+        if summary.contains("refactor") || summary.contains("restructure") {
+            return "Verify all existing tests pass after the refactor"
+        }
+        if summary.contains("test") || summary.contains("spec") {
+            return "Review test coverage and identify any gaps"
+        }
+        return "Review the completed work and confirm it meets requirements"
     }
 
     deinit {

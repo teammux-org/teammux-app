@@ -204,7 +204,8 @@ struct DispatchWorkerRow: View {
 // MARK: - DispatchHistoryRow
 
 /// A single row in the dispatch history showing what was sent, to whom, when,
-/// the dispatch direction (task vs response), and delivery status.
+/// the dispatch direction (task vs response), delivery status, and whether
+/// the dispatch was triggered by automatic follow-up dispatch.
 struct DispatchHistoryRow: View {
     let event: DispatchEvent
     let engine: EngineClient
@@ -212,6 +213,15 @@ struct DispatchHistoryRow: View {
     private var workerName: String {
         engine.roster.first(where: { $0.id == event.targetWorkerId })?.name
             ?? "Worker \(event.targetWorkerId)"
+    }
+
+    /// Whether this dispatch was triggered autonomously. Matches against the
+    /// latest entry in `autonomousDispatches` by worker ID and instruction text.
+    /// Because only the latest auto-dispatch per worker is retained, earlier
+    /// auto-dispatches for the same worker will lose this badge once a newer
+    /// one arrives.
+    private var isAutonomous: Bool {
+        engine.autonomousDispatches[event.targetWorkerId]?.instruction == event.instruction
     }
 
     var body: some View {
@@ -223,6 +233,15 @@ struct DispatchHistoryRow: View {
             Text(workerName)
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
+
+            if isAutonomous {
+                Text("\u{1F916} Auto")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.secondary.opacity(0.12)))
+            }
 
             Text("\"\(event.instruction)\"")
                 .font(.system(size: 11))
