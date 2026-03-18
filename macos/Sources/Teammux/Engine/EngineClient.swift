@@ -494,6 +494,127 @@ final class EngineClient: ObservableObject {
         return true
     }
 
+    // MARK: - Session Restore
+
+    /// Restores workers and state from a previously saved session snapshot.
+    ///
+    /// For each `WorkerSnapshot`:
+    /// 1. Checks that the worktree path still exists on disk — skips with warning if missing
+    /// 2. Calls `spawnWorker` normally (engine handles worktree-already-exists gracefully)
+    /// 3. Overrides `workerWorktrees` and `workerBranches` caches with saved snapshot values
+    ///
+    /// Note: the engine assigns fresh worker IDs on spawn — snapshot IDs are not preserved.
+    /// An old-to-new ID mapping is built during the worker loop and used to remap
+    /// `workerPRs` and `dispatchHistory` entries to the new IDs.
+    ///
+    /// Completion history is intentionally not restored from the snapshot —
+    /// `sessionStart()` reloads it from the authoritative JSONL log.
+    ///
+    /// After workers: merges snapshot dispatch events into `dispatchHistory` (dedup by
+    /// timestamp + remapped targetWorkerId). Populates `workerPRs` from snapshot.
+    ///
+    /// Returns the number of workers that failed to restore (0 = full success).
+    @discardableResult
+    func restoreSession(_ snapshot: SessionSnapshot) -> Int {
+        let fm = FileManager.default
+        var skippedWorkers: [String] = []
+        var idMapping: [UInt32: UInt32] = [:]  // old snapshot ID → new engine ID
+
+        for worker in snapshot.workers {
+            guard fm.fileExists(atPath: worker.worktreePath) else {
+                Self.logger.warning("restoreSession: worktree missing at \(worker.worktreePath) — skipping worker \(worker.id) (\(worker.name))")
+                skippedWorkers.append(worker.name)
+                continue
+            }
+
+            let agentType = AgentType(fromCValue: worker.agentTypeCValue, binaryName: worker.agentBinary)
+
+            let workerId = spawnWorker(
+                agentBinary: worker.agentBinary,
+                agentType: agentType,
+                workerName: worker.name,
+                taskDescription: worker.taskDescription,
+                roleId: worker.roleId
+            )
+
+            guard workerId != 0 else {
+                Self.logger.warning("restoreSession: spawnWorker failed for \(worker.name) — skipping")
+                skippedWorkers.append(worker.name)
+                continue
+            }
+
+            idMapping[worker.id] = workerId
+
+            // Override caches with saved snapshot values (do not rely on
+            // tm_worktree_path query — use saved paths directly).
+            workerWorktrees[workerId] = worker.worktreePath
+            workerBranches[workerId] = worker.branchName
+
+            // Fix the worktreeReadyQueue entry to use the saved path
+            // (spawnWorker may have queued with a different/new path).
+            if let idx = worktreeReadyQueue.firstIndex(where: { $0.id == workerId }) {
+                worktreeReadyQueue[idx] = WorktreeReady(
+                    id: workerId,
+                    worktreePath: worker.worktreePath,
+                    agentBinary: worker.agentBinary,
+                    taskDescription: worker.taskDescription
+                )
+            }
+        }
+
+        // Merge snapshot dispatch events into dispatchHistory.
+        // Remap targetWorkerId from snapshot IDs to new engine IDs.
+        // Deduplicate by timestamp + remapped targetWorkerId.
+        // Dispatch events are not persisted to JSONL — the snapshot is
+        // the only persistence mechanism for these.
+        for entry in snapshot.dispatchHistoryEntries {
+            let newTargetId = idMapping[entry.targetWorkerId] ?? entry.targetWorkerId
+
+            let isDuplicate = dispatchHistory.contains { existing in
+                existing.targetWorkerId == newTargetId
+                    && existing.timestamp == entry.timestamp
+            }
+            guard !isDuplicate else { continue }
+
+            dispatchHistory.append(DispatchEvent(
+                targetWorkerId: newTargetId,
+                instruction: entry.instruction,
+                timestamp: entry.timestamp,
+                delivered: entry.delivered,
+                kind: entry.kind
+            ))
+        }
+
+        // Sort dispatch history by timestamp (oldest first) after merge
+        dispatchHistory.sort { $0.timestamp < $1.timestamp }
+
+        // Populate workerPRs from snapshot, remapping old IDs to new IDs
+        for (key, prSnapshot) in snapshot.workerPRs {
+            guard let oldId = UInt32(key) else {
+                Self.logger.warning("restoreSession: unparseable workerPR key '\(key)' — skipping PR event")
+                continue
+            }
+            let newId = idMapping[oldId] ?? oldId
+            workerPRs[newId] = PREvent(
+                workerId: newId,
+                branchName: prSnapshot.branchName,
+                prUrl: prSnapshot.prUrl,
+                title: prSnapshot.title,
+                status: prSnapshot.status,
+                timestamp: prSnapshot.timestamp
+            )
+        }
+
+        if !skippedWorkers.isEmpty {
+            let names = skippedWorkers.joined(separator: ", ")
+            lastError = "Skipped workers with missing worktrees: \(names)"
+            Self.logger.warning("restoreSession: skipped \(skippedWorkers.count) workers — \(names)")
+        }
+
+        Self.logger.info("restoreSession: restored \(snapshot.workers.count - skippedWorkers.count)/\(snapshot.workers.count) workers")
+        return skippedWorkers.count
+    }
+
     /// Refresh the published roster from the engine.
     /// Wraps `tm_roster_get()` + `tm_roster_free()`.
     func refreshRoster() {
