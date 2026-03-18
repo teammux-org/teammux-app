@@ -24,32 +24,42 @@
 | ID   | Module                      | Issue                                                              | Stream | Breaking | Status   |
 |------|-----------------------------|--------------------------------------------------------------------|--------|----------|----------|
 | TD10 | hotreload.zig               | Role hot-reload for active workers not implemented                 | S4/S7  | NO       | RESOLVED |
-| TD11 | SpawnPopoverView            | Role selector UI (browse/preview bundled roles before spawning)    | S9     | NO       | RESOLVED |
+| TD11 | SpawnPopoverView            | Role selector UI deferred                                          | S9     | NO       | RESOLVED |
 | TD12 | interceptor.zig             | git commit -a bypasses interceptor                                 | S1     | NO       | RESOLVED |
 | TD13 | commands.zig / EngineClient | /teammux-complete and /teammux-question have no Swift-side handlers| S2/S6  | NO       | RESOLVED |
-| TD14 | TeamBuilderView             | Role picker in setup flow — session not started during setup       | S3/S9  | NO       | RESOLVED |
+| TD14 | TeamBuilderView             | Role picker in setup flow deferred                                 | S3/S9  | NO       | RESOLVED |
 
-## v0.1.3 — New debt introduced this sprint
+## v0.1.4 — Current sprint targets
 
-| ID   | Module           | Issue                                               | Target | Breaking | Status |
-|------|------------------|-----------------------------------------------------|--------|----------|--------|
-| TD15 | coordinator.zig  | Worker-to-worker direct messaging not routed        | v0.2   | NO       | OPEN   |
-| TD16 | LiveFeedView     | Completion history not persisted across sessions    | v0.2   | NO       | OPEN   |
-| TD17 | interceptor.zig  | git stash / git apply bypass not intercepted        | v0.3   | NO       | OPEN   |
-| TD18 | hotreload.zig    | Role hot-reload does not update ownership registry  | v0.2   | NO       | OPEN   |
-| TD19 | interceptor.zig  | Interceptor exit code indistinguishable from git errors | v0.2   | NO       | OPEN   |
-| TD20 | EngineClient     | lastError is shared mutable state — stale errors from unrelated operations | v0.2 | NO | OPEN |
+| ID   | Module                      | Issue                                                              | Stream | Breaking | Status |
+|------|-----------------------------|--------------------------------------------------------------------|--------|----------|--------|
+| TD15 | coordinator.zig             | Worker-to-worker direct messaging not routed                       | T2/T9  | NO       | OPEN   |
+| TD16 | LiveFeedView                | Completion history not persisted across sessions                   | T5/T10 | NO       | OPEN   |
+| TD17 | interceptor.zig             | git stash / git apply bypass not intercepted                       | T3     | NO       | OPEN   |
+| TD18 | hotreload.zig               | Role hot-reload does not update ownership registry                 | T4     | NO       | OPEN   |
+| TD19 | interceptor.zig             | Interceptor exit code indistinguishable from git errors            | T3     | NO       | OPEN   |
+| TD20 | EngineClient                | lastError is shared mutable state — stale errors bleed across calls| T6     | NO       | OPEN   |
+
+## v0.1.4 — New debt introduced this sprint
+
+| ID   | Module                   | Issue                                                            | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------|--------|----------|--------|
+| TD21 | worktree_lifecycle.zig   | Dangling worktrees if engine crashes mid-spawn                   | v0.2   | NO       | OPEN   |
+| TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | OPEN   |
+| TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown              | v0.1.5 | NO       | OPEN   |
+| TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.2   | NO       | OPEN   |
 
 ## Notes
-- TD10: Role definition changes after spawn do not update active worker CLAUDE.md. stream-S4 implements kqueue watcher on role TOML, regenerates CLAUDE.md and injects update via message bus on change.
-- TD11: SpawnPopoverView role picker only shows roles already loaded by engine. S9 adds pre-session role loading from bundled TOML via tm_roles_list_bundled so TeamBuilderView can show roles before sessionStart().
-- TD12: git commit -a and git commit --all stage and commit denied files bypassing the interceptor wrapper. S1 adds commit subcommand interception with -a/--all flag detection.
-- TD13: /teammux-complete and /teammux-question are documented in worker CLAUDE.md and dispatched by the Zig command watcher. Swift-side EngineClient handlers that parse payloads and update @Published state are not yet implemented. S2 adds engine message types, S6 adds Swift bridge.
-- TD14: TeamBuilderView runs before sessionStart() so engine.availableRoles is empty. S3 adds tm_roles_list_bundled C API, S9 consumes it in TeamBuilderView. TD14 resolved when S9 merges.
-- TD15: tm_dispatch_task routes from Team Lead to a specific worker. Worker-to-worker routing (A asks B a question) is not wired. Deferred to v0.2.
-- TD16: CompletionReport and QuestionRequest cards in LiveFeedView are ephemeral. Session restart loses history. Persist to JSONL in .teammux/logs/ in v0.2.
-- TD17: git stash pop and git apply can restore denied files to the working tree. Not intercepted. Deferred to v0.3 — lower risk than commit bypass.
-- TD18: When a role TOML changes, the active worker gets a refreshed CLAUDE.md. The FileOwnershipRegistry is NOT updated — deny patterns in the registry still reflect the original role. Deferred to v0.2.
-- TD19: Interceptor wrapper uses exit 1 for both git-add and git-commit blocks. Callers cannot distinguish "Teammux blocked this" from "git itself failed." Use a distinctive exit code (e.g., 126) for interceptor enforcement. Affects both add and commit blocks.
-- TD20: EngineClient.lastError is a single @Published String? written by 50+ methods. When one method fails, lastError may still contain an error from a previous unrelated call. Affects GitWorkerRow, DispatchWorkerRow, QuestionCardView, and any future view reading lastError on failure. Fix: return Result<T, Error> from engine methods or clear lastError at method entry. Deferred to v0.2.
-- Merge order v0.1.3: S1 (any time) → S2/S3/S4/S5 (parallel) → S6/S7/S8/S9 (parallel wave 2) → S10/S11 (parallel wave 3) → S12 (last)
+- TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
+- TD16: CompletionReport and QuestionRequest cards ephemeral across sessions. T5 adds history.zig JSONL persistence, T10 adds Swift bridge loading on sessionStart with collapsible history section in LiveFeedView.
+- TD17: git stash pop and git apply can restore denied files. T3 adds interception alongside exit 126 fix (TD19) and push-to-main block.
+- TD18: Role TOML hot-reload updates CLAUDE.md but not FileOwnershipRegistry. T4 extends hotreload.zig callback to call ownership_update and re-installs interceptor with new deny patterns atomically.
+- TD19: Interceptor wrapper uses exit 1 for enforcement — indistinguishable from real git errors. T3 changes all enforcement blocks to exit 126 (POSIX reserved for "command cannot execute").
+- TD20: EngineClient.lastError written by 50+ methods — stale errors bleed. T6 adds clear at method entry (minimal correct fix). Full Result<T, EngineError> migration deferred to future sprint.
+- TD21: tm_worktree_create creates directory and branch. On engine crash mid-spawn, worktree directory and branch may be left on disk. Recovery scan at engine init deferred to v0.2.
+- TD22: SessionState.swift restores worker roster and spawns workers into existing worktrees. FileOwnershipRegistry is rebuilt at spawn time from the role definition — but deny patterns from any runtime ownership changes (direct tm_ownership_register calls) are lost. Full registry snapshot deferred to v0.2.
+- TD23: ContextView renders CLAUDE.md as plain text with bold section headers (## prefix detection). True markdown rendering with a SwiftUI-compatible renderer deferred to v0.1.5 to avoid adding a dependency.
+- TD24: completion_history.jsonl is append-only and grows across all sessions. Log rotation (max size, archive old entries) deferred to v0.2. Risk is low for initial usage.
+- Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
+- Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
+- Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.
