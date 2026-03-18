@@ -272,3 +272,36 @@ struct PREvent: Identifiable, Equatable, Sendable {
         self.timestamp = timestamp
     }
 }
+
+// MARK: - AutonomousDispatch
+
+/// Metadata for a follow-up task dispatched autonomously by the Team Lead
+/// on receipt of a `CompletionReport`. The actual dispatched task lives in
+/// `EngineClient.dispatchHistory` as a `DispatchEvent`; this struct tracks
+/// which dispatches were triggered without human approval.
+///
+/// Keyed by `workerId` in `EngineClient.autonomousDispatches` — only the
+/// latest auto-dispatch per worker is stored. A second auto-dispatch before
+/// the first is consumed overwrites it (latest state wins, matching the
+/// `workerCompletions` overwrite pattern).
+struct AutonomousDispatch: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let workerId: UInt32
+    let instruction: String
+    let triggerSummary: String
+    let timestamp: Date
+
+    init(
+        id: UUID = UUID(),
+        workerId: UInt32,
+        instruction: String,
+        triggerSummary: String,
+        timestamp: Date
+    ) {
+        self.id = id
+        self.workerId = workerId
+        self.instruction = instruction
+        self.triggerSummary = triggerSummary
+        self.timestamp = timestamp
+    }
+}
