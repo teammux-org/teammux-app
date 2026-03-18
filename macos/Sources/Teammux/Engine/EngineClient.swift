@@ -661,9 +661,13 @@ final class EngineClient: ObservableObject {
         tm_pr_free(prPtr)
 
         // Populate workerPRs so the PR card appears immediately in GitView.
-        // A subsequent TM_MSG_PR_READY from the bus will upsert (overwrite).
+        // A subsequent TM_MSG_PR_READY from the bus will replace this entry.
         let workerInfo = roster.first { $0.id == workerId }
+        if workerInfo == nil {
+            Self.logger.warning("createPR: worker \(workerId) not found in roster, PR card will lack branch name")
+        }
         let prEvent = PREvent(
+            id: workerPRs[workerId]?.id ?? UUID(),
             workerId: workerId,
             branchName: workerInfo?.branchName ?? "",
             prUrl: pr.url,

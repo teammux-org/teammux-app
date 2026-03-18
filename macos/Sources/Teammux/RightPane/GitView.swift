@@ -64,7 +64,8 @@ struct GitView: View {
 
     // MARK: - Git list
 
-    /// Sorted PR events for display: open first, then merged, then closed.
+    /// Sorted PR events for display: open first, then merged, then closed;
+    /// within each status group, newest first by timestamp.
     private var sortedPREvents: [PREvent] {
         engine.workerPRs.values.sorted { a, b in
             let order: (PRStatus) -> Int = { status in
@@ -454,6 +455,8 @@ struct PRCardView: View {
     let prEvent: PREvent
     @ObservedObject var engine: EngineClient
 
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "PRCardView")
+
     @State private var isMergeActionInFlight = false
     @State private var actionError: String?
 
@@ -558,7 +561,9 @@ struct PRCardView: View {
         Task { @MainActor in
             let success = engine.approveMerge(workerId: prEvent.workerId, strategy: .merge)
             if !success {
-                actionError = engine.lastError ?? "Failed to approve merge"
+                let msg = engine.lastError ?? "Failed to approve merge"
+                Self.logger.error("approveMerge failed for worker \(prEvent.workerId): \(msg)")
+                actionError = msg
             }
             isMergeActionInFlight = false
         }
@@ -570,14 +575,21 @@ struct PRCardView: View {
         Task { @MainActor in
             let success = engine.rejectMerge(workerId: prEvent.workerId)
             if !success {
-                actionError = engine.lastError ?? "Failed to reject merge"
+                let msg = engine.lastError ?? "Failed to reject merge"
+                Self.logger.error("rejectMerge failed for worker \(prEvent.workerId): \(msg)")
+                actionError = msg
             }
             isMergeActionInFlight = false
         }
     }
 
     private func openInGitHub() {
-        guard let url = URL(string: prEvent.prUrl) else { return }
+        guard let url = URL(string: prEvent.prUrl) else {
+            let msg = "Cannot open PR: invalid URL for worker \(prEvent.workerId)"
+            Self.logger.error("\(msg)")
+            actionError = msg
+            return
+        }
         NSWorkspace.shared.open(url)
     }
 }
