@@ -248,7 +248,7 @@ pub fn parseCommandJson(allocator: std.mem.Allocator, content: []const u8) !Pars
 }
 
 /// Extract a quoted string value for a given key from JSON.
-fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
+pub fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
     // Simple approach: find "key" : "value"
     const search = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{key}) catch return null;
     defer std.heap.page_allocator.free(search);

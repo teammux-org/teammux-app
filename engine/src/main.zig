@@ -13,6 +13,7 @@ pub const interceptor = @import("interceptor.zig");
 pub const hotreload = @import("hotreload.zig");
 pub const coordinator_mod = @import("coordinator.zig");
 pub const worktree_lifecycle = @import("worktree_lifecycle.zig");
+pub const history_mod = @import("history.zig");
 
 // ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
