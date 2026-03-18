@@ -255,7 +255,7 @@ pub fn writeContextFile(
 /// Generate a rich CLAUDE.md from a role definition, task description, and branch name.
 /// Empty sections (arrays with no items, strings with zero length) are omitted to
 /// produce clean markdown.
-fn generateRoleClaude(
+pub fn generateRoleClaude(
     allocator: std.mem.Allocator,
     role_def: config.RoleDefinition,
     task_description: []const u8,
