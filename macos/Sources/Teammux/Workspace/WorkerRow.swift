@@ -67,6 +67,7 @@ struct WorkerRow: View {
                         .padding(.vertical, 1)
                         .background(Capsule().fill(Color.secondary.opacity(0.12)))
                         .onTapGesture {
+                            NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(branch, forType: .string)
                         }
                 }

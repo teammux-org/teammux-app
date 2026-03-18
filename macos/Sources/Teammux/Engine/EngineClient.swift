@@ -362,8 +362,9 @@ final class EngineClient: ObservableObject {
             Self.logger.error("Worker \(workerId) spawned but tm_worker_get returned nil")
         }
 
-        // Cache worktree path and branch for downstream consumers (T12/T13/T15).
-        // The engine created the worktree internally during tm_worker_spawn (T1).
+        // Cache worktree path and branch for downstream consumers
+        // (session persistence, context viewer, worker detail drawer).
+        // The engine creates the worktree internally during tm_worker_spawn.
         // Nil return means no worktree — graceful degradation, worker operates
         // from project root.
         if let cPath = tm_worktree_path(engine, workerId) {
