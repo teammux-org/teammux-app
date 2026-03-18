@@ -494,6 +494,107 @@ final class EngineClient: ObservableObject {
         return true
     }
 
+    // MARK: - Session Restore
+
+    /// Restores workers and state from a previously saved session snapshot.
+    ///
+    /// For each `WorkerSnapshot`:
+    /// 1. Checks that the worktree path still exists on disk — skips with warning if missing
+    /// 2. Calls `spawnWorker` normally (engine handles worktree-already-exists gracefully)
+    /// 3. Overrides `workerWorktrees` and `workerBranches` caches with saved snapshot values
+    ///
+    /// After workers: merges snapshot dispatch events into `dispatchHistory` (dedup by
+    /// timestamp + targetWorkerId). Populates `workerPRs` from snapshot.
+    func restoreSession(_ snapshot: SessionSnapshot) {
+        let fm = FileManager.default
+        var skippedWorkers: [String] = []
+
+        for worker in snapshot.workers {
+            // Check worktree exists on disk
+            guard fm.fileExists(atPath: worker.worktreePath) else {
+                Self.logger.warning("restoreSession: worktree missing at \(worker.worktreePath) — skipping worker \(worker.id) (\(worker.name))")
+                skippedWorkers.append(worker.name)
+                continue
+            }
+
+            let agentType = AgentType(fromCValue: worker.agentTypeCValue, binaryName: worker.agentBinary)
+
+            let workerId = spawnWorker(
+                agentBinary: worker.agentBinary,
+                agentType: agentType,
+                workerName: worker.name,
+                taskDescription: worker.taskDescription,
+                roleId: worker.roleId
+            )
+
+            guard workerId != 0 else {
+                Self.logger.warning("restoreSession: spawnWorker failed for \(worker.name) — skipping")
+                skippedWorkers.append(worker.name)
+                continue
+            }
+
+            // Override caches with saved snapshot values (do not rely on
+            // tm_worktree_path query — use saved paths directly).
+            workerWorktrees[workerId] = worker.worktreePath
+            workerBranches[workerId] = worker.branchName
+
+            // Fix the worktreeReadyQueue entry to use the saved path
+            // (spawnWorker may have queued with a different/new path).
+            if let idx = worktreeReadyQueue.firstIndex(where: { $0.id == workerId }) {
+                worktreeReadyQueue[idx] = WorktreeReady(
+                    id: workerId,
+                    worktreePath: worker.worktreePath,
+                    agentBinary: worker.agentBinary,
+                    taskDescription: worker.taskDescription
+                )
+            }
+        }
+
+        // Merge snapshot dispatch events into dispatchHistory.
+        // Deduplicate by timestamp + targetWorkerId — JSONL is source of
+        // truth for completion/question history; snapshot supplements
+        // dispatch events only (not persisted to JSONL).
+        for entry in snapshot.dispatchHistoryEntries {
+            let isDuplicate = dispatchHistory.contains { existing in
+                existing.targetWorkerId == entry.targetWorkerId
+                    && existing.timestamp == entry.timestamp
+            }
+            guard !isDuplicate else { continue }
+
+            dispatchHistory.append(DispatchEvent(
+                targetWorkerId: entry.targetWorkerId,
+                instruction: entry.instruction,
+                timestamp: entry.timestamp,
+                delivered: entry.delivered,
+                kind: entry.kind
+            ))
+        }
+
+        // Sort dispatch history by timestamp (oldest first) after merge
+        dispatchHistory.sort { $0.timestamp < $1.timestamp }
+
+        // Populate workerPRs from snapshot
+        for (key, prSnapshot) in snapshot.workerPRs {
+            guard let workerId = UInt32(key) else { continue }
+            workerPRs[workerId] = PREvent(
+                workerId: prSnapshot.workerId,
+                branchName: prSnapshot.branchName,
+                prUrl: prSnapshot.prUrl,
+                title: prSnapshot.title,
+                status: prSnapshot.status,
+                timestamp: prSnapshot.timestamp
+            )
+        }
+
+        if !skippedWorkers.isEmpty {
+            let names = skippedWorkers.joined(separator: ", ")
+            lastError = "Skipped workers with missing worktrees: \(names)"
+            Self.logger.warning("restoreSession: skipped \(skippedWorkers.count) workers — \(names)")
+        }
+
+        Self.logger.info("restoreSession: restored \(snapshot.workers.count - skippedWorkers.count)/\(snapshot.workers.count) workers")
+    }
+
     /// Refresh the published roster from the engine.
     /// Wraps `tm_roster_get()` + `tm_roster_free()`.
     func refreshRoster() {
