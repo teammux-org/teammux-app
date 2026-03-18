@@ -1166,3 +1166,65 @@ test "github - processEvents does not route PR status for non-teammux branch" {
     // Event callback also not called (filtered by isTeammuxBranch)
     try std.testing.expect(test_data.callback_count == 0);
 }
+
+test "github - processEvents maps reopened action to open status" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"710","type":"PullRequestEvent","payload":{"action":"reopened","pull_request":{"html_url":"https://github.com/o/r/pull/10","merged":false,"head":{"ref":"teammux/worker-8-reopen"}}}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(bus_data.call_count == 1);
+
+    const payload_slice = bus_data.last_payload[0..bus_data.last_payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"status\":\"open\"") != null);
+    try std.testing.expect(bus_data.last_from == 8);
+}
+
+test "github - processEvents defaults to closed when merged field missing" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    // closed action but no "merged" field in pull_request — should default to "closed"
+    const json =
+        \\[{"id":"711","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/11","head":{"ref":"teammux/worker-9-close"}}}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(bus_data.call_count == 1);
+
+    const payload_slice = bus_data.last_payload[0..bus_data.last_payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"status\":\"closed\"") != null);
+    try std.testing.expect(bus_data.last_from == 9);
+}
+
+test "github - extractJsonStringSimple handles escaped quotes in value" {
+    const json = "{\"title\":\"Fix \\\"null\\\" handling\"}";
+    const title = extractJsonStringSimple(json, "title");
+    try std.testing.expect(title != null);
+    // extractJsonStringSimple skips escaped quotes — returns content between outer quotes
+    try std.testing.expect(std.mem.indexOf(u8, title.?, "null") != null);
+}
+
+test "github - extractJsonStringSimple returns null for truncated input" {
+    const json = "{\"url\":\"https://example.com";
+    try std.testing.expect(extractJsonStringSimple(json, "url") == null);
+}

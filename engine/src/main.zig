@@ -4904,4 +4904,51 @@ test "routePrError sends TM_MSG_ERROR to bus" {
     try std.testing.expect(ErrState.msg_type == @intFromEnum(bus.MessageType.err));
 }
 
+test "/teammux-pr-ready with null args does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+
+    // Null args — should return cleanly without crashing
+    commandRoutingCallback(cmd_z.ptr, null, e);
+}
+
+test "/teammux-pr-ready missing worker_id does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{\"title\": \"test\"}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+}
+
+test "/teammux-pr-ready non-numeric worker_id does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": \"abc\", \"title\": \"test\"}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+}
+
+test "/teammux-pr-ready missing title does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": 1}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+}
+
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; }
