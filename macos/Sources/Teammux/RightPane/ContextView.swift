@@ -6,15 +6,19 @@ import os
 /// Right-pane tab for viewing a worker's CLAUDE.md context file.
 ///
 /// Reads {worktreePath}/CLAUDE.md from disk for the selected worker.
-/// Section headers (## prefix) rendered bold. Auto-refreshes on role
-/// hot-reload with changed-line highlight. Edit button opens role TOML.
+/// Level-2 section headers (## prefix) are rendered bold; other heading
+/// levels are displayed as plain text (TD23). Auto-refreshes on role
+/// hot-reload with changed-line highlight. Edit button opens the worker's
+/// role TOML (visible only when a role is assigned and its file is found).
 struct ContextView: View {
     @ObservedObject var engine: EngineClient
 
     private static let logger = Logger(subsystem: "com.teammux.app", category: "ContextView")
 
-    @State private var selectedWorkerId: UInt32?
+    @Binding var selectedWorkerId: UInt32?
+
     @State private var claudeContent: String?
+    @State private var loadError: String?
     @State private var highlightedLines: Set<Int> = []
     @State private var highlightTask: Task<Void, Never>?
 
@@ -37,6 +41,7 @@ struct ContextView: View {
         .onChange(of: selectedWorkerId) { _, _ in
             highlightTask?.cancel()
             highlightedLines = []
+            loadError = nil
             loadContent()
         }
         .onChange(of: engine.hotReloadedWorkers) { oldValue, newValue in
@@ -73,7 +78,10 @@ struct ContextView: View {
                let roleId = engine.workerRoles[workerId]?.id,
                let tomlPath = roleTomlPath(roleId: roleId) {
                 Button(action: {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: tomlPath))
+                    let opened = NSWorkspace.shared.open(URL(fileURLWithPath: tomlPath))
+                    if !opened {
+                        Self.logger.warning("Failed to open role TOML at \(tomlPath) — no default app for .toml?")
+                    }
                 }) {
                     Image(systemName: "pencil")
                         .font(.system(size: 10))
@@ -124,66 +132,45 @@ struct ContextView: View {
     @ViewBuilder
     private var contentArea: some View {
         if selectedWorkerId == nil {
-            emptyStateNoWorker
+            emptyState(icon: "doc.text",
+                       title: "Select a worker to view their CLAUDE.md context")
         } else if let workerId = selectedWorkerId,
                   engine.workerWorktrees[workerId] == nil {
-            emptyStateNoWorktree
-        } else if claudeContent == nil {
-            emptyStateNoFile
+            emptyState(icon: "clock",
+                       title: "Worker has no worktree",
+                       subtitle: "Waiting for spawn to complete.")
+        } else if let error = loadError {
+            emptyState(icon: "exclamationmark.triangle",
+                       title: "Could not read CLAUDE.md",
+                       subtitle: error)
         } else if let content = claudeContent {
             claudeContentView(content)
+        } else {
+            emptyState(icon: "doc.text.magnifyingglass",
+                       title: "No CLAUDE.md found",
+                       subtitle: "The worker's worktree does not contain a CLAUDE.md file.")
         }
     }
 
-    // MARK: - Empty states
+    // MARK: - Empty state
 
-    private var emptyStateNoWorker: some View {
+    private func emptyState(icon: String, title: String, subtitle: String? = nil) -> some View {
         VStack(spacing: 12) {
-            Image(systemName: "doc.text")
+            Image(systemName: icon)
                 .font(.system(size: 32))
                 .foregroundColor(.secondary)
 
-            Text("Select a worker to view their CLAUDE.md context")
+            Text(title)
                 .font(.headline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
 
-    private var emptyStateNoWorktree: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "clock")
-                .font(.system(size: 32))
-                .foregroundColor(.secondary)
-
-            Text("Worker has no worktree")
-                .font(.headline)
-                .foregroundColor(.secondary)
-
-            Text("Waiting for spawn to complete.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
-
-    private var emptyStateNoFile: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "doc.text.magnifyingglass")
-                .font(.system(size: 32))
-                .foregroundColor(.secondary)
-
-            Text("No CLAUDE.md found")
-                .font(.headline)
-                .foregroundColor(.secondary)
-
-            Text("The worker's worktree does not contain a CLAUDE.md file.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
+            if let subtitle {
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
@@ -205,23 +192,16 @@ struct ContextView: View {
     }
 
     private func lineView(_ line: String, at index: Int) -> some View {
-        Group {
-            if line.hasPrefix("## ") {
-                Text(String(line.dropFirst(3)))
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-            } else {
-                Text(line.isEmpty ? " " : line)
-                    .font(.system(size: 11, design: .monospaced))
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 1)
-        .background(
-            highlightedLines.contains(index)
-                ? Color.yellow.opacity(0.3)
-                : Color.clear
-        )
-        .animation(.easeInOut(duration: 0.3), value: highlightedLines)
+        let isHeader = line.hasPrefix("## ")
+        let displayText = isHeader ? String(line.dropFirst(3)) : (line.isEmpty ? " " : line)
+        let weight: Font.Weight = isHeader ? .bold : .regular
+
+        return Text(displayText)
+            .font(.system(size: 11, weight: weight, design: .monospaced))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 1)
+            .background(highlightedLines.contains(index) ? Color.yellow.opacity(0.3) : Color.clear)
+            .animation(.easeInOut(duration: 0.3), value: highlightedLines)
     }
 
     // MARK: - Content loading
@@ -230,26 +210,38 @@ struct ContextView: View {
         guard let workerId = selectedWorkerId,
               let worktreePath = engine.workerWorktrees[workerId] else {
             claudeContent = nil
+            loadError = nil
             return
         }
 
         let filePath = "\(worktreePath)/CLAUDE.md"
         let oldContent = claudeContent
 
-        guard let data = FileManager.default.contents(atPath: filePath),
-              let content = String(data: data, encoding: .utf8) else {
+        guard let data = FileManager.default.contents(atPath: filePath) else {
             claudeContent = nil
+            loadError = nil
             Self.logger.info("loadContent: CLAUDE.md not found at \(filePath)")
             return
         }
 
+        guard let content = String(data: data, encoding: .utf8) else {
+            claudeContent = nil
+            loadError = "CLAUDE.md exists but could not be decoded as UTF-8 (\(data.count) bytes)"
+            Self.logger.warning("loadContent: CLAUDE.md at \(filePath) is not valid UTF-8 (\(data.count) bytes)")
+            return
+        }
+
         claudeContent = content
+        loadError = nil
 
         if diffHighlight, let oldContent {
             applyDiffHighlight(oldContent: oldContent, newContent: content)
         }
     }
 
+    /// Highlights lines that differ between old and new content for 2 seconds.
+    /// Uses positional comparison (not LCS/Myers diff), so an insertion or
+    /// deletion will mark all subsequent shifted lines as changed (TD28).
     private func applyDiffHighlight(oldContent: String, newContent: String) {
         let oldLines = oldContent.components(separatedBy: "\n")
         let newLines = newContent.components(separatedBy: "\n")
@@ -272,19 +264,18 @@ struct ContextView: View {
         highlightedLines = changedIndices
 
         highlightTask = Task { @MainActor in
-            do {
-                try await Task.sleep(for: .seconds(2))
-            } catch {
-                return
-            }
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
             highlightedLines = []
         }
     }
 
     // MARK: - Role TOML path resolution
 
-    /// Resolve the role TOML file path from a role ID by checking the same
-    /// search paths the engine uses (project-local, user, bundle, dev-build).
+    /// Resolve the role TOML file path from a role ID. Checks search paths
+    /// that approximate the engine's resolution order (project-local, user,
+    /// bundle, dev-build). The dev-build path uses projectRoot instead of the
+    /// engine's exe_dir since exe_dir is not accessible from Swift.
     private func roleTomlPath(roleId: String) -> String? {
         let fm = FileManager.default
 
@@ -304,11 +295,14 @@ struct ContextView: View {
            fm.fileExists(atPath: bundlePath) { return bundlePath }
 
         // 4. Dev-build fallback: {projectRoot}/roles/{roleId}.toml
+        // (engine uses {exe_dir}/roles/ but exe_dir is not accessible from Swift;
+        // projectRoot matches the repo layout during development)
         if let root = engine.projectRoot {
             let devPath = "\(root)/roles/\(roleId).toml"
             if fm.fileExists(atPath: devPath) { return devPath }
         }
 
+        Self.logger.debug("roleTomlPath: no TOML found for role '\(roleId)' in any search path")
         return nil
     }
 }

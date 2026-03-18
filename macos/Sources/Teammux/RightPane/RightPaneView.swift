@@ -2,7 +2,7 @@ import SwiftUI
 
 // MARK: - RightTab
 
-/// The six tabs available in the right pane.
+/// The tabs available in the right pane.
 enum RightTab: String, CaseIterable, Identifiable {
     case teamLead = "Team Lead"
     case git = "Git"
@@ -28,7 +28,7 @@ enum RightTab: String, CaseIterable, Identifiable {
 // MARK: - RightPaneView
 
 /// Right pane with a custom tab bar (not native segmented control)
-/// routing to six content views: Team Lead terminal, Git, Diff, Live Feed, Dispatch, and Context.
+/// routing to a content view for each tab.
 ///
 /// The active tab is indicated by a thin underline in accent color.
 struct RightPaneView: View {
@@ -36,6 +36,7 @@ struct RightPaneView: View {
 
     @State private var activeTab: RightTab = .teamLead
     @State private var diffSelectedWorkerId: UInt32? = nil
+    @State private var contextSelectedWorkerId: UInt32? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -102,7 +103,7 @@ struct RightPaneView: View {
         case .dispatch:
             DispatchView(engine: engine)
         case .context:
-            ContextView(engine: engine)
+            ContextView(engine: engine, selectedWorkerId: $contextSelectedWorkerId)
         }
     }
 }
