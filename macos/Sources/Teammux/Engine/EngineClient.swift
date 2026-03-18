@@ -104,6 +104,16 @@ final class EngineClient: ObservableObject {
     /// `tm_worktree_branch()`. Used by WorkerRow for the branch badge.
     @Published var workerBranches: [UInt32: String] = [:]
 
+    /// Active peer questions from workers, keyed by sending worker ID.
+    /// Only the latest question per sender is stored — a second question
+    /// before relay overwrites the first (latest state wins).
+    @Published var peerQuestions: [UInt32: PeerQuestion] = [:]
+
+    /// Peer delegation events, append-only (cap 100). Displayed as
+    /// informational cards in LiveFeedView — the engine has already
+    /// routed each delegation to the target worker's PTY.
+    @Published var peerDelegations: [PeerDelegation] = []
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -278,6 +288,8 @@ final class EngineClient: ObservableObject {
         dispatchHistory.removeAll()
         workerWorktrees.removeAll()
         workerBranches.removeAll()
+        peerQuestions.removeAll()
+        peerDelegations.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -1284,11 +1296,15 @@ final class EngineClient: ObservableObject {
                 )
                 client.messages.append(msg)
 
-                // Route to workerCompletions / workerQuestions for Team Lead UI
+                // Route to workerCompletions / workerQuestions / peerQuestions / peerDelegations
                 if type == .completion {
                     client.handleCompletionMessage(from: from, payload: payload, timestamp: timestamp, gitCommit: gitCommit)
                 } else if type == .question {
                     client.handleQuestionMessage(from: from, payload: payload, timestamp: timestamp)
+                } else if type == .peerQuestion {
+                    client.handlePeerQuestionMessage(payload: payload, timestamp: timestamp)
+                } else if type == .delegation {
+                    client.handleDelegationMessage(payload: payload, timestamp: timestamp)
                 }
             }
             return TM_OK
@@ -1822,6 +1838,128 @@ final class EngineClient: ObservableObject {
             workerQuestions[workerId] = request
         } catch {
             let msg = "handleQuestionMessage: JSON parse failed for worker \(workerId): \(error.localizedDescription)"
+            Self.logger.error("\(msg)")
+            lastError = msg
+        }
+    }
+
+    // MARK: - Peer Messaging
+
+    /// Remove the peer question from a specific sending worker after the Team Lead
+    /// relays or dismisses it. Idempotent — safe to call if no question exists.
+    func clearPeerQuestion(fromWorkerId: UInt32) {
+        if peerQuestions.removeValue(forKey: fromWorkerId) == nil {
+            Self.logger.warning("clearPeerQuestion: no active peer question from worker \(fromWorkerId)")
+        }
+    }
+
+    /// Parse a TM_MSG_PEER_QUESTION payload and update `peerQuestions`.
+    /// Payload format: `{"worker_id": N, "target_worker_id": M, "message": "..."}`
+    private func handlePeerQuestionMessage(payload: String, timestamp: Date) {
+        guard let data = payload.data(using: .utf8) else {
+            let msg = "handlePeerQuestionMessage: payload is not valid UTF-8"
+            Self.logger.error("\(msg)")
+            lastError = msg
+            return
+        }
+
+        do {
+            guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let msg = "handlePeerQuestionMessage: payload is not a JSON object"
+                Self.logger.error("\(msg)")
+                lastError = msg
+                return
+            }
+
+            guard let fromWorkerId = dict["worker_id"] as? UInt32 ?? (dict["worker_id"] as? Int).map(UInt32.init) else {
+                let msg = "handlePeerQuestionMessage: missing or invalid worker_id"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+            guard let targetWorkerId = dict["target_worker_id"] as? UInt32 ?? (dict["target_worker_id"] as? Int).map(UInt32.init) else {
+                let msg = "handlePeerQuestionMessage: missing or invalid target_worker_id"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+            guard let message = dict["message"] as? String, !message.isEmpty else {
+                let msg = "handlePeerQuestionMessage: missing or empty message"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+
+            if let existing = peerQuestions[fromWorkerId] {
+                Self.logger.warning("handlePeerQuestionMessage: overwriting unrelayed peer question from worker \(fromWorkerId), previous message: \(existing.message)")
+            }
+
+            let question = PeerQuestion(
+                fromWorkerId: fromWorkerId,
+                targetWorkerId: targetWorkerId,
+                message: message,
+                timestamp: timestamp
+            )
+            peerQuestions[fromWorkerId] = question
+        } catch {
+            let msg = "handlePeerQuestionMessage: JSON parse failed: \(error.localizedDescription)"
+            Self.logger.error("\(msg)")
+            lastError = msg
+        }
+    }
+
+    /// Parse a TM_MSG_DELEGATION payload and append to `peerDelegations`.
+    /// Payload format: `{"worker_id": N, "target_worker_id": M, "task": "..."}`
+    /// Capped at 100 entries — oldest trimmed when exceeding.
+    private func handleDelegationMessage(payload: String, timestamp: Date) {
+        guard let data = payload.data(using: .utf8) else {
+            let msg = "handleDelegationMessage: payload is not valid UTF-8"
+            Self.logger.error("\(msg)")
+            lastError = msg
+            return
+        }
+
+        do {
+            guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let msg = "handleDelegationMessage: payload is not a JSON object"
+                Self.logger.error("\(msg)")
+                lastError = msg
+                return
+            }
+
+            guard let fromWorkerId = dict["worker_id"] as? UInt32 ?? (dict["worker_id"] as? Int).map(UInt32.init) else {
+                let msg = "handleDelegationMessage: missing or invalid worker_id"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+            guard let targetWorkerId = dict["target_worker_id"] as? UInt32 ?? (dict["target_worker_id"] as? Int).map(UInt32.init) else {
+                let msg = "handleDelegationMessage: missing or invalid target_worker_id"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+            guard let task = dict["task"] as? String, !task.isEmpty else {
+                let msg = "handleDelegationMessage: missing or empty task"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+
+            let delegation = PeerDelegation(
+                fromWorkerId: fromWorkerId,
+                targetWorkerId: targetWorkerId,
+                task: task,
+                timestamp: timestamp
+            )
+            peerDelegations.append(delegation)
+
+            // Cap at 100 — trim oldest when exceeding
+            if peerDelegations.count > 100 {
+                peerDelegations = Array(peerDelegations.suffix(100))
+            }
+        } catch {
+            let msg = "handleDelegationMessage: JSON parse failed: \(error.localizedDescription)"
             Self.logger.error("\(msg)")
             lastError = msg
         }
