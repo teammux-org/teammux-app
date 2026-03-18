@@ -181,6 +181,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_engine_create()` which uses an out-param pattern.
     /// Returns `true` on success, `false` if creation fails.
     func create(projectRoot: String) -> Bool {
+        lastError = nil
         guard engine == nil else {
             lastError = "Engine already created"
             Self.logger.error("Engine already created")
@@ -208,6 +209,7 @@ final class EngineClient: ObservableObject {
     /// Also loads available roles via `loadAvailableRoles()`.
     /// Returns `true` on `TM_OK`.
     func sessionStart() -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -274,6 +276,7 @@ final class EngineClient: ObservableObject {
     /// Reload config from disk (`.teammux/config.toml`).
     /// Wraps `tm_config_reload()`.
     func reloadConfig() {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -306,6 +309,7 @@ final class EngineClient: ObservableObject {
         taskDescription: String,
         roleId: String? = nil
     ) -> UInt32 {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -409,6 +413,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_worker_dismiss()`.
     /// Returns `true` on `TM_OK`.
     func dismissWorker(_ workerId: UInt32) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -474,6 +479,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_message_send()`.
     /// Returns `true` on `TM_OK`.
     func sendMessage(to workerId: UInt32, type: MessageType, payload: String) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -503,6 +509,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_message_broadcast()`.
     /// Returns `true` on `TM_OK`.
     func broadcastMessage(type: MessageType, payload: String) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -533,6 +540,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_github_auth()`.
     /// Returns `true` on `TM_OK`.
     func connectGitHub() -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -564,6 +572,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_github_create_pr()` + `tm_pr_free()`.
     /// Returns a `GitHubPR` on success, `nil` on failure.
     func createPR(for workerId: UInt32, title: String, body: String) -> GitHubPR? {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -600,6 +609,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_github_merge_pr()`.
     /// Returns `true` on `TM_OK`.
     func mergePR(_ prNumber: UInt64, strategy: MergeStrategy) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -626,6 +636,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_github_get_diff()` + `tm_diff_free()`.
     /// Returns an array of `DiffFile`, empty on failure.
     func getDiff(for workerId: UInt32) -> [DiffFile] {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -665,6 +676,7 @@ final class EngineClient: ObservableObject {
     /// `true` does not mean the merge succeeded — check `getMergeStatus()` for the
     /// outcome, which may be `.inProgress`, `.success`, or `.conflict`.
     func approveMerge(workerId: UInt32, strategy: MergeStrategy) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -693,6 +705,7 @@ final class EngineClient: ObservableObject {
     /// The worker remains in the roster with a completed/dismissed status.
     /// Wraps `tm_merge_reject()`. Returns `true` on `TM_OK`.
     func rejectMerge(workerId: UInt32) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -717,6 +730,7 @@ final class EngineClient: ObservableObject {
     /// Wraps `tm_merge_get_status()`.
     /// Returns `.pending` if the engine is not initialized.
     func getMergeStatus(workerId: UInt32) -> MergeStatus {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("getMergeStatus: engine not created")
@@ -729,6 +743,7 @@ final class EngineClient: ObservableObject {
     /// Get list of conflicts for a worker after a conflicted merge.
     /// Wraps `tm_merge_conflicts_get()` + `tm_merge_conflicts_free()`.
     func getConflicts(workerId: UInt32) -> [ConflictInfo] {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("Engine not created")
@@ -878,6 +893,7 @@ final class EngineClient: ObservableObject {
     /// On error, defaults to allow because the real enforcement layer is
     /// stream-R8's git interceptor at the PTY level. This is advisory.
     func checkCapability(workerId: UInt32, filePath: String) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Capability check unavailable: engine not created"
             Self.logger.error("checkCapability: engine not created — defaulting to allow for '\(filePath)'")
@@ -1047,6 +1063,7 @@ final class EngineClient: ObservableObject {
     /// Requires `workerRoles[workerId]` to be set (role ID is read from it).
     /// Wraps `tm_role_watch()`.
     private func startRoleWatch(workerId: UInt32) {
+        lastError = nil
         guard let engine else {
             Self.logger.error("startRoleWatch: engine not created")
             return
@@ -1112,6 +1129,7 @@ final class EngineClient: ObservableObject {
     /// and shows a transient banner. Cancels any previous dismiss timer for
     /// the same worker to debounce rapid file saves.
     private func handleRoleChanged(workerId: UInt32, newClaudeMd: String?) {
+        lastError = nil
         guard let newClaudeMd, !newClaudeMd.isEmpty else {
             let msg = "Role hot-reload failed for worker \(workerId) — the role file may contain syntax errors"
             Self.logger.error("handleRoleChanged: \(msg)")
@@ -1351,6 +1369,7 @@ final class EngineClient: ObservableObject {
     /// Dispatch `/teammux-*` commands received from the engine's
     /// command interception callback.
     private func handleCommand(_ command: String, argsJson: String) {
+        lastError = nil
         let args = parseArgsJson(argsJson)
 
         switch command {
@@ -1473,6 +1492,7 @@ final class EngineClient: ObservableObject {
     /// Handles flat `{"key": "value", ...}` objects without pulling in
     /// full `JSONSerialization` (which may fail on non-UTF8 engine output).
     private func parseArgsJson(_ json: String) -> [String: String] {
+        lastError = nil
         guard let data = json.data(using: .utf8) else { return [:] }
         do {
             if let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -1572,6 +1592,7 @@ final class EngineClient: ObservableObject {
     /// On failure, sets `lastError` with a diagnostic message.
     /// On success, refreshes `dispatchHistory` from the engine.
     func dispatchTask(workerId: UInt32, instruction: String) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("dispatchTask: engine not created")
@@ -1599,6 +1620,7 @@ final class EngineClient: ObservableObject {
     /// On failure, sets `lastError` with a diagnostic message.
     /// On success, refreshes `dispatchHistory` from the engine.
     func dispatchResponse(workerId: UInt32, response: String) -> Bool {
+        lastError = nil
         guard let engine else {
             lastError = "Engine not created"
             Self.logger.error("dispatchResponse: engine not created")
@@ -1627,6 +1649,7 @@ final class EngineClient: ObservableObject {
     /// Called internally after each dispatch; also available for UI refresh
     /// (e.g. when the Dispatch tab appears).
     func refreshDispatchHistory() {
+        lastError = nil
         guard let engine else {
             Self.logger.warning("refreshDispatchHistory: engine not created")
             return
@@ -1689,6 +1712,7 @@ final class EngineClient: ObservableObject {
     /// Payload format: `{"summary": "...", "details": "...", "git_commit": "..."}`
     /// Worker ID comes from the message envelope (`from` field), not the payload.
     private func handleCompletionMessage(from workerId: UInt32, payload: String, timestamp: Date, gitCommit: String?) {
+        lastError = nil
         guard let data = payload.data(using: .utf8) else {
             let msg = "handleCompletionMessage: payload is not valid UTF-8 for worker \(workerId)"
             Self.logger.error("\(msg)")
@@ -1736,6 +1760,7 @@ final class EngineClient: ObservableObject {
     /// Payload format: `{"question": "...", "context": "..."}`
     /// Worker ID comes from the message envelope (`from` field), not the payload.
     private func handleQuestionMessage(from workerId: UInt32, payload: String, timestamp: Date) {
+        lastError = nil
         guard let data = payload.data(using: .utf8) else {
             let msg = "handleQuestionMessage: payload is not valid UTF-8 for worker \(workerId)"
             Self.logger.error("\(msg)")
