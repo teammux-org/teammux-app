@@ -63,7 +63,7 @@ struct QuestionRequest: Identifiable, Equatable, Sendable {
 
 /// Distinguishes task dispatches from response dispatches.
 /// Maps to `tm_dispatch_event_t.kind` in teammux.h (0 = task, 1 = response).
-enum DispatchKind: UInt8, Sendable {
+enum DispatchKind: UInt8, Sendable, Codable {
     case task = 0
     case response = 1
 }
@@ -168,7 +168,7 @@ struct PeerDelegation: Identifiable, Equatable, Sendable {
 
 /// Discriminator for persisted history entries loaded from the JSONL log.
 /// Parsed from the `type` string field in `tm_history_entry_t` ("completion" or "question").
-enum HistoryEntryType: String, Sendable {
+enum HistoryEntryType: String, Sendable, Codable {
     case completion
     case question
 }
