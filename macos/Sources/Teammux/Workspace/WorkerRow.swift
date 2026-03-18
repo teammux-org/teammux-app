@@ -12,6 +12,7 @@ import SwiftUI
 struct WorkerRow: View {
     let worker: WorkerInfo
     let role: RoleDefinition?
+    let branch: String?
     let isActive: Bool
     let onTap: () -> Void
     let onDismiss: () -> Void
@@ -54,6 +55,20 @@ struct WorkerRow: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
+                }
+
+                // Branch badge — tap to copy branch name to clipboard
+                if let branch {
+                    Text(branch)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                        .onTapGesture {
+                            NSPasteboard.general.setString(branch, forType: .string)
+                        }
                 }
             }
 
