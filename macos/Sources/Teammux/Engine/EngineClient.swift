@@ -32,8 +32,8 @@ enum MergeStrategy: Int, Sendable {
 ///
 /// PTY ownership note: Ghostty owns PTYs, not the engine. After
 /// `spawnWorker` creates a worktree + branch, Swift creates a
-/// `Ghostty.SurfaceView` to launch the agent. Message bus text
-/// injection goes via `SurfaceView.sendText()`, not the engine.
+/// `Ghostty.SurfaceView` to launch the agent. Text injection goes
+/// via registered injector closures (backed by `SurfaceView.sendText()`).
 /// A worker whose worktree is ready but whose SurfaceView has not yet been created.
 struct WorktreeReady: Identifiable, Equatable, Sendable {
     let id: UInt32  // worker ID, also serves as Identifiable.id
@@ -103,6 +103,10 @@ final class EngineClient: ObservableObject {
     /// GhosttyKit — the caller captures the concrete SurfaceView type.
     private var textInjectors: [UInt32: (String) -> Void] = [:]
 
+    /// Auto-dismiss tasks for the hot-reload banner. Stored so we can cancel
+    /// a previous timer when a new reload fires for the same worker (debounce).
+    private var hotReloadTimers: [UInt32: Task<Void, Never>] = [:]
+
     /// Subscription handles returned by watch/subscribe calls.
     /// Stored so we can unwatch/unsubscribe in teardownCallbacks().
     private var rosterSubscription: UInt32 = 0
@@ -116,7 +120,7 @@ final class EngineClient: ObservableObject {
 
     // MARK: - Surface registry
 
-    /// Register a SurfaceView for a given worker so the engine can
+    /// Register a SurfaceView for a given worker so `EngineClient` can
     /// inject text via the provided closure. The caller captures the
     /// concrete SurfaceView type so this file stays decoupled from GhosttyKit.
     func registerSurface(_ surface: AnyObject, for workerId: UInt32, injector: @escaping (String) -> Void) {
@@ -251,6 +255,8 @@ final class EngineClient: ObservableObject {
         workerRoles.removeAll()
         workerCompletions.removeAll()
         workerQuestions.removeAll()
+        for (_, task) in hotReloadTimers { task.cancel() }
+        hotReloadTimers.removeAll()
         hotReloadedWorkers.removeAll()
         githubStatus = .disconnected
         lastError = nil
@@ -370,6 +376,7 @@ final class EngineClient: ObservableObject {
                 // write-scope guarantees.
                 lastError = msg
                 Self.logger.error("spawnWorker: \(msg) — dismissing worker to avoid degraded enforcement")
+                stopRoleWatch(workerId: workerId)
                 let dismissResult = tm_worker_dismiss(engine, workerId)
                 if dismissResult != TM_OK {
                     let dismissMsg = lastEngineError() ?? "tm_worker_dismiss failed (\(dismissResult.rawValue))"
@@ -390,7 +397,7 @@ final class EngineClient: ObservableObject {
     }
 
     /// Dismiss (tear down) a worker. Removes worktree, cleans up engine state.
-    /// Also unregisters the surface view and removes the cached role.
+    /// Also stops role file watching, unregisters the surface view, and removes the cached role.
     /// The engine releases ownership rules internally via `tm_ownership_release`.
     /// Wraps `tm_worker_dismiss()`.
     /// Returns `true` on `TM_OK`.
@@ -1049,12 +1056,12 @@ final class EngineClient: ObservableObject {
             tm_role_watch(engine, workerId, cRoleId, { cbWorkerId, newClaudeMdPtr, userdata in
                 guard let userdata else {
                     Logger(subsystem: "com.teammux.app", category: "EngineClient")
-                        .warning("role_changed_cb: nil userdata")
+                        .error("role_changed_cb: nil userdata for worker \(cbWorkerId) — pointer lifecycle bug")
                     return
                 }
 
                 // Copy string before crossing thread boundary — pointer is only
-                // valid for the duration of this callback (engine frees after return).
+                // valid for the duration of this callback (watcher frees after return).
                 let newClaudeMd: String? = {
                     guard let ptr = newClaudeMdPtr, ptr.pointee != 0 else { return nil }
                     return String(cString: ptr)
@@ -1069,39 +1076,60 @@ final class EngineClient: ObservableObject {
 
         if result != TM_OK {
             let msg = lastEngineError() ?? "tm_role_watch failed (\(result.rawValue))"
+            lastError = "Role hot-reload unavailable for worker \(workerId): \(msg)"
             Self.logger.error("startRoleWatch: \(msg) for worker \(workerId)")
         }
     }
 
-    /// Stop watching the role file for a worker. Also removes the worker
-    /// from `hotReloadedWorkers` if present. Idempotent.
+    /// Stop watching the role file for a worker. Also cancels any pending
+    /// dismiss timer and removes the worker from `hotReloadedWorkers`. Idempotent.
     /// Wraps `tm_role_unwatch()`.
     private func stopRoleWatch(workerId: UInt32) {
-        guard let engine else { return }
+        hotReloadTimers[workerId]?.cancel()
+        hotReloadTimers.removeValue(forKey: workerId)
+        hotReloadedWorkers.remove(workerId)
+
+        guard let engine else {
+            Self.logger.warning("stopRoleWatch: engine is nil — cannot unwatch for worker \(workerId)")
+            return
+        }
         let result = tm_role_unwatch(engine, workerId)
         if result != TM_OK {
             let msg = lastEngineError() ?? "tm_role_unwatch failed (\(result.rawValue))"
             Self.logger.warning("stopRoleWatch: \(msg) for worker \(workerId)")
         }
-        hotReloadedWorkers.remove(workerId)
     }
 
-    /// Handle a role-changed callback on `@MainActor`. Injects the updated
-    /// CLAUDE.md into the worker's PTY and shows a transient banner.
+    /// Handle a role-changed callback on `@MainActor`. Injects a role-update
+    /// notification with the updated CLAUDE.md content into the worker's PTY
+    /// and shows a transient banner. Cancels any previous dismiss timer for
+    /// the same worker to debounce rapid file saves.
     private func handleRoleChanged(workerId: UInt32, newClaudeMd: String?) {
         guard let newClaudeMd, !newClaudeMd.isEmpty else {
-            Self.logger.warning("handleRoleChanged: new_claude_md is nil or empty for worker \(workerId) — role file parse error?")
+            let msg = "Role hot-reload failed for worker \(workerId) — the role file may contain syntax errors"
+            Self.logger.error("handleRoleChanged: \(msg)")
+            lastError = msg
             return
         }
 
         let text = "\n[Teammux] role-update: Your role definition has been updated.\n\(newClaudeMd)\n"
         injectText(text, for: workerId)
 
+        // Cancel any previous dismiss timer for this worker (debounce rapid saves).
+        hotReloadTimers[workerId]?.cancel()
         hotReloadedWorkers.insert(workerId)
 
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
+        hotReloadTimers[workerId] = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(3))
+            } catch is CancellationError {
+                return
+            } catch {
+                Self.logger.warning("handleRoleChanged: sleep interrupted: \(error)")
+                return
+            }
             self.hotReloadedWorkers.remove(workerId)
+            self.hotReloadTimers.removeValue(forKey: workerId)
         }
     }
 
@@ -1272,8 +1300,23 @@ final class EngineClient: ObservableObject {
     }
 
     /// Unsubscribe/unwatch all callbacks. Called before `tm_session_stop()`.
+    /// Also stops all per-worker role file watches to prevent dangling callbacks.
     private func teardownCallbacks() {
         guard let engine else { return }
+
+        // Stop all role file watches before tearing down other callbacks.
+        // Each watch holds a selfPtr that becomes dangling after teardown.
+        for workerId in workerRoles.keys {
+            let result = tm_role_unwatch(engine, workerId)
+            if result != TM_OK {
+                let msg = lastEngineError() ?? "tm_role_unwatch failed (\(result.rawValue))"
+                Self.logger.warning("teardownCallbacks: \(msg) for worker \(workerId)")
+            }
+        }
+        // Cancel all pending banner dismiss timers.
+        for (_, task) in hotReloadTimers { task.cancel() }
+        hotReloadTimers.removeAll()
+
         if rosterSubscription != 0 {
             tm_roster_unwatch(engine, rosterSubscription)
             rosterSubscription = 0
@@ -1400,7 +1443,7 @@ final class EngineClient: ObservableObject {
     // MARK: - Private: Text injection
 
     /// Inject text into a worker's PTY via the registered injector closure.
-    /// No-op if no surface is registered for the worker.
+    /// Logs a warning and returns without action if no injector is registered.
     private func injectText(_ text: String, for workerId: UInt32) {
         guard let injector = textInjectors[workerId] else {
             Self.logger.warning("injectText: no injector registered for worker \(workerId)")

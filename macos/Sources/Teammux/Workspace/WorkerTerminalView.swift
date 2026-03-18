@@ -80,8 +80,19 @@ private struct WorkerTerminalSurface: NSViewRepresentable {
         }
 
         let surfaceView = Ghostty.SurfaceView(app, baseConfig: config)
-        engine.registerSurface(surfaceView, for: worker.id) { [weak surfaceView] text in
-            surfaceView?.surfaceModel?.sendText(text)
+        let workerId = worker.id
+        engine.registerSurface(surfaceView, for: workerId) { [weak surfaceView] text in
+            guard let surface = surfaceView else {
+                Logger(subsystem: "com.teammux.app", category: "WorkerTerminalView")
+                    .warning("injector: surfaceView deallocated for worker \(workerId) — text not injected")
+                return
+            }
+            guard let model = surface.surfaceModel else {
+                Logger(subsystem: "com.teammux.app", category: "WorkerTerminalView")
+                    .warning("injector: surfaceModel is nil for worker \(workerId) — text not injected")
+                return
+            }
+            model.sendText(text)
         }
         return surfaceView
     }

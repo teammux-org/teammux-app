@@ -222,7 +222,7 @@ struct EngineClientTests {
         let surface = NSObject()
 
         // Register
-        client.registerSurface(surface, for: 1)
+        client.registerSurface(surface, for: 1, injector: { _ in })
         #expect(client.surfaceView(for: 1) != nil)
         #expect(client.surfaceView(for: 1) === surface)
 
@@ -239,8 +239,8 @@ struct EngineClientTests {
         let surface1 = NSObject()
         let surface2 = NSObject()
 
-        client.registerSurface(surface1, for: 1)
-        client.registerSurface(surface2, for: 2)
+        client.registerSurface(surface1, for: 1, injector: { _ in })
+        client.registerSurface(surface2, for: 2, injector: { _ in })
 
         #expect(client.surfaceView(for: 1) === surface1)
         #expect(client.surfaceView(for: 2) === surface2)
@@ -256,18 +256,18 @@ struct EngineClientTests {
         let surface1 = NSObject()
         let surface2 = NSObject()
 
-        client.registerSurface(surface1, for: 1)
+        client.registerSurface(surface1, for: 1, injector: { _ in })
         #expect(client.surfaceView(for: 1) === surface1)
 
         // Overwrite with a new surface
-        client.registerSurface(surface2, for: 1)
+        client.registerSurface(surface2, for: 1, injector: { _ in })
         #expect(client.surfaceView(for: 1) === surface2)
     }
 
     @Test func destroyClearsSurfaceRegistry() {
         let client = EngineClient()
         let surface = NSObject()
-        client.registerSurface(surface, for: 1)
+        client.registerSurface(surface, for: 1, injector: { _ in })
 
         client.destroy()
 
