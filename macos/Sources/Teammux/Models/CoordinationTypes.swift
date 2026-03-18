@@ -7,7 +7,7 @@ import Foundation
 ///
 /// The engine does not provide UUIDs — `id` is generated Swift-side for
 /// SwiftUI `ForEach` / `Identifiable` conformance.
-struct CompletionReport: Identifiable, Sendable {
+struct CompletionReport: Identifiable, Equatable, Sendable {
     let id: UUID
     let workerId: UInt32
     let summary: String
@@ -36,7 +36,7 @@ struct CompletionReport: Identifiable, Sendable {
 
 /// A worker's question to the Team Lead, bridged from `tm_question_t` in teammux.h.
 /// Delivered via `TM_MSG_QUESTION` on the message bus.
-struct QuestionRequest: Identifiable, Sendable {
+struct QuestionRequest: Identifiable, Equatable, Sendable {
     let id: UUID
     let workerId: UInt32
     let question: String

@@ -1038,10 +1038,10 @@ final class EngineClient: ObservableObject {
                 )
                 client.messages.append(msg)
 
-                // Route completion and question messages to dedicated dicts
-                if rawType == TM_MSG_COMPLETION.rawValue {
+                // Route to workerCompletions / workerQuestions for Team Lead UI
+                if type == .completion {
                     client.handleCompletionMessage(from: from, payload: payload, timestamp: timestamp, gitCommit: gitCommit)
-                } else if rawType == TM_MSG_QUESTION.rawValue {
+                } else if type == .question {
                     client.handleQuestionMessage(from: from, payload: payload, timestamp: timestamp)
                 }
             }
@@ -1324,34 +1324,54 @@ final class EngineClient: ObservableObject {
     // MARK: - Coordination
 
     /// Remove the completion report for a worker after the Team Lead acknowledges it.
+    /// Idempotent — safe to call if no report exists for the worker.
     func acknowledgeCompletion(workerId: UInt32) {
-        workerCompletions.removeValue(forKey: workerId)
+        if workerCompletions.removeValue(forKey: workerId) == nil {
+            Self.logger.warning("acknowledgeCompletion: no active completion for worker \(workerId)")
+        }
     }
 
     /// Remove the question for a worker after the Team Lead dismisses or responds.
+    /// Idempotent — safe to call if no question exists for the worker.
     func clearQuestion(workerId: UInt32) {
-        workerQuestions.removeValue(forKey: workerId)
+        if workerQuestions.removeValue(forKey: workerId) == nil {
+            Self.logger.warning("clearQuestion: no active question for worker \(workerId)")
+        }
     }
 
     // MARK: - Private: Coordination handlers
 
     /// Parse a TM_MSG_COMPLETION payload and update `workerCompletions`.
-    /// Payload format: `{"worker_id": N, "summary": "...", "details": "...", "git_commit": "..."}`
+    /// Payload format: `{"summary": "...", "details": "...", "git_commit": "..."}`
+    /// Worker ID comes from the message envelope (`from` field), not the payload.
     private func handleCompletionMessage(from workerId: UInt32, payload: String, timestamp: Date, gitCommit: String?) {
         guard let data = payload.data(using: .utf8) else {
-            Self.logger.error("handleCompletionMessage: payload is not valid UTF-8 for worker \(workerId)")
+            let msg = "handleCompletionMessage: payload is not valid UTF-8 for worker \(workerId)"
+            Self.logger.error("\(msg)")
+            lastError = msg
             return
         }
 
         do {
             guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                Self.logger.error("handleCompletionMessage: payload is not a JSON object for worker \(workerId)")
+                let msg = "handleCompletionMessage: payload is not a JSON object for worker \(workerId)"
+                Self.logger.error("\(msg)")
+                lastError = msg
                 return
             }
 
-            let summary = dict["summary"] as? String ?? ""
+            guard let summary = dict["summary"] as? String, !summary.isEmpty else {
+                let msg = "handleCompletionMessage: missing or empty summary for worker \(workerId)"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
             let details = dict["details"] as? String
             let payloadGitCommit = dict["git_commit"] as? String
+
+            if let existing = workerCompletions[workerId] {
+                Self.logger.warning("handleCompletionMessage: overwriting unacknowledged completion for worker \(workerId), previous summary: \(existing.summary)")
+            }
 
             let report = CompletionReport(
                 workerId: workerId,
@@ -1362,26 +1382,42 @@ final class EngineClient: ObservableObject {
             )
             workerCompletions[workerId] = report
         } catch {
-            Self.logger.error("handleCompletionMessage: JSON parse failed for worker \(workerId): \(error.localizedDescription)")
+            let msg = "handleCompletionMessage: JSON parse failed for worker \(workerId): \(error.localizedDescription)"
+            Self.logger.error("\(msg)")
+            lastError = msg
         }
     }
 
     /// Parse a TM_MSG_QUESTION payload and update `workerQuestions`.
-    /// Payload format: `{"worker_id": N, "question": "...", "context": "..."}`
+    /// Payload format: `{"question": "...", "context": "..."}`
+    /// Worker ID comes from the message envelope (`from` field), not the payload.
     private func handleQuestionMessage(from workerId: UInt32, payload: String, timestamp: Date) {
         guard let data = payload.data(using: .utf8) else {
-            Self.logger.error("handleQuestionMessage: payload is not valid UTF-8 for worker \(workerId)")
+            let msg = "handleQuestionMessage: payload is not valid UTF-8 for worker \(workerId)"
+            Self.logger.error("\(msg)")
+            lastError = msg
             return
         }
 
         do {
             guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                Self.logger.error("handleQuestionMessage: payload is not a JSON object for worker \(workerId)")
+                let msg = "handleQuestionMessage: payload is not a JSON object for worker \(workerId)"
+                Self.logger.error("\(msg)")
+                lastError = msg
                 return
             }
 
-            let question = dict["question"] as? String ?? ""
+            guard let question = dict["question"] as? String, !question.isEmpty else {
+                let msg = "handleQuestionMessage: missing or empty question for worker \(workerId)"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
             let context = dict["context"] as? String
+
+            if let existing = workerQuestions[workerId] {
+                Self.logger.warning("handleQuestionMessage: overwriting unanswered question for worker \(workerId), previous question: \(existing.question)")
+            }
 
             let request = QuestionRequest(
                 workerId: workerId,
@@ -1391,7 +1427,9 @@ final class EngineClient: ObservableObject {
             )
             workerQuestions[workerId] = request
         } catch {
-            Self.logger.error("handleQuestionMessage: JSON parse failed for worker \(workerId): \(error.localizedDescription)")
+            let msg = "handleQuestionMessage: JSON parse failed for worker \(workerId): \(error.localizedDescription)"
+            Self.logger.error("\(msg)")
+            lastError = msg
         }
     }
 
