@@ -205,7 +205,7 @@ struct DispatchWorkerRow: View {
 
 /// A single row in the dispatch history showing what was sent, to whom, when,
 /// the dispatch direction (task vs response), delivery status, and whether
-/// the dispatch was triggered autonomously by the Team Lead heuristic.
+/// the dispatch was triggered by automatic follow-up dispatch.
 struct DispatchHistoryRow: View {
     let event: DispatchEvent
     let engine: EngineClient
@@ -215,8 +215,11 @@ struct DispatchHistoryRow: View {
             ?? "Worker \(event.targetWorkerId)"
     }
 
-    /// Whether this dispatch was triggered autonomously (matches an entry
-    /// in `autonomousDispatches` by worker ID and instruction text).
+    /// Whether this dispatch was triggered autonomously. Matches against the
+    /// latest entry in `autonomousDispatches` by worker ID and instruction text.
+    /// Because only the latest auto-dispatch per worker is retained, earlier
+    /// auto-dispatches for the same worker will lose this badge once a newer
+    /// one arrives.
     private var isAutonomous: Bool {
         engine.autonomousDispatches[event.targetWorkerId]?.instruction == event.instruction
     }

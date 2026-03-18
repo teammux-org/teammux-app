@@ -281,9 +281,9 @@ struct PREvent: Identifiable, Equatable, Sendable {
 /// which dispatches were triggered without human approval.
 ///
 /// Keyed by `workerId` in `EngineClient.autonomousDispatches` — only the
-/// latest auto-dispatch per worker is stored. A second auto-dispatch before
-/// the first is consumed overwrites it (latest state wins, matching the
-/// `workerCompletions` overwrite pattern).
+/// latest auto-dispatch per worker is stored. A second auto-dispatch for
+/// the same worker overwrites the previous one (latest state wins,
+/// matching the `workerCompletions` overwrite pattern).
 struct AutonomousDispatch: Identifiable, Equatable, Sendable {
     let id: UUID
     let workerId: UInt32

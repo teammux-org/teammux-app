@@ -126,10 +126,11 @@ final class EngineClient: ObservableObject {
     @Published var workerPRs: [UInt32: PREvent] = [:]
 
     /// Autonomous dispatch metadata, keyed by worker ID. Only the latest
-    /// auto-dispatch per worker is stored — a second auto-dispatch before
-    /// the first is consumed overwrites it (latest state wins). The actual
-    /// dispatched task lives in `dispatchHistory`; this dict tracks which
-    /// dispatches were triggered autonomously by `triggerAutonomousDispatch`.
+    /// auto-dispatch per worker is stored — a second auto-dispatch for
+    /// the same worker overwrites the previous one (latest state wins).
+    /// The actual dispatched task lives in `dispatchHistory`; this dict
+    /// tracks which dispatches were triggered autonomously.
+    /// Not Codable — ephemeral metadata, not persisted across sessions.
     @Published var autonomousDispatches: [UInt32: AutonomousDispatch] = [:]
 
     // MARK: - Private state
@@ -2372,9 +2373,12 @@ final class EngineClient: ObservableObject {
     // MARK: - Autonomous Dispatch
 
     /// Immediately dispatch a follow-up task for a completed worker.
-    /// Called synchronously from `handleCompletionMessage` after
+    /// Called inline from `handleCompletionMessage` after
     /// `workerCompletions[workerId]` is set — no human approval step,
     /// no cancel window. Fully autonomous Team Lead behavior.
+    ///
+    /// Saves and restores `lastError` around the dispatch call so the
+    /// autonomous path does not clobber error state from unrelated operations.
     private func triggerAutonomousDispatch(for completion: CompletionReport) {
         let role = workerRoles[completion.workerId]
         let instruction = suggestFollowUp(completion: completion, role: role)
@@ -2386,22 +2390,31 @@ final class EngineClient: ObservableObject {
             timestamp: Date()
         )
 
-        if let existing = autonomousDispatches[completion.workerId] {
-            Self.logger.warning("triggerAutonomousDispatch: overwriting unacknowledged auto-dispatch for worker \(completion.workerId), previous: \(existing.instruction)")
-        }
-        autonomousDispatches[completion.workerId] = dispatch
+        // Save lastError so the autonomous dispatch path does not clobber
+        // error state from a prior manual operation (dispatchTask clears it).
+        let savedError = lastError
 
         let success = dispatchTask(workerId: completion.workerId, instruction: instruction)
         if success {
+            if let existing = autonomousDispatches[completion.workerId] {
+                Self.logger.warning("triggerAutonomousDispatch: overwriting prior auto-dispatch for worker \(completion.workerId), previous: \(existing.instruction)")
+            }
+            autonomousDispatches[completion.workerId] = dispatch
             Self.logger.info("triggerAutonomousDispatch: auto-dispatched to worker \(completion.workerId): \(instruction)")
         } else {
-            Self.logger.error("triggerAutonomousDispatch: dispatch failed for worker \(completion.workerId)")
+            let engineError = lastError ?? "unknown engine error"
+            Self.logger.error("triggerAutonomousDispatch: dispatch failed for worker \(completion.workerId), instruction: \(instruction), error: \(engineError)")
         }
+
+        // Restore lastError — autonomous dispatch should not corrupt
+        // user-visible error state from unrelated operations.
+        lastError = savedError
     }
 
     /// Deterministic heuristic for follow-up task suggestion based on
     /// completion summary keywords. No LLM — pure keyword matching.
-    /// `role` parameter reserved for future role-aware differentiation (v0.1.5).
+    /// `role` parameter unused in current implementation; reserved for
+    /// future role-aware differentiation.
     private func suggestFollowUp(completion: CompletionReport, role: RoleDefinition?) -> String {
         let summary = completion.summary.lowercased()
 
