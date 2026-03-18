@@ -185,10 +185,16 @@ pub fn create(
         allocator.free(old.value.path);
         allocator.free(old.value.branch);
     }
-    try registry.entries.put(worker_id, .{
+    registry.entries.put(worker_id, .{
         .path = wt_path,
         .branch = branch,
-    });
+    }) catch |err| {
+        // Rollback: remove the git worktree we just created
+        worktree.runGit(allocator, project_path, &.{ "worktree", "remove", "--force", wt_path }) catch {};
+        allocator.free(wt_path);
+        allocator.free(branch);
+        return err;
+    };
 }
 
 /// Remove a specific worker's worktree.

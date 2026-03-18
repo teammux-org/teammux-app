@@ -371,7 +371,10 @@ export fn tm_worktree_create(engine: ?*Engine, worker_id: u32, task_description:
             error.MkdirFailed => "failed to create worktree directory",
             else => "worktree create failed",
         }) catch {};
-        return 5; // TM_ERR_WORKTREE
+        return switch (err) {
+            error.NoHomeDir, error.MkdirFailed => 7, // TM_ERR_CONFIG
+            else => 5, // TM_ERR_WORKTREE
+        };
     };
     return 0;
 }

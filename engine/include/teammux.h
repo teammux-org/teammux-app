@@ -221,8 +221,8 @@ tm_result_t       tm_worker_dismiss(tm_engine_t* engine, tm_worker_id_t worker_i
 
 // Create a git worktree for a worker. task_description is slugified into
 // the branch name (teammux/{worker_id}-{slug}). task_description must not
-// be NULL. Returns TM_ERR_CONFIG if task_description is NULL.
-// Returns TM_ERR_WORKTREE on git failure, path resolution, or mkdir failure.
+// be NULL. Returns TM_ERR_CONFIG if task_description is NULL, HOME is unset,
+// or worktree directory cannot be created. Returns TM_ERR_WORKTREE on git failure.
 tm_result_t tm_worktree_create(tm_engine_t* engine,
                                 uint32_t worker_id,
                                 const char* task_description);
