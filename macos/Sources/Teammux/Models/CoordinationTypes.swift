@@ -162,3 +162,47 @@ struct PeerDelegation: Identifiable, Equatable, Sendable {
         self.timestamp = timestamp
     }
 }
+
+// MARK: - HistoryEntryType
+
+/// Discriminator for persisted history entries loaded from the JSONL log.
+/// Parsed from the `type` string field in `tm_history_entry_t` ("completion" or "question").
+enum HistoryEntryType: String, Sendable {
+    case completion
+    case question
+}
+
+// MARK: - HistoryEntry
+
+/// A persisted history entry loaded from the engine's JSONL completion log.
+/// Bridged from `tm_history_entry_t` in teammux.h via `tm_history_load`.
+///
+/// The engine does not provide UUIDs — `id` is generated Swift-side for
+/// SwiftUI `ForEach` / `Identifiable` conformance.
+struct HistoryEntry: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let type: HistoryEntryType
+    let workerId: UInt32
+    let roleId: String?
+    let content: String
+    let gitCommit: String?
+    let timestamp: Date
+
+    init(
+        id: UUID = UUID(),
+        type: HistoryEntryType,
+        workerId: UInt32,
+        roleId: String?,
+        content: String,
+        gitCommit: String? = nil,
+        timestamp: Date
+    ) {
+        self.id = id
+        self.type = type
+        self.workerId = workerId
+        self.roleId = roleId
+        self.content = content
+        self.gitCommit = gitCommit
+        self.timestamp = timestamp
+    }
+}
