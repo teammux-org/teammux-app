@@ -114,6 +114,11 @@ final class EngineClient: ObservableObject {
     /// routed each delegation to the target worker's PTY.
     @Published var peerDelegations: [PeerDelegation] = []
 
+    /// All history entries loaded from the JSONL log at session start.
+    /// Sorted newest-first. Populated once during `sessionStart()` and
+    /// not appended to during the session. Cleared on `destroy()`.
+    @Published var completionHistory: [HistoryEntry] = []
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -225,7 +230,7 @@ final class EngineClient: ObservableObject {
 
     /// Start the session (background threads, watchers, etc.).
     /// Wraps `tm_session_start()`. Must be called after `create`.
-    /// Also loads available roles via `loadAvailableRoles()`.
+    /// Also loads available roles and completion history.
     /// Returns `true` on `TM_OK`.
     func sessionStart() -> Bool {
         lastError = nil
@@ -245,6 +250,7 @@ final class EngineClient: ObservableObject {
 
         setupCallbacks()
         loadAvailableRoles()
+        loadAndSeedHistory()
         return true
     }
 
@@ -290,6 +296,7 @@ final class EngineClient: ObservableObject {
         workerBranches.removeAll()
         peerQuestions.removeAll()
         peerDelegations.removeAll()
+        completionHistory.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -1747,6 +1754,98 @@ final class EngineClient: ObservableObject {
         }
 
         dispatchHistory = events
+    }
+
+    // MARK: - Private: Completion History
+
+    /// Load all history entries from the engine's JSONL log and seed
+    /// `workerCompletions` / `workerQuestions` for workers with no live entry.
+    /// Called once during `sessionStart()`.
+    private func loadAndSeedHistory() {
+        let entries = loadCompletionHistory()
+        completionHistory = entries
+
+        // Seed workerCompletions from the most recent .completion per worker.
+        // Live entries (arriving via message bus) will overwrite these.
+        var seenCompletions = Set<UInt32>()
+        for entry in entries where entry.type == .completion {
+            guard !seenCompletions.contains(entry.workerId) else { continue }
+            seenCompletions.insert(entry.workerId)
+            if workerCompletions[entry.workerId] == nil {
+                workerCompletions[entry.workerId] = CompletionReport(
+                    workerId: entry.workerId,
+                    summary: entry.content,
+                    gitCommit: entry.gitCommit,
+                    timestamp: entry.timestamp
+                )
+            }
+        }
+
+        // Seed workerQuestions from the most recent .question per worker.
+        var seenQuestions = Set<UInt32>()
+        for entry in entries where entry.type == .question {
+            guard !seenQuestions.contains(entry.workerId) else { continue }
+            seenQuestions.insert(entry.workerId)
+            if workerQuestions[entry.workerId] == nil {
+                workerQuestions[entry.workerId] = QuestionRequest(
+                    workerId: entry.workerId,
+                    question: entry.content,
+                    timestamp: entry.timestamp
+                )
+            }
+        }
+
+        if !entries.isEmpty {
+            Self.logger.info("Loaded \(entries.count) history entries, seeded \(seenCompletions.count) completions and \(seenQuestions.count) questions")
+        }
+    }
+
+    /// Bridge `tm_history_load` → `[HistoryEntry]`, sorted newest-first.
+    /// Returns an empty array when the engine returns NULL (no file or no entries).
+    private func loadCompletionHistory() -> [HistoryEntry] {
+        guard let engine else {
+            Self.logger.warning("loadCompletionHistory: engine not created")
+            return []
+        }
+
+        var count: UInt32 = 0
+        guard let entriesPtr = tm_history_load(engine, &count) else {
+            return []
+        }
+
+        var entries: [HistoryEntry] = []
+        for i in 0..<Int(count) {
+            guard let ptr = entriesPtr[i] else { continue }
+
+            let typeStr = String(cString: ptr.pointee.type)
+            guard let entryType = HistoryEntryType(rawValue: typeStr) else { continue }
+
+            let roleId: String? = {
+                let s = String(cString: ptr.pointee.role_id)
+                return s.isEmpty ? nil : s
+            }()
+
+            let gitCommit: String? = {
+                guard let p = ptr.pointee.git_commit, p.pointee != 0 else { return nil }
+                return String(cString: p)
+            }()
+
+            let entry = HistoryEntry(
+                type: entryType,
+                workerId: ptr.pointee.worker_id,
+                roleId: roleId,
+                content: String(cString: ptr.pointee.content),
+                gitCommit: gitCommit,
+                timestamp: Date(timeIntervalSince1970: Double(ptr.pointee.timestamp))
+            )
+            entries.append(entry)
+        }
+
+        tm_history_free(entriesPtr, count)
+
+        // Sort newest-first for display
+        entries.sort { $0.timestamp > $1.timestamp }
+        return entries
     }
 
     // MARK: - Private: Coordination handlers
