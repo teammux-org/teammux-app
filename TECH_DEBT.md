@@ -50,6 +50,8 @@
 | TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.2   | NO       | OPEN   |
 | TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | v0.2   | NO       | OPEN   |
 | TD26 | TeamMessage / CoordTypes | PRState and PRStatus model same concept with divergent colors    | v0.1.5 | NO       | OPEN   |
+| TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange      | v0.1.5 | NO       | OPEN   |
+| TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff   | v0.1.5 | NO       | OPEN   |
 
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
@@ -64,6 +66,8 @@
 - TD24: completion_history.jsonl is append-only and grows across all sessions. Log rotation (max size, archive old entries) deferred to v0.2. Risk is low for initial usage.
 - TD25: Push-to-main interceptor matches literal "main"/"master" tokens in $@. Refspec syntax (git push origin HEAD:main, refs/heads/feature:refs/heads/master) bypasses the check. Defense-in-depth only — workers operate in isolated worktrees on teammux/* branches. Full refspec destination parsing deferred to v0.2.
 - TD26: PRState (TeamMessage.swift, maps to tm_pr_state_t) and PRStatus (CoordinationTypes.swift, bus message workflow) both represent PR lifecycle state. PRState.closed is red, PRStatus.closed is grey. Unify into one type with consistent colors in v0.1.5.
+- TD27: ContextView observes hotReloadedWorkers via onChange, but Set.insert on an already-present element is a no-op — the Set doesn't mutate, so onChange doesn't fire. Rapid saves within the 3-second hot-reload window only show the first change. Fix requires engine to expose a reload counter or timestamp per worker. Refresh button works as manual workaround.
+- TD28: applyDiffHighlight compares old and new lines by positional index. An insertion near the top marks all subsequent shifted lines as changed. LCS-based diff would highlight only truly changed lines. Acceptable for a 2-second transient highlight but visually noisy on insertions/deletions.
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.

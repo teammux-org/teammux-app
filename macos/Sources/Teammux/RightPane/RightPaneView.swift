@@ -2,13 +2,14 @@ import SwiftUI
 
 // MARK: - RightTab
 
-/// The five tabs available in the right pane.
+/// The tabs available in the right pane.
 enum RightTab: String, CaseIterable, Identifiable {
     case teamLead = "Team Lead"
     case git = "Git"
     case diff = "Diff"
     case liveFeed = "Live Feed"
     case dispatch = "Dispatch"
+    case context = "Context"
 
     var id: String { rawValue }
 
@@ -19,6 +20,7 @@ enum RightTab: String, CaseIterable, Identifiable {
         case .diff:     return "doc.text.magnifyingglass"
         case .liveFeed: return "antenna.radiowaves.left.and.right"
         case .dispatch: return "paperplane.fill"
+        case .context:  return "doc.text.fill"
         }
     }
 }
@@ -26,7 +28,7 @@ enum RightTab: String, CaseIterable, Identifiable {
 // MARK: - RightPaneView
 
 /// Right pane with a custom tab bar (not native segmented control)
-/// routing to five content views: Team Lead terminal, Git, Diff, Live Feed, and Dispatch.
+/// routing to a content view for each tab.
 ///
 /// The active tab is indicated by a thin underline in accent color.
 struct RightPaneView: View {
@@ -34,6 +36,7 @@ struct RightPaneView: View {
 
     @State private var activeTab: RightTab = .teamLead
     @State private var diffSelectedWorkerId: UInt32? = nil
+    @State private var contextSelectedWorkerId: UInt32? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -99,6 +102,8 @@ struct RightPaneView: View {
             LiveFeedView(engine: engine, activeTab: $activeTab, diffSelectedWorkerId: $diffSelectedWorkerId)
         case .dispatch:
             DispatchView(engine: engine)
+        case .context:
+            ContextView(engine: engine, selectedWorkerId: $contextSelectedWorkerId)
         }
     }
 }
