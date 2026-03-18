@@ -1421,6 +1421,9 @@ export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u
         w.task_description,
         w.branch_name,
         e.project_root,
+        w.worktree_path,
+        w.name,
+        &e.ownership_registry,
         cb,
         userdata,
     ) catch |err| {

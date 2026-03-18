@@ -1,6 +1,8 @@
 const std = @import("std");
 const config = @import("config.zig");
 const worktree = @import("worktree.zig");
+const ownership = @import("ownership.zig");
+const interceptor = @import("interceptor.zig");
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -22,6 +24,9 @@ pub const RoleWatcher = struct {
     task_description: []const u8,
     branch_name: []const u8,
     project_root: []const u8, // non-owning — Engine outlives watcher
+    worktree_path: []const u8, // owned — worker's worktree for interceptor reinstall
+    worker_name: []const u8, // owned — worker name for interceptor reinstall
+    ownership_registry: ?*ownership.FileOwnershipRegistry, // non-owning — Engine outlives watcher
     kq: std.posix.fd_t,
     watch_fd: std.posix.fd_t,
     callback: RoleChangedCb,
@@ -30,9 +35,9 @@ pub const RoleWatcher = struct {
     running: std.atomic.Value(bool),
 
     /// Heap-allocate a new RoleWatcher. All string arguments are copied (owned).
-    /// project_root is stored as a non-owning reference — Engine must outlive the watcher.
-    /// The allocator must be thread-safe (e.g., c_allocator) — fireCallback uses it
-    /// on the watcher thread.
+    /// project_root and ownership_registry are stored as non-owning references —
+    /// Engine must outlive the watcher. The allocator must be thread-safe
+    /// (e.g., c_allocator) — fireCallback uses it on the watcher thread.
     pub fn create(
         allocator: std.mem.Allocator,
         worker_id: worktree.WorkerId,
@@ -41,6 +46,9 @@ pub const RoleWatcher = struct {
         task_description: []const u8,
         branch_name: []const u8,
         project_root: []const u8,
+        wt_path: []const u8,
+        w_name: []const u8,
+        registry: ?*ownership.FileOwnershipRegistry,
         callback: RoleChangedCb,
         userdata: ?*anyopaque,
     ) !*RoleWatcher {
@@ -52,6 +60,10 @@ pub const RoleWatcher = struct {
         errdefer allocator.free(owned_task);
         const owned_branch = try allocator.dupe(u8, branch_name);
         errdefer allocator.free(owned_branch);
+        const owned_wt_path = try allocator.dupe(u8, wt_path);
+        errdefer allocator.free(owned_wt_path);
+        const owned_w_name = try allocator.dupe(u8, w_name);
+        errdefer allocator.free(owned_w_name);
 
         const self = try allocator.create(RoleWatcher);
         self.* = .{
@@ -62,6 +74,9 @@ pub const RoleWatcher = struct {
             .task_description = owned_task,
             .branch_name = owned_branch,
             .project_root = project_root,
+            .worktree_path = owned_wt_path,
+            .worker_name = owned_w_name,
+            .ownership_registry = registry,
             .kq = -1,
             .watch_fd = -1,
             .callback = callback,
@@ -109,7 +124,8 @@ pub const RoleWatcher = struct {
         }
     }
 
-    /// Stop, close file descriptors, free owned strings (project_root is non-owning), destroy self.
+    /// Stop, close file descriptors, free owned strings (project_root and
+    /// ownership_registry are non-owning), destroy self.
     pub fn destroy(self: *RoleWatcher) void {
         self.stop();
         if (self.kq >= 0) {
@@ -125,6 +141,8 @@ pub const RoleWatcher = struct {
         allocator.free(self.role_path);
         allocator.free(self.task_description);
         allocator.free(self.branch_name);
+        allocator.free(self.worktree_path);
+        allocator.free(self.worker_name);
         allocator.destroy(self);
     }
 
@@ -201,6 +219,31 @@ pub const RoleWatcher = struct {
             return;
         };
         defer role_def.deinit(self.allocator);
+
+        // TD18: Update ownership registry and interceptor with new patterns
+        if (self.ownership_registry) |registry| {
+            registry.updateWorkerRules(
+                self.worker_id,
+                role_def.write_patterns,
+                role_def.deny_write_patterns,
+            ) catch |err| {
+                std.log.warn("[teammux] hotreload: ownership update failed for worker {d}: {}", .{ self.worker_id, err });
+            };
+
+            // Reinstall interceptor wrapper with new deny patterns
+            if (self.worktree_path.len > 0) {
+                interceptor.install(
+                    self.allocator,
+                    self.worktree_path,
+                    self.worker_id,
+                    self.worker_name,
+                    role_def.deny_write_patterns,
+                    role_def.write_patterns,
+                ) catch |err| {
+                    std.log.warn("[teammux] hotreload: ownership updated but interceptor reinstall failed for worker {d} — will retry on next role change: {}", .{ self.worker_id, err });
+                };
+            }
+        }
 
         // Regenerate CLAUDE.md content
         const claude_md = worktree.generateRoleClaude(
@@ -295,6 +338,9 @@ test "hotreload - RoleWatcher create and destroy without start" {
         "test task",
         "test-branch",
         "/tmp",
+        "",
+        "",
+        null,
         &struct {
             fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
         }.cb,
@@ -329,6 +375,9 @@ test "hotreload - watcher detects NOTE_WRITE" {
         "test task",
         "test-branch",
         tmp_path,
+        "",
+        "",
+        null,
         &struct {
             fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
                 if (content) |c| {
@@ -386,6 +435,9 @@ test "hotreload - watcher detects NOTE_RENAME (vim save pattern)" {
         "vim rename task",
         "feat/vim-test",
         tmp_path,
+        "",
+        "",
+        null,
         &struct {
             fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
                 if (content) |c| {
@@ -457,6 +509,9 @@ test "hotreload - callback receives correct CLAUDE.md content" {
         "implement feature X",
         "feat/feature-x",
         tmp_path,
+        "",
+        "",
+        null,
         &struct {
             fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
                 const s_ptr: *CallbackState = @ptrCast(@alignCast(ud));
@@ -518,6 +573,9 @@ test "hotreload - stop joins thread cleanly" {
         "stop test task",
         "test-branch",
         tmp_path,
+        "",
+        "",
+        null,
         &struct {
             fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
         }.cb,
@@ -562,11 +620,11 @@ test "hotreload - destroyAll cleans up map" {
 
     var map = RoleWatcherMap.init(alloc);
 
-    const w1 = try RoleWatcher.create(alloc, 1, "role-a", path_a, "task a", "branch-a", tmp_path, noop_cb, null);
+    const w1 = try RoleWatcher.create(alloc, 1, "role-a", path_a, "task a", "branch-a", tmp_path, "", "", null, noop_cb, null);
     try w1.start();
     try map.put(1, w1);
 
-    const w2 = try RoleWatcher.create(alloc, 2, "role-b", path_b, "task b", "branch-b", tmp_path, noop_cb, null);
+    const w2 = try RoleWatcher.create(alloc, 2, "role-b", path_b, "task b", "branch-b", tmp_path, "", "", null, noop_cb, null);
     try w2.start();
     try map.put(2, w2);
 
@@ -574,4 +632,265 @@ test "hotreload - destroyAll cleans up map" {
 
     // destroyAll should stop all threads, free all watchers, and deinit the map
     destroyAll(&map);
+}
+
+// ─────────────────────────────────────────────────────────
+// Tests — TD18: ownership + interceptor sync on hot-reload
+// ─────────────────────────────────────────────────────────
+
+fn writeTestRoleWithPatterns(
+    alloc: std.mem.Allocator,
+    dir: std.fs.Dir,
+    filename: []const u8,
+    role_name: []const u8,
+    write_pats: []const []const u8,
+    deny_pats: []const []const u8,
+) !void {
+    var buf = try std.ArrayList(u8).initCapacity(alloc, 512);
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "[identity]\nid = \"test-role\"\nname = \"");
+    try buf.appendSlice(alloc, role_name);
+    try buf.appendSlice(alloc, "\"\ndivision = \"testing\"\ndescription = \"A test role\"\n\n[capabilities]\nwrite = [");
+    for (write_pats, 0..) |p, i| {
+        if (i > 0) try buf.appendSlice(alloc, ", ");
+        try buf.appendSlice(alloc, "\"");
+        try buf.appendSlice(alloc, p);
+        try buf.appendSlice(alloc, "\"");
+    }
+    try buf.appendSlice(alloc, "]\ndeny_write = [");
+    for (deny_pats, 0..) |p, i| {
+        if (i > 0) try buf.appendSlice(alloc, ", ");
+        try buf.appendSlice(alloc, "\"");
+        try buf.appendSlice(alloc, p);
+        try buf.appendSlice(alloc, "\"");
+    }
+    try buf.appendSlice(alloc, "]\n\n[context]\nmission = \"Test mission\"\n");
+
+    const file = try dir.createFile(filename, .{});
+    defer file.close();
+    try file.writeAll(buf.items);
+}
+
+test "hotreload TD18 - ownership registry updated on role change" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+
+    // Initial role: frontend patterns
+    const initial_write = [_][]const u8{ "src/frontend/**", "tests/**" };
+    const initial_deny = [_][]const u8{"src/backend/**"};
+    try writeTestRoleWithPatterns(alloc, tmp.dir, "test-role.toml", "Frontend", &initial_write, &initial_deny);
+
+    const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
+    defer alloc.free(role_path);
+
+    // Set up ownership registry with initial rules
+    var registry = ownership.FileOwnershipRegistry.init(alloc);
+    defer registry.deinit();
+    try registry.register(1, "src/frontend/**", true);
+    try registry.register(1, "src/backend/**", false);
+
+    var callback_fired = std.atomic.Value(bool).init(false);
+
+    const watcher = try RoleWatcher.create(
+        alloc,
+        1,
+        "test-role",
+        role_path,
+        "test task",
+        "test-branch",
+        tmp_path,
+        tmp_path, // worktree_path = tmp dir for interceptor install
+        "Test Worker",
+        &registry,
+        &struct {
+            fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+                if (content != null) {
+                    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud));
+                    flag.store(true, .release);
+                }
+            }
+        }.cb,
+        @ptrCast(&callback_fired),
+    );
+    defer watcher.destroy();
+
+    try watcher.start();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Update role: swap patterns — backend write, frontend deny
+    const new_write = [_][]const u8{"src/backend/**"};
+    const new_deny = [_][]const u8{ "src/frontend/**", "infrastructure/**" };
+    try writeTestRoleWithPatterns(alloc, tmp.dir, "test-role.toml", "Backend", &new_write, &new_deny);
+
+    // Wait for callback
+    var waited: usize = 0;
+    while (waited < 30) : (waited += 1) {
+        if (callback_fired.load(.acquire)) break;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(callback_fired.load(.acquire));
+
+    // Verify registry reflects NEW patterns
+    const rules = registry.getRules(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rules.len == 3); // 1 write + 2 deny
+
+    // New write pattern works
+    try std.testing.expect(registry.check(1, "src/backend/server.ts"));
+
+    // Old write pattern now denied
+    try std.testing.expect(!registry.check(1, "src/frontend/App.tsx"));
+
+    // New deny pattern works
+    try std.testing.expect(!registry.check(1, "infrastructure/main.tf"));
+}
+
+test "hotreload TD18 - interceptor wrapper regenerated with new patterns" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+
+    // Initial role with deny patterns
+    const initial_write = [_][]const u8{"src/**"};
+    const initial_deny = [_][]const u8{"infra/**"};
+    try writeTestRoleWithPatterns(alloc, tmp.dir, "test-role.toml", "Initial", &initial_write, &initial_deny);
+
+    const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
+    defer alloc.free(role_path);
+
+    var registry = ownership.FileOwnershipRegistry.init(alloc);
+    defer registry.deinit();
+    try registry.register(1, "src/**", true);
+    try registry.register(1, "infra/**", false);
+
+    var callback_fired = std.atomic.Value(bool).init(false);
+
+    const watcher = try RoleWatcher.create(
+        alloc,
+        1,
+        "test-role",
+        role_path,
+        "test task",
+        "test-branch",
+        tmp_path,
+        tmp_path,
+        "Test Worker",
+        &registry,
+        &struct {
+            fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+                if (content != null) {
+                    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud));
+                    flag.store(true, .release);
+                }
+            }
+        }.cb,
+        @ptrCast(&callback_fired),
+    );
+    defer watcher.destroy();
+
+    try watcher.start();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Update role with different deny patterns
+    const new_write = [_][]const u8{"tests/**"};
+    const new_deny = [_][]const u8{"docs/**"};
+    try writeTestRoleWithPatterns(alloc, tmp.dir, "test-role.toml", "Updated", &new_write, &new_deny);
+
+    // Wait for callback
+    var waited: usize = 0;
+    while (waited < 30) : (waited += 1) {
+        if (callback_fired.load(.acquire)) break;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(callback_fired.load(.acquire));
+
+    // Verify interceptor wrapper was regenerated — read the wrapper script
+    const wrapper_path = try std.fmt.allocPrint(alloc, "{s}/.git-wrapper/git", .{tmp_path});
+    defer alloc.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(alloc, 64 * 1024);
+    defer alloc.free(content);
+
+    // New deny pattern present in wrapper
+    try std.testing.expect(std.mem.indexOf(u8, content, "'docs/**'") != null);
+    // Old deny pattern NOT present
+    try std.testing.expect(std.mem.indexOf(u8, content, "'infra/**'") == null);
+}
+
+test "hotreload TD18 - failed parse does not corrupt registry" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+
+    // Start with valid role
+    const write = [_][]const u8{"src/**"};
+    const deny = [_][]const u8{"infra/**"};
+    try writeTestRoleWithPatterns(alloc, tmp.dir, "test-role.toml", "Valid", &write, &deny);
+
+    const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
+    defer alloc.free(role_path);
+
+    var registry = ownership.FileOwnershipRegistry.init(alloc);
+    defer registry.deinit();
+    try registry.register(1, "src/**", true);
+    try registry.register(1, "infra/**", false);
+
+    var callback_fired = std.atomic.Value(bool).init(false);
+
+    const watcher = try RoleWatcher.create(
+        alloc,
+        1,
+        "test-role",
+        role_path,
+        "test task",
+        "test-branch",
+        tmp_path,
+        tmp_path,
+        "Test Worker",
+        &registry,
+        &struct {
+            fn cb(_: u32, _: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+                // Fires for both success (non-null) and failure (null)
+                const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud));
+                flag.store(true, .release);
+            }
+        }.cb,
+        @ptrCast(&callback_fired),
+    );
+    defer watcher.destroy();
+
+    try watcher.start();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Write INVALID TOML — missing required identity.id field
+    {
+        const invalid = try tmp.dir.createFile("test-role.toml", .{});
+        defer invalid.close();
+        try invalid.writeAll("this is not valid toml\n");
+    }
+
+    // Wait for callback to fire (parse failure sends null)
+    var waited: usize = 0;
+    while (waited < 30) : (waited += 1) {
+        if (callback_fired.load(.acquire)) break;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(callback_fired.load(.acquire));
+
+    // Registry must be UNCHANGED — old rules preserved
+    const rules = registry.getRules(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rules.len == 2);
+    try std.testing.expect(registry.check(1, "src/foo.ts"));
+    try std.testing.expect(!registry.check(1, "infra/main.tf"));
 }
