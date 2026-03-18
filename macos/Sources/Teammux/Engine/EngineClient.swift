@@ -1063,7 +1063,6 @@ final class EngineClient: ObservableObject {
     /// Requires `workerRoles[workerId]` to be set (role ID is read from it).
     /// Wraps `tm_role_watch()`.
     private func startRoleWatch(workerId: UInt32) {
-        lastError = nil
         guard let engine else {
             Self.logger.error("startRoleWatch: engine not created")
             return
@@ -1129,7 +1128,6 @@ final class EngineClient: ObservableObject {
     /// and shows a transient banner. Cancels any previous dismiss timer for
     /// the same worker to debounce rapid file saves.
     private func handleRoleChanged(workerId: UInt32, newClaudeMd: String?) {
-        lastError = nil
         guard let newClaudeMd, !newClaudeMd.isEmpty else {
             let msg = "Role hot-reload failed for worker \(workerId) — the role file may contain syntax errors"
             Self.logger.error("handleRoleChanged: \(msg)")
@@ -1369,7 +1367,6 @@ final class EngineClient: ObservableObject {
     /// Dispatch `/teammux-*` commands received from the engine's
     /// command interception callback.
     private func handleCommand(_ command: String, argsJson: String) {
-        lastError = nil
         let args = parseArgsJson(argsJson)
 
         switch command {
@@ -1492,7 +1489,6 @@ final class EngineClient: ObservableObject {
     /// Handles flat `{"key": "value", ...}` objects without pulling in
     /// full `JSONSerialization` (which may fail on non-UTF8 engine output).
     private func parseArgsJson(_ json: String) -> [String: String] {
-        lastError = nil
         guard let data = json.data(using: .utf8) else { return [:] }
         do {
             if let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -1712,7 +1708,6 @@ final class EngineClient: ObservableObject {
     /// Payload format: `{"summary": "...", "details": "...", "git_commit": "..."}`
     /// Worker ID comes from the message envelope (`from` field), not the payload.
     private func handleCompletionMessage(from workerId: UInt32, payload: String, timestamp: Date, gitCommit: String?) {
-        lastError = nil
         guard let data = payload.data(using: .utf8) else {
             let msg = "handleCompletionMessage: payload is not valid UTF-8 for worker \(workerId)"
             Self.logger.error("\(msg)")
@@ -1760,7 +1755,6 @@ final class EngineClient: ObservableObject {
     /// Payload format: `{"question": "...", "context": "..."}`
     /// Worker ID comes from the message envelope (`from` field), not the payload.
     private func handleQuestionMessage(from workerId: UInt32, payload: String, timestamp: Date) {
-        lastError = nil
         guard let data = payload.data(using: .utf8) else {
             let msg = "handleQuestionMessage: payload is not valid UTF-8 for worker \(workerId)"
             Self.logger.error("\(msg)")

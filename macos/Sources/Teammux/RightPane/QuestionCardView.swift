@@ -6,8 +6,8 @@ import SwiftUI
 /// Team Lead's response.
 ///
 /// "Dispatch" calls `engine.dispatchResponse(workerId:response:)` and clears the
-/// question only on success. On failure the card stays visible so the Team Lead
-/// knows the response was not delivered.
+/// question only on success. On failure the card stays visible and shows an inline
+/// error message so the Team Lead knows the response was not delivered.
 /// "Dismiss" clears the question without responding.
 struct QuestionCardView: View {
     let request: QuestionRequest
@@ -74,6 +74,7 @@ struct QuestionCardView: View {
                 Spacer()
 
                 Button("Dismiss") {
+                    operationError = nil
                     engine.clearQuestion(workerId: request.workerId)
                 }
                 .buttonStyle(.plain)
