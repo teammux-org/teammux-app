@@ -58,6 +58,15 @@ struct QuestionRequest: Identifiable, Equatable, Sendable {
     }
 }
 
+// MARK: - DispatchKind
+
+/// Distinguishes task dispatches from response dispatches.
+/// Maps to `tm_dispatch_event_t.kind` in teammux.h (0 = task, 1 = response).
+enum DispatchKind: UInt8, Sendable {
+    case task = 0
+    case response = 1
+}
+
 // MARK: - DispatchEvent
 
 /// A Team Lead dispatch event, bridged from `tm_dispatch_event_t` in teammux.h.
@@ -71,18 +80,21 @@ struct DispatchEvent: Identifiable, Equatable, Sendable {
     let instruction: String
     let timestamp: Date
     let delivered: Bool
+    let kind: DispatchKind
 
     init(
         id: UUID = UUID(),
         targetWorkerId: UInt32,
         instruction: String,
         timestamp: Date,
-        delivered: Bool
+        delivered: Bool,
+        kind: DispatchKind
     ) {
         self.id = id
         self.targetWorkerId = targetWorkerId
         self.instruction = instruction
         self.timestamp = timestamp
         self.delivered = delivered
+        self.kind = kind
     }
 }
