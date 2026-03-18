@@ -6,14 +6,15 @@ import SwiftUI
 /// Team Lead's response.
 ///
 /// "Dispatch" calls `engine.dispatchResponse(workerId:response:)` and clears the
-/// question only on success. On failure the card stays visible so the Team Lead
-/// knows the response was not delivered.
+/// question only on success. On failure the card stays visible and shows an inline
+/// error message so the Team Lead knows the response was not delivered.
 /// "Dismiss" clears the question without responding.
 struct QuestionCardView: View {
     let request: QuestionRequest
     @ObservedObject var engine: EngineClient
 
     @State private var responseText = ""
+    @State private var operationError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -60,11 +61,20 @@ struct QuestionCardView: View {
                 )
                 .lineLimit(1...4)
 
+            if let error = operationError {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+                    .lineLimit(2)
+                    .padding(.leading, 2)
+            }
+
             // Actions
             HStack {
                 Spacer()
 
                 Button("Dismiss") {
+                    operationError = nil
                     engine.clearQuestion(workerId: request.workerId)
                 }
                 .buttonStyle(.plain)
@@ -98,9 +108,12 @@ struct QuestionCardView: View {
     private func dispatchResponse() {
         let trimmed = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        operationError = nil
         let success = engine.dispatchResponse(workerId: request.workerId, response: trimmed)
         if success {
             engine.clearQuestion(workerId: request.workerId)
+        } else {
+            operationError = engine.lastError ?? "Failed to dispatch response"
         }
     }
 
