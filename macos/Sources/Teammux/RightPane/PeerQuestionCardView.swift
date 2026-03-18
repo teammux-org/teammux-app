@@ -13,6 +13,8 @@ struct PeerQuestionCardView: View {
     let question: PeerQuestion
     @ObservedObject var engine: EngineClient
 
+    @State private var relayError: String?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Header: sender → target route
@@ -36,6 +38,14 @@ struct PeerQuestionCardView: View {
                 .font(.system(size: 11))
                 .foregroundColor(.primary)
                 .lineLimit(4)
+
+            // Error feedback
+            if let relayError {
+                Text(relayError)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+                    .lineLimit(2)
+            }
 
             // Actions
             HStack {
@@ -72,12 +82,15 @@ struct PeerQuestionCardView: View {
     // MARK: - Actions
 
     private func relayQuestion() {
+        relayError = nil
         let success = engine.dispatchTask(
             workerId: question.targetWorkerId,
             instruction: question.message
         )
         if success {
             engine.clearPeerQuestion(fromWorkerId: question.fromWorkerId)
+        } else {
+            relayError = engine.lastError ?? "Failed to relay question to worker"
         }
     }
 

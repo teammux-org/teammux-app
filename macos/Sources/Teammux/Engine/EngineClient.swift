@@ -1302,9 +1302,9 @@ final class EngineClient: ObservableObject {
                 } else if type == .question {
                     client.handleQuestionMessage(from: from, payload: payload, timestamp: timestamp)
                 } else if type == .peerQuestion {
-                    client.handlePeerQuestionMessage(payload: payload, timestamp: timestamp)
+                    client.handlePeerQuestionMessage(from: from, payload: payload, timestamp: timestamp)
                 } else if type == .delegation {
-                    client.handleDelegationMessage(payload: payload, timestamp: timestamp)
+                    client.handleDelegationMessage(from: from, payload: payload, timestamp: timestamp)
                 }
             }
             return TM_OK
@@ -1855,9 +1855,12 @@ final class EngineClient: ObservableObject {
 
     /// Parse a TM_MSG_PEER_QUESTION payload and update `peerQuestions`.
     /// Payload format: `{"worker_id": N, "target_worker_id": M, "message": "..."}`
-    private func handlePeerQuestionMessage(payload: String, timestamp: Date) {
+    /// Worker ID comes from the message envelope (`from` field), consistent with
+    /// `handleCompletionMessage` / `handleQuestionMessage`. Payload `worker_id`
+    /// is cross-validated but not authoritative.
+    private func handlePeerQuestionMessage(from envelopeFrom: UInt32, payload: String, timestamp: Date) {
         guard let data = payload.data(using: .utf8) else {
-            let msg = "handlePeerQuestionMessage: payload is not valid UTF-8"
+            let msg = "handlePeerQuestionMessage: payload is not valid UTF-8 for worker \(envelopeFrom)"
             Self.logger.error("\(msg)")
             lastError = msg
             return
@@ -1865,44 +1868,44 @@ final class EngineClient: ObservableObject {
 
         do {
             guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                let msg = "handlePeerQuestionMessage: payload is not a JSON object"
+                let msg = "handlePeerQuestionMessage: payload is not a JSON object for worker \(envelopeFrom)"
                 Self.logger.error("\(msg)")
                 lastError = msg
                 return
             }
 
-            guard let fromWorkerId = dict["worker_id"] as? UInt32 ?? (dict["worker_id"] as? Int).map(UInt32.init) else {
-                let msg = "handlePeerQuestionMessage: missing or invalid worker_id"
-                Self.logger.warning("\(msg)")
-                lastError = msg
-                return
+            // Cross-validate payload worker_id against envelope from
+            if let payloadWorkerId = (dict["worker_id"] as? Int).flatMap({ UInt32(exactly: $0) }),
+               payloadWorkerId != envelopeFrom {
+                Self.logger.warning("handlePeerQuestionMessage: payload worker_id \(payloadWorkerId) does not match envelope from \(envelopeFrom)")
             }
-            guard let targetWorkerId = dict["target_worker_id"] as? UInt32 ?? (dict["target_worker_id"] as? Int).map(UInt32.init) else {
-                let msg = "handlePeerQuestionMessage: missing or invalid target_worker_id"
-                Self.logger.warning("\(msg)")
+
+            guard let targetWorkerId = (dict["target_worker_id"] as? Int).flatMap({ UInt32(exactly: $0) }) else {
+                let msg = "handlePeerQuestionMessage: missing or invalid target_worker_id for worker \(envelopeFrom)"
+                Self.logger.error("\(msg)")
                 lastError = msg
                 return
             }
             guard let message = dict["message"] as? String, !message.isEmpty else {
-                let msg = "handlePeerQuestionMessage: missing or empty message"
-                Self.logger.warning("\(msg)")
+                let msg = "handlePeerQuestionMessage: missing or empty message for worker \(envelopeFrom)"
+                Self.logger.error("\(msg)")
                 lastError = msg
                 return
             }
 
-            if let existing = peerQuestions[fromWorkerId] {
-                Self.logger.warning("handlePeerQuestionMessage: overwriting unrelayed peer question from worker \(fromWorkerId), previous message: \(existing.message)")
+            if let existing = peerQuestions[envelopeFrom] {
+                Self.logger.warning("handlePeerQuestionMessage: overwriting unrelayed peer question from worker \(envelopeFrom), previous message: \(existing.message)")
             }
 
             let question = PeerQuestion(
-                fromWorkerId: fromWorkerId,
+                fromWorkerId: envelopeFrom,
                 targetWorkerId: targetWorkerId,
                 message: message,
                 timestamp: timestamp
             )
-            peerQuestions[fromWorkerId] = question
+            peerQuestions[envelopeFrom] = question
         } catch {
-            let msg = "handlePeerQuestionMessage: JSON parse failed: \(error.localizedDescription)"
+            let msg = "handlePeerQuestionMessage: JSON parse failed for worker \(envelopeFrom): \(error.localizedDescription)"
             Self.logger.error("\(msg)")
             lastError = msg
         }
@@ -1911,9 +1914,11 @@ final class EngineClient: ObservableObject {
     /// Parse a TM_MSG_DELEGATION payload and append to `peerDelegations`.
     /// Payload format: `{"worker_id": N, "target_worker_id": M, "task": "..."}`
     /// Capped at 100 entries — oldest trimmed when exceeding.
-    private func handleDelegationMessage(payload: String, timestamp: Date) {
+    /// Worker ID comes from the message envelope (`from` field), consistent with
+    /// other coordination handlers.
+    private func handleDelegationMessage(from envelopeFrom: UInt32, payload: String, timestamp: Date) {
         guard let data = payload.data(using: .utf8) else {
-            let msg = "handleDelegationMessage: payload is not valid UTF-8"
+            let msg = "handleDelegationMessage: payload is not valid UTF-8 for worker \(envelopeFrom)"
             Self.logger.error("\(msg)")
             lastError = msg
             return
@@ -1921,33 +1926,33 @@ final class EngineClient: ObservableObject {
 
         do {
             guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                let msg = "handleDelegationMessage: payload is not a JSON object"
+                let msg = "handleDelegationMessage: payload is not a JSON object for worker \(envelopeFrom)"
                 Self.logger.error("\(msg)")
                 lastError = msg
                 return
             }
 
-            guard let fromWorkerId = dict["worker_id"] as? UInt32 ?? (dict["worker_id"] as? Int).map(UInt32.init) else {
-                let msg = "handleDelegationMessage: missing or invalid worker_id"
-                Self.logger.warning("\(msg)")
-                lastError = msg
-                return
+            // Cross-validate payload worker_id against envelope from
+            if let payloadWorkerId = (dict["worker_id"] as? Int).flatMap({ UInt32(exactly: $0) }),
+               payloadWorkerId != envelopeFrom {
+                Self.logger.warning("handleDelegationMessage: payload worker_id \(payloadWorkerId) does not match envelope from \(envelopeFrom)")
             }
-            guard let targetWorkerId = dict["target_worker_id"] as? UInt32 ?? (dict["target_worker_id"] as? Int).map(UInt32.init) else {
-                let msg = "handleDelegationMessage: missing or invalid target_worker_id"
-                Self.logger.warning("\(msg)")
+
+            guard let targetWorkerId = (dict["target_worker_id"] as? Int).flatMap({ UInt32(exactly: $0) }) else {
+                let msg = "handleDelegationMessage: missing or invalid target_worker_id for worker \(envelopeFrom)"
+                Self.logger.error("\(msg)")
                 lastError = msg
                 return
             }
             guard let task = dict["task"] as? String, !task.isEmpty else {
-                let msg = "handleDelegationMessage: missing or empty task"
-                Self.logger.warning("\(msg)")
+                let msg = "handleDelegationMessage: missing or empty task for worker \(envelopeFrom)"
+                Self.logger.error("\(msg)")
                 lastError = msg
                 return
             }
 
             let delegation = PeerDelegation(
-                fromWorkerId: fromWorkerId,
+                fromWorkerId: envelopeFrom,
                 targetWorkerId: targetWorkerId,
                 task: task,
                 timestamp: timestamp
@@ -1956,10 +1961,10 @@ final class EngineClient: ObservableObject {
 
             // Cap at 100 — trim oldest when exceeding
             if peerDelegations.count > 100 {
-                peerDelegations = Array(peerDelegations.suffix(100))
+                peerDelegations.removeFirst(peerDelegations.count - 100)
             }
         } catch {
-            let msg = "handleDelegationMessage: JSON parse failed: \(error.localizedDescription)"
+            let msg = "handleDelegationMessage: JSON parse failed for worker \(envelopeFrom): \(error.localizedDescription)"
             Self.logger.error("\(msg)")
             lastError = msg
         }

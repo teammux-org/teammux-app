@@ -2,11 +2,13 @@ import SwiftUI
 
 // MARK: - LiveFeedView
 
-/// Right-pane tab showing the real-time message bus feed, with completion
-/// and question card sections above the message stream.
+/// Right-pane tab showing the real-time message bus feed, with completion,
+/// question, peer question, and delegation card sections above the message stream.
 ///
 /// Sections appear conditionally: completion cards when workers have signaled
-/// completion, question cards when workers are awaiting Team Lead guidance.
+/// completion, question cards when workers are awaiting Team Lead guidance,
+/// peer question cards for worker-to-worker questions pending Team Lead relay,
+/// and delegation cards showing routed task delegations.
 /// The message feed auto-scrolls to the latest entry below.
 struct LiveFeedView: View {
     @ObservedObject var engine: EngineClient
