@@ -246,7 +246,7 @@ fn generateInterceptorScript(
         \\      echo "[Teammux] Cannot stage all files — this worker has write restrictions."
         \\      echo "Use explicit paths: git add <file>"
         \\      echo "Your write scope: $WRITE_SCOPE"
-        \\      exit 1
+        \\      exit 126
         \\    fi
         \\  done
         \\  # Check individual files against deny patterns
@@ -261,7 +261,7 @@ fn generateInterceptorScript(
         \\      if [[ "$arg" == $pattern ]]; then
         \\        echo "[Teammux] Permission denied: $arg is outside your write scope ($WORKER_NAME)"
         \\        echo "Your write scope: $WRITE_SCOPE"
-        \\        exit 1
+        \\        exit 126
         \\      fi
         \\    done
         \\  done
@@ -282,8 +282,36 @@ fn generateInterceptorScript(
         \\          echo "[Teammux] Cannot use 'git commit -a' with write restrictions ($WORKER_NAME)."
         \\          echo "[Teammux] Stage files explicitly with 'git add' first."
         \\          echo "[Teammux] Your write scope: $WRITE_SCOPE"
-        \\          exit 1
+        \\          exit 126
         \\        fi
+        \\        ;;
+        \\    esac
+        \\  done
+        \\elif [[ "$subcmd" == "stash" ]]; then
+        \\  for arg in "$@"; do
+        \\    case "$arg" in
+        \\      pop|apply)
+        \\        if [[ ${#DENY_PATTERNS[@]} -gt 0 ]]; then
+        \\          echo "[Teammux] Cannot $arg stash with write restrictions."
+        \\          echo "[Teammux] Your write scope: $WRITE_SCOPE"
+        \\          exit 126
+        \\        fi
+        \\        ;;
+        \\    esac
+        \\  done
+        \\elif [[ "$subcmd" == "apply" ]]; then
+        \\  if [[ ${#DENY_PATTERNS[@]} -gt 0 ]]; then
+        \\    echo "[Teammux] Cannot git apply with write restrictions."
+        \\    echo "[Teammux] Your write scope: $WRITE_SCOPE"
+        \\    exit 126
+        \\  fi
+        \\elif [[ "$subcmd" == "push" ]]; then
+        \\  for arg in "$@"; do
+        \\    case "$arg" in
+        \\      main|master)
+        \\        echo "[Teammux] Cannot push directly to main."
+        \\        echo "[Teammux] Use /teammux-pr-ready to signal task completion."
+        \\        exit 126
         \\        ;;
         \\    esac
         \\  done
@@ -592,4 +620,104 @@ test "interceptor - wrapper contains commit -a interception block" {
     try std.testing.expect(std.mem.indexOf(u8, content, "Stage files explicitly with 'git add' first.") != null);
     // Uses WRITE_SCOPE (pre-formatted scalar), not WRITE_PATTERNS array
     try std.testing.expect(std.mem.indexOf(u8, content, "Your write scope: $WRITE_SCOPE") != null);
+}
+
+test "interceptor - enforcement blocks use exit 126 not exit 1" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{"src/backend/**"};
+    const write = [_][]const u8{"src/frontend/**"};
+    try install(std.testing.allocator, path, 1, "test", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // exit 126 must be present (used by all enforcement blocks)
+    try std.testing.expect(std.mem.indexOf(u8, content, "exit 126") != null);
+    // No bare "exit 1" (followed by newline) should remain — exit 126 lines won't match
+    try std.testing.expect(std.mem.indexOf(u8, content, "exit 1\n") == null);
+}
+
+test "interceptor - wrapper contains stash pop/apply interception block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{"src/backend/**"};
+    const write = [_][]const u8{"src/frontend/**"};
+    try install(std.testing.allocator, path, 1, "test", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Stash subcmd detection
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"stash\"") != null);
+    // Only pop and apply are blocked — push is not in the case pattern
+    try std.testing.expect(std.mem.indexOf(u8, content, "pop|apply)") != null);
+    // Error message uses $arg to show which stash subcommand was blocked
+    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot $arg stash with write restrictions") != null);
+    // Guard: only blocks when deny patterns exist
+    try std.testing.expect(std.mem.indexOf(u8, content, "${#DENY_PATTERNS[@]} -gt 0") != null);
+}
+
+test "interceptor - wrapper contains git apply interception block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{"src/backend/**"};
+    const write = [_][]const u8{"src/frontend/**"};
+    try install(std.testing.allocator, path, 1, "test", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Apply subcmd detection (separate from stash apply)
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"apply\"") != null);
+    // Blocks git apply entirely when deny patterns exist
+    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot git apply with write restrictions") != null);
+}
+
+test "interceptor - wrapper contains push-to-main interception block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{"src/backend/**"};
+    const write = [_][]const u8{"src/frontend/**"};
+    try install(std.testing.allocator, path, 1, "test", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Push subcmd detection
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"push\"") != null);
+    // Only main and master are blocked — teammux/* branches pass through
+    try std.testing.expect(std.mem.indexOf(u8, content, "main|master)") != null);
+    // Error message
+    try std.testing.expect(std.mem.indexOf(u8, content, "Cannot push directly to main") != null);
+    // Suggests PR workflow instead
+    try std.testing.expect(std.mem.indexOf(u8, content, "/teammux-pr-ready") != null);
 }
