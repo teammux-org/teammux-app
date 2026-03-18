@@ -57,3 +57,32 @@ struct QuestionRequest: Identifiable, Equatable, Sendable {
         self.timestamp = timestamp
     }
 }
+
+// MARK: - DispatchEvent
+
+/// A Team Lead dispatch event, bridged from `tm_dispatch_event_t` in teammux.h.
+/// Records task dispatches and response dispatches to workers.
+///
+/// The engine does not provide UUIDs — `id` is generated Swift-side for
+/// SwiftUI `ForEach` / `Identifiable` conformance.
+struct DispatchEvent: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let targetWorkerId: UInt32
+    let instruction: String
+    let timestamp: Date
+    let delivered: Bool
+
+    init(
+        id: UUID = UUID(),
+        targetWorkerId: UInt32,
+        instruction: String,
+        timestamp: Date,
+        delivered: Bool
+    ) {
+        self.id = id
+        self.targetWorkerId = targetWorkerId
+        self.instruction = instruction
+        self.timestamp = timestamp
+        self.delivered = delivered
+    }
+}
