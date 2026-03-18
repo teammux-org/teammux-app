@@ -5,7 +5,7 @@ import os
 
 /// Maps to `tm_message_type_t` in teammux.h.
 /// TASK=0, INSTRUCTION=1, CONTEXT=2, STATUS_REQ=3,
-/// STATUS_RPT=4, COMPLETION=5, ERROR=6, BROADCAST=7
+/// STATUS_RPT=4, COMPLETION=5, ERROR=6, BROADCAST=7, QUESTION=8
 enum MessageType: Int, CaseIterable, Sendable {
     case task        = 0
     case instruction = 1
@@ -15,6 +15,7 @@ enum MessageType: Int, CaseIterable, Sendable {
     case completion  = 5
     case error       = 6
     case broadcast   = 7
+    case question    = 8
 
     private static let logger = Logger(subsystem: "com.teammux.app", category: "MessageType")
 
@@ -29,6 +30,7 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .completion:  return .green
         case .error:       return .red
         case .broadcast:   return .yellow
+        case .question:    return .cyan
         }
     }
 
@@ -43,6 +45,7 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .completion:  return "Completion"
         case .error:       return "Error"
         case .broadcast:   return "Broadcast"
+        case .question:    return "Question"
         }
     }
 
