@@ -105,7 +105,7 @@ struct InitiateView: View {
             // Workers
             ForEach(teamConfig.workers) { worker in
                 TeamSummaryRow(
-                    role: worker.name,
+                    role: worker.roleId.map { "\(worker.name) — \($0)" } ?? worker.name,
                     agent: worker.agent.displayName,
                     model: worker.model
                 )
