@@ -95,6 +95,15 @@ final class EngineClient: ObservableObject {
     /// and available for UI refresh (e.g. when the Dispatch tab appears).
     @Published var dispatchHistory: [DispatchEvent] = []
 
+    /// Absolute worktree path per worker ID. Populated after spawn from
+    /// `tm_worktree_path()`. Nil entry means the worker has no dedicated
+    /// worktree (graceful degradation — operates from project root).
+    @Published var workerWorktrees: [UInt32: String] = [:]
+
+    /// Git branch name per worker ID. Populated after spawn from
+    /// `tm_worktree_branch()`. Used by WorkerRow for the branch badge.
+    @Published var workerBranches: [UInt32: String] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -265,6 +274,8 @@ final class EngineClient: ObservableObject {
         hotReloadTimers.removeAll()
         hotReloadedWorkers.removeAll()
         dispatchHistory.removeAll()
+        workerWorktrees.removeAll()
+        workerBranches.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -351,6 +362,21 @@ final class EngineClient: ObservableObject {
             Self.logger.error("Worker \(workerId) spawned but tm_worker_get returned nil")
         }
 
+        // Cache worktree path and branch for downstream consumers (T12/T13/T15).
+        // The engine created the worktree internally during tm_worker_spawn (T1).
+        // Nil return means no worktree — graceful degradation, worker operates
+        // from project root.
+        if let cPath = tm_worktree_path(engine, workerId) {
+            workerWorktrees[workerId] = String(cString: cPath)
+        } else {
+            Self.logger.warning("spawnWorker: tm_worktree_path returned nil for worker \(workerId) — operating from project root")
+        }
+        if let cBranch = tm_worktree_branch(engine, workerId) {
+            workerBranches[workerId] = String(cString: cBranch)
+        } else {
+            Self.logger.warning("spawnWorker: tm_worktree_branch returned nil for worker \(workerId)")
+        }
+
         // Resolve role and register ownership patterns if roleId was provided.
         // Failure here is non-fatal — the worker still operates, just without
         // role-based ownership enforcement. The role is always cached when
@@ -428,6 +454,8 @@ final class EngineClient: ObservableObject {
 
         unregisterSurface(for: workerId)
         workerRoles.removeValue(forKey: workerId)
+        workerWorktrees.removeValue(forKey: workerId)
+        workerBranches.removeValue(forKey: workerId)
         refreshRoster()
         return true
     }
