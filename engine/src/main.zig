@@ -42,8 +42,11 @@ pub const Engine = struct {
     msg_cb: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int,
     msg_cb_userdata: ?*anyopaque,
     coordinator: coordinator_mod.Coordinator,
+    wt_registry: worktree_lifecycle.WorktreeRegistry,
     cmd_cb: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
     cmd_cb_userdata: ?*anyopaque,
+    last_wt_path_cstr: ?[*:0]u8,
+    last_wt_branch_cstr: ?[*:0]u8,
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
         const engine = try allocator.create(Engine);
@@ -73,8 +76,11 @@ pub const Engine = struct {
             .msg_cb = null,
             .msg_cb_userdata = null,
             .coordinator = coordinator_mod.Coordinator.init(allocator),
+            .wt_registry = worktree_lifecycle.WorktreeRegistry.init(allocator),
             .cmd_cb = null,
             .cmd_cb_userdata = null,
+            .last_wt_path_cstr = null,
+            .last_wt_branch_cstr = null,
         };
         return engine;
     }
@@ -88,11 +94,14 @@ pub const Engine = struct {
         self.coordinator.deinit();
         self.merge_coordinator.deinit();
         self.ownership_registry.deinit();
+        self.wt_registry.deinit();
         self.roster.deinit();
         if (self.cfg) |*c| c.deinit(self.allocator);
         if (self.last_error) |e| self.allocator.free(e);
         if (self.last_error_cstr) |c| self.allocator.free(std.mem.span(c));
         if (self.last_config_get_cstr) |c| self.allocator.free(std.mem.span(c));
+        if (self.last_wt_path_cstr) |c| self.allocator.free(std.mem.span(c));
+        if (self.last_wt_branch_cstr) |c| self.allocator.free(std.mem.span(c));
         self.allocator.free(self.project_root);
         self.allocator.destroy(self);
     }
@@ -312,7 +321,18 @@ export fn tm_config_get(engine: ?*Engine, key: ?[*:0]const u8) ?[*:0]const u8 {
 
 export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_type: c_int, worker_name: ?[*:0]const u8, task_description: ?[*:0]const u8) u32 {
     const e = engine orelse return 0xFFFFFFFF;
-    const id = e.roster.spawn(e.project_root, std.mem.span(agent_binary orelse return 0xFFFFFFFF), @enumFromInt(agent_type), std.mem.span(worker_name orelse return 0xFFFFFFFF), std.mem.span(task_description orelse return 0xFFFFFFFF)) catch |err| {
+    const td = std.mem.span(task_description orelse return 0xFFFFFFFF);
+
+    // Pre-allocate worker ID for lifecycle registry (peek at roster.next_id)
+    const upcoming_id = e.roster.next_id;
+
+    // Create worktree BEFORE roster spawn — graceful degradation on failure
+    const cfg_ptr: ?*const config.Config = if (e.cfg) |*c| c else null;
+    worktree_lifecycle.create(&e.wt_registry, cfg_ptr, e.project_root, upcoming_id, td) catch |err| {
+        std.log.warn("[teammux] worktree lifecycle create failed for worker {d}: {s}", .{ upcoming_id, @errorName(err) });
+    };
+
+    const id = e.roster.spawn(e.project_root, std.mem.span(agent_binary orelse return 0xFFFFFFFF), @enumFromInt(agent_type), std.mem.span(worker_name orelse return 0xFFFFFFFF), td) catch |err| {
         e.setError(switch (err) { error.GitFailed => "git worktree add failed", else => "worker spawn failed" }) catch {};
         return 0xFFFFFFFF;
     };
@@ -332,7 +352,51 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     }
     e.roster.dismiss(e.project_root, worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
     e.ownership_registry.release(worker_id);
+    // Remove lifecycle worktree AFTER roster dismiss
+    worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
     return 0;
+}
+
+// ─── Worktree lifecycle ──────────────────────────────────
+
+export fn tm_worktree_create(engine: ?*Engine, worker_id: u32, task_description: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const td = std.mem.span(task_description orelse return 7); // TM_ERR_CONFIG
+    const cfg_ptr: ?*const config.Config = if (e.cfg) |*c| c else null;
+    worktree_lifecycle.create(&e.wt_registry, cfg_ptr, e.project_root, worker_id, td) catch |err| {
+        e.setError(switch (err) {
+            error.GitFailed => "git worktree add failed",
+            error.NoHomeDir => "HOME not set, cannot resolve worktree root",
+            error.MkdirFailed => "failed to create worktree directory",
+            else => "worktree create failed",
+        }) catch {};
+        return 5; // TM_ERR_WORKTREE
+    };
+    return 0;
+}
+
+export fn tm_worktree_remove(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
+    return 0;
+}
+
+export fn tm_worktree_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
+    const e = engine orelse return null;
+    if (e.last_wt_path_cstr) |old| { e.allocator.free(std.mem.span(old)); e.last_wt_path_cstr = null; }
+    const path = worktree_lifecycle.getPath(&e.wt_registry, worker_id) orelse return null;
+    const z = e.allocator.dupeZ(u8, path) catch return null;
+    e.last_wt_path_cstr = z.ptr;
+    return z.ptr;
+}
+
+export fn tm_worktree_branch(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
+    const e = engine orelse return null;
+    if (e.last_wt_branch_cstr) |old| { e.allocator.free(std.mem.span(old)); e.last_wt_branch_cstr = null; }
+    const branch = worktree_lifecycle.getBranch(&e.wt_registry, worker_id) orelse return null;
+    const z = e.allocator.dupeZ(u8, branch) catch return null;
+    e.last_wt_branch_cstr = z.ptr;
+    return z.ptr;
 }
 export fn tm_roster_get(engine: ?*Engine) ?*CRoster {
     const e = engine orelse return null;
