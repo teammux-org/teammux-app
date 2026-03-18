@@ -18,6 +18,9 @@ struct RosterView: View {
                 isActive: activeWorkerId == nil,
                 onTap: {
                     activeWorkerId = nil
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        selectedDrawerWorkerId = nil
+                    }
                 }
             )
 
@@ -36,16 +39,12 @@ struct RosterView: View {
                                 branch: engine.workerBranches[worker.id],
                                 isActive: activeWorkerId == worker.id,
                                 onTap: {
-                                    if activeWorkerId == worker.id {
-                                        withAnimation(.easeInOut(duration: 0.2)) {
-                                            selectedDrawerWorkerId =
-                                                selectedDrawerWorkerId == worker.id ? nil : worker.id
-                                        }
-                                    } else {
-                                        activeWorkerId = worker.id
-                                        withAnimation(.easeInOut(duration: 0.2)) {
-                                            selectedDrawerWorkerId = worker.id
-                                        }
+                                    let alreadyActive = activeWorkerId == worker.id
+                                    activeWorkerId = worker.id
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        selectedDrawerWorkerId = alreadyActive && selectedDrawerWorkerId == worker.id
+                                            ? nil
+                                            : worker.id
                                     }
                                 },
                                 onDismiss: {

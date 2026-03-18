@@ -56,20 +56,15 @@ struct WorkerDetailDrawer: View {
     // MARK: - Role header
 
     private var roleHeader: some View {
-        HStack(spacing: 6) {
-            if let role = engine.workerRoles[worker.id] {
-                if !role.emoji.isEmpty {
-                    Text(role.emoji)
-                        .font(.system(size: 16))
-                }
-                Text(role.name)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
-            } else {
-                Text(worker.name)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
+        let role = engine.workerRoles[worker.id]
+        return HStack(spacing: 6) {
+            if let emoji = role?.emoji, !emoji.isEmpty {
+                Text(emoji)
+                    .font(.system(size: 16))
             }
+            Text(role?.name ?? worker.name)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
         }
     }
 
@@ -118,7 +113,7 @@ struct WorkerDetailDrawer: View {
 
                 Text(prEvent.status.label)
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(prEvent.status.color)
+                    .foregroundStyle(prEvent.status.color)
             }
 
             Text(prEvent.title)
@@ -141,18 +136,8 @@ struct WorkerDetailDrawer: View {
 
     // MARK: - Path abbreviation
 
-    /// Abbreviates a worktree path by replacing the home directory with ~
-    /// and showing only the last 3 path components if the path is long.
     private func abbreviatePath(_ path: String) -> String {
-        var display = path
-        if let home = ProcessInfo.processInfo.environment["HOME"] {
-            display = display.replacingOccurrences(of: home, with: "~")
-        }
-        let components = display.split(separator: "/")
-        if components.count > 4 {
-            let tail = components.suffix(3).joined(separator: "/")
-            return "~/\u{2026}/\(tail)"
-        }
-        return display
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.replacingOccurrences(of: home, with: "~")
     }
 }
