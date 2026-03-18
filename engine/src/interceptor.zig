@@ -15,9 +15,13 @@ const wrapper_file_name = "git";
 // ─────────────────────────────────────────────────────────
 
 /// Write a git wrapper script into {worktree_path}/.git-wrapper/git that
-/// intercepts `git add` (per-file deny checks, bulk-stage blocking) and
-/// `git commit -a/--all` (TD12) for denied file patterns. When deny_patterns
-/// is empty, writes a minimal pass-through wrapper.
+/// intercepts dangerous git subcommands for denied file patterns:
+/// - `git add` (per-file deny checks, bulk-stage blocking)
+/// - `git commit -a/--all` (blocks unstaged-file inclusion)
+/// - `git stash pop/apply` (blocks uncontrolled working-tree writes)
+/// - `git apply` (blocks patch application with write restrictions)
+/// - `git push main/master` (forces PR workflow via /teammux-pr-ready)
+/// When deny_patterns is empty, writes a minimal pass-through wrapper.
 ///
 /// The wrapper embeds deny patterns as a bash array and the write scope
 /// for actionable error messages. The real git binary path is resolved
@@ -179,7 +183,7 @@ fn generatePassthroughScript(allocator: std.mem.Allocator, real_git: []const u8)
 }
 
 /// Generate the full interceptor wrapper script with embedded deny patterns,
-/// subcommand detection, bulk-add blocking, and per-file checking.
+/// subcommand detection, and enforcement blocks for add/commit/stash/apply/push.
 /// All strings must be validated with isSafeForShell before calling.
 fn generateInterceptorScript(
     allocator: std.mem.Allocator,
@@ -664,8 +668,10 @@ test "interceptor - wrapper contains stash pop/apply interception block" {
 
     // Stash subcmd detection
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"stash\"") != null);
-    // Only pop and apply are blocked — push is not in the case pattern
+    // Only pop and apply are blocked — stash push (default stash action) passes through
     try std.testing.expect(std.mem.indexOf(u8, content, "pop|apply)") != null);
+    // Verify push is not added to the blocked stash subcommands
+    try std.testing.expect(std.mem.indexOf(u8, content, "pop|apply|push)") == null);
     // Error message uses $arg to show which stash subcommand was blocked
     try std.testing.expect(std.mem.indexOf(u8, content, "Cannot $arg stash with write restrictions") != null);
     // Guard: only blocks when deny patterns exist
@@ -693,6 +699,8 @@ test "interceptor - wrapper contains git apply interception block" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"apply\"") != null);
     // Blocks git apply entirely when deny patterns exist
     try std.testing.expect(std.mem.indexOf(u8, content, "Cannot git apply with write restrictions") != null);
+    // Guard: only blocks when deny patterns exist (parity with stash/commit blocks)
+    try std.testing.expect(std.mem.indexOf(u8, content, "${#DENY_PATTERNS[@]} -gt 0") != null);
 }
 
 test "interceptor - wrapper contains push-to-main interception block" {
@@ -714,8 +722,10 @@ test "interceptor - wrapper contains push-to-main interception block" {
 
     // Push subcmd detection
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"push\"") != null);
-    // Only main and master are blocked — teammux/* branches pass through
+    // Only literal "main" and "master" are blocked — all other branch names pass through
     try std.testing.expect(std.mem.indexOf(u8, content, "main|master)") != null);
+    // Verify case pattern is not expanded beyond main/master
+    try std.testing.expect(std.mem.indexOf(u8, content, "main|master|") == null);
     // Error message
     try std.testing.expect(std.mem.indexOf(u8, content, "Cannot push directly to main") != null);
     // Suggests PR workflow instead
