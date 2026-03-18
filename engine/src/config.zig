@@ -52,6 +52,7 @@ pub const Config = struct {
     workers: []WorkerConfig,
     github_token: ?[]const u8,
     bus_delivery: []const u8,
+    worktree_root: ?[]const u8 = null,
     fields_set: FieldsSet = .{},
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
@@ -71,6 +72,7 @@ pub const Config = struct {
         allocator.free(self.workers);
         if (self.github_token) |t| allocator.free(t);
         allocator.free(self.bus_delivery);
+        if (self.worktree_root) |wr| allocator.free(wr);
     }
 };
 
@@ -106,6 +108,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
     // Defaults
     var project_name: []const u8 = try allocator.dupe(u8, "");
     var project_github_repo: ?[]const u8 = null;
+    var worktree_root: ?[]const u8 = null;
     var tl_agent: AgentType = .claude_code;
     var tl_model: []const u8 = try allocator.dupe(u8, "claude-opus-4-6");
     var tl_permissions: []const u8 = try allocator.dupe(u8, "full");
@@ -121,6 +124,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
     errdefer {
         allocator.free(project_name);
         if (project_github_repo) |r| allocator.free(r);
+        if (worktree_root) |wr| allocator.free(wr);
         if (!replaced_tl_model) allocator.free(tl_model);
         if (!replaced_tl_permissions) allocator.free(tl_permissions);
         if (github_token) |t| allocator.free(t);
@@ -189,6 +193,9 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
                 } else if (std.mem.eql(u8, key, "github_repo")) {
                     if (project_github_repo) |old| allocator.free(old);
                     project_github_repo = try allocator.dupe(u8, val);
+                } else if (std.mem.eql(u8, key, "worktree_root")) {
+                    if (worktree_root) |old| allocator.free(old);
+                    worktree_root = try allocator.dupe(u8, val);
                 }
             },
             .team_lead => {
@@ -259,6 +266,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Confi
         .workers = try workers.toOwnedSlice(allocator),
         .github_token = github_token,
         .bus_delivery = bus_delivery,
+        .worktree_root = worktree_root,
         .fields_set = .{
             .tl_model = replaced_tl_model,
             .tl_permissions = replaced_tl_permissions,
@@ -772,6 +780,10 @@ pub fn loadWithOverrides(
             allocator.free(cfg.team_lead.permissions);
             cfg.team_lead.permissions = try allocator.dupe(u8, override_cfg.team_lead.permissions);
         }
+        if (override_cfg.worktree_root) |wr| {
+            if (cfg.worktree_root) |old| allocator.free(old);
+            cfg.worktree_root = try allocator.dupe(u8, wr);
+        }
     }
     return cfg;
 }
@@ -786,6 +798,7 @@ pub fn get(cfg: *const Config, dot_key: []const u8) ?[]const u8 {
     // project.*
     if (std.mem.eql(u8, dot_key, "project.name")) return cfg.project.name;
     if (std.mem.eql(u8, dot_key, "project.github_repo")) return cfg.project.github_repo;
+    if (std.mem.eql(u8, dot_key, "project.worktree_root")) return cfg.worktree_root;
 
     // team_lead.*
     if (std.mem.eql(u8, dot_key, "team_lead.model")) return cfg.team_lead.model;
@@ -1189,6 +1202,61 @@ test "config - load with missing override file" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("no-override", cfg.project.name);
+}
+
+test "config - worktree_root parsed and accessible via dot-key" {
+    const toml =
+        \\[project]
+        \\name = "wt-test"
+        \\worktree_root = "/custom/worktrees"
+    ;
+
+    var cfg = try parse(std.testing.allocator, toml);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/custom/worktrees", cfg.worktree_root.?);
+    try std.testing.expectEqualStrings("/custom/worktrees", get(&cfg, "project.worktree_root").?);
+}
+
+test "config - worktree_root defaults to null" {
+    const toml =
+        \\[project]
+        \\name = "no-wt"
+    ;
+
+    var cfg = try parse(std.testing.allocator, toml);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.worktree_root == null);
+    try std.testing.expect(get(&cfg, "project.worktree_root") == null);
+}
+
+test "config - worktree_root override merges correctly" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const base =
+        \\[project]
+        \\name = "wt-override"
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "config.toml", .data = base });
+
+    const override =
+        \\[project]
+        \\worktree_root = "/override/path"
+    ;
+    try tmp_dir.dir.writeFile(.{ .sub_path = "config.local.toml", .data = override });
+
+    const base_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "config.toml");
+    defer std.testing.allocator.free(base_path);
+    const override_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "config.local.toml");
+    defer std.testing.allocator.free(override_path);
+
+    var cfg = try loadWithOverrides(std.testing.allocator, base_path, override_path);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/override/path", cfg.worktree_root.?);
+    try std.testing.expectEqualStrings("wt-override", cfg.project.name);
 }
 
 // ─── TOML helper tests ───────────────────────────────────
