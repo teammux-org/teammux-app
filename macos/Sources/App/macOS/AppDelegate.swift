@@ -461,15 +461,21 @@ class AppDelegate: NSObject,
     }
 
     /// Persists session state for every open project.
-    /// Called from both resign-active and will-terminate to maximise
-    /// the chance that state is captured before the process exits.
-    /// AppKit lifecycle methods run on the main thread; assumeIsolated
+    /// Called from both `applicationDidResignActive` and `applicationWillTerminate`
+    /// to maximise the chance that state is captured before the process exits.
+    /// AppKit lifecycle methods run on the main thread; `assumeIsolated`
     /// bridges the concurrency annotation gap (safe on macOS 15+).
     private func saveAllSessions() {
         MainActor.assumeIsolated {
-            guard let pm = projectManager else { return }
+            guard let pm = projectManager else {
+                Self.logger.error("saveAllSessions: projectManager is nil — cannot persist sessions")
+                return
+            }
             for project in pm.projects {
-                guard let engine = pm.engine(for: project.id) else { continue }
+                guard let engine = pm.engine(for: project.id) else {
+                    Self.logger.error("saveAllSessions: no engine for project \(project.id) — session will not be saved")
+                    continue
+                }
                 SessionState.save(engine: engine, projectPath: project.path.path)
             }
         }

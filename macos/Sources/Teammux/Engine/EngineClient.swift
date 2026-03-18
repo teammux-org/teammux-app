@@ -503,14 +503,24 @@ final class EngineClient: ObservableObject {
     /// 2. Calls `spawnWorker` normally (engine handles worktree-already-exists gracefully)
     /// 3. Overrides `workerWorktrees` and `workerBranches` caches with saved snapshot values
     ///
+    /// Note: the engine assigns fresh worker IDs on spawn — snapshot IDs are not preserved.
+    /// An old-to-new ID mapping is built during the worker loop and used to remap
+    /// `workerPRs` and `dispatchHistory` entries to the new IDs.
+    ///
+    /// Completion history is intentionally not restored from the snapshot —
+    /// `sessionStart()` reloads it from the authoritative JSONL log.
+    ///
     /// After workers: merges snapshot dispatch events into `dispatchHistory` (dedup by
-    /// timestamp + targetWorkerId). Populates `workerPRs` from snapshot.
-    func restoreSession(_ snapshot: SessionSnapshot) {
+    /// timestamp + remapped targetWorkerId). Populates `workerPRs` from snapshot.
+    ///
+    /// Returns the number of workers that failed to restore (0 = full success).
+    @discardableResult
+    func restoreSession(_ snapshot: SessionSnapshot) -> Int {
         let fm = FileManager.default
         var skippedWorkers: [String] = []
+        var idMapping: [UInt32: UInt32] = [:]  // old snapshot ID → new engine ID
 
         for worker in snapshot.workers {
-            // Check worktree exists on disk
             guard fm.fileExists(atPath: worker.worktreePath) else {
                 Self.logger.warning("restoreSession: worktree missing at \(worker.worktreePath) — skipping worker \(worker.id) (\(worker.name))")
                 skippedWorkers.append(worker.name)
@@ -533,6 +543,8 @@ final class EngineClient: ObservableObject {
                 continue
             }
 
+            idMapping[worker.id] = workerId
+
             // Override caches with saved snapshot values (do not rely on
             // tm_worktree_path query — use saved paths directly).
             workerWorktrees[workerId] = worker.worktreePath
@@ -551,18 +563,21 @@ final class EngineClient: ObservableObject {
         }
 
         // Merge snapshot dispatch events into dispatchHistory.
-        // Deduplicate by timestamp + targetWorkerId — JSONL is source of
-        // truth for completion/question history; snapshot supplements
-        // dispatch events only (not persisted to JSONL).
+        // Remap targetWorkerId from snapshot IDs to new engine IDs.
+        // Deduplicate by timestamp + remapped targetWorkerId.
+        // Dispatch events are not persisted to JSONL — the snapshot is
+        // the only persistence mechanism for these.
         for entry in snapshot.dispatchHistoryEntries {
+            let newTargetId = idMapping[entry.targetWorkerId] ?? entry.targetWorkerId
+
             let isDuplicate = dispatchHistory.contains { existing in
-                existing.targetWorkerId == entry.targetWorkerId
+                existing.targetWorkerId == newTargetId
                     && existing.timestamp == entry.timestamp
             }
             guard !isDuplicate else { continue }
 
             dispatchHistory.append(DispatchEvent(
-                targetWorkerId: entry.targetWorkerId,
+                targetWorkerId: newTargetId,
                 instruction: entry.instruction,
                 timestamp: entry.timestamp,
                 delivered: entry.delivered,
@@ -573,11 +588,15 @@ final class EngineClient: ObservableObject {
         // Sort dispatch history by timestamp (oldest first) after merge
         dispatchHistory.sort { $0.timestamp < $1.timestamp }
 
-        // Populate workerPRs from snapshot
+        // Populate workerPRs from snapshot, remapping old IDs to new IDs
         for (key, prSnapshot) in snapshot.workerPRs {
-            guard let workerId = UInt32(key) else { continue }
-            workerPRs[workerId] = PREvent(
-                workerId: prSnapshot.workerId,
+            guard let oldId = UInt32(key) else {
+                Self.logger.warning("restoreSession: unparseable workerPR key '\(key)' — skipping PR event")
+                continue
+            }
+            let newId = idMapping[oldId] ?? oldId
+            workerPRs[newId] = PREvent(
+                workerId: newId,
                 branchName: prSnapshot.branchName,
                 prUrl: prSnapshot.prUrl,
                 title: prSnapshot.title,
@@ -593,6 +612,7 @@ final class EngineClient: ObservableObject {
         }
 
         Self.logger.info("restoreSession: restored \(snapshot.workers.count - skippedWorkers.count)/\(snapshot.workers.count) workers")
+        return skippedWorkers.count
     }
 
     /// Refresh the published roster from the engine.

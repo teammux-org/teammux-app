@@ -64,6 +64,15 @@ struct SetupView: View {
                                 step = .project
                             }
                         )
+                    } else {
+                        VStack(spacing: 12) {
+                            Text("No project selected.")
+                                .foregroundColor(.secondary)
+                            Button("Back to Project Selection") {
+                                step = .project
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
 
                 case .team:
@@ -271,6 +280,7 @@ struct RestoreCardView: View {
     // MARK: - Actions
 
     private func startFresh() {
+        SessionState.delete(projectPath: projectURL.path)
         onStartFresh()
     }
 
@@ -295,7 +305,10 @@ struct RestoreCardView: View {
 
         // Ensure config.toml exists (may have been written by previous session)
         if !fm.fileExists(atPath: configFile.path) {
-            let minimalConfig = "[project]\nname = \"\(projectURL.lastPathComponent)\"\n"
+            let escapedName = projectURL.lastPathComponent
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let minimalConfig = "[project]\nname = \"\(escapedName)\"\n"
             do {
                 try minimalConfig.write(to: configFile, atomically: true, encoding: .utf8)
             } catch {
@@ -333,10 +346,18 @@ struct RestoreCardView: View {
         }
 
         // Restore workers and state from snapshot
-        engine.restoreSession(snapshot)
+        let skippedCount = engine.restoreSession(snapshot)
 
-        // Delete session file after successful restore
-        SessionState.delete(projectPath: projectURL.path)
+        if skippedCount > 0 {
+            // Partial restore — keep session file so user can retry.
+            // Show warning but proceed (some workers were restored).
+            errorMessage = engine.lastError
+        }
+
+        // Delete session file only on full success
+        if skippedCount == 0 {
+            SessionState.delete(projectPath: projectURL.path)
+        }
 
         isRestoring = false
         onRestore()

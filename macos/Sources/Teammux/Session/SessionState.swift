@@ -6,7 +6,7 @@ import os
 
 /// Codable snapshot of a single worker for session persistence.
 /// All fields are `let` — this is a frozen point-in-time capture.
-struct WorkerSnapshot: Codable {
+struct WorkerSnapshot: Codable, Equatable {
     let id: UInt32
     let name: String
     let roleId: String?
@@ -14,13 +14,18 @@ struct WorkerSnapshot: Codable {
     let worktreePath: String
     let branchName: String
     let agentBinary: String
+    /// Raw C value for `AgentType` (`0` = claudeCode, `1` = codexCli, `99` = custom).
+    /// Stored as Int32 because `AgentType` has an associated value for `.custom`
+    /// and does not conform to `Codable`. The `agentBinary` field provides the
+    /// binary name needed to reconstruct `.custom` agents via
+    /// `AgentType(fromCValue:binaryName:)`.
     let agentTypeCValue: Int32
 }
 
 // MARK: - HistoryEntrySnapshot
 
 /// Codable snapshot of a completion/question history entry.
-struct HistoryEntrySnapshot: Codable {
+struct HistoryEntrySnapshot: Codable, Equatable {
     let type: HistoryEntryType
     let workerId: UInt32
     let roleId: String?
@@ -32,7 +37,7 @@ struct HistoryEntrySnapshot: Codable {
 // MARK: - DispatchEventSnapshot
 
 /// Codable snapshot of a dispatch event.
-struct DispatchEventSnapshot: Codable {
+struct DispatchEventSnapshot: Codable, Equatable {
     let targetWorkerId: UInt32
     let instruction: String
     let timestamp: Date
@@ -43,7 +48,7 @@ struct DispatchEventSnapshot: Codable {
 // MARK: - PREventSnapshot
 
 /// Codable snapshot of a PR event.
-struct PREventSnapshot: Codable {
+struct PREventSnapshot: Codable, Equatable {
     let workerId: UInt32
     let branchName: String
     let prUrl: String
@@ -54,9 +59,14 @@ struct PREventSnapshot: Codable {
 
 // MARK: - SessionSnapshot
 
-/// Top-level session snapshot. Contains all five persisted items:
-/// roster, worktree paths, completion history, dispatch history, PR signals.
-struct SessionSnapshot: Codable {
+/// Top-level session snapshot. Persists four collections:
+/// - `workers` — worker roster with embedded worktree paths and role assignments
+/// - `completionHistoryEntries` — saved for offline inspection; not restored at
+///   load time (the JSONL log loaded by `sessionStart()` is the source of truth)
+/// - `dispatchHistoryEntries` — the only persistence mechanism for dispatch events
+/// - `workerPRs` — PR status per worker
+struct SessionSnapshot: Codable, Equatable {
+    let schemaVersion: Int
     let projectPath: String
     let timestamp: Date
     let workers: [WorkerSnapshot]
@@ -71,11 +81,14 @@ struct SessionSnapshot: Codable {
 ///
 /// Persistence path: `~/.teammux/sessions/{SHA256(projectPath)}.json`
 ///
-/// Save is triggered by `applicationWillResignActive` and `applicationWillTerminate`.
+/// Save is triggered by `applicationDidResignActive` and `applicationWillTerminate`.
 /// Load is triggered by `SetupView` on project selection.
 enum SessionState {
 
     private static let logger = Logger(subsystem: "com.teammux.app", category: "SessionState")
+
+    /// Current schema version. Increment when the snapshot format changes.
+    static let currentSchemaVersion = 1
 
     // MARK: - Path computation
 
@@ -103,7 +116,7 @@ enum SessionState {
     // MARK: - Save
 
     /// Snapshots the current engine state and writes it to disk.
-    /// Non-fatal on failure — logs a warning and returns.
+    /// Non-fatal on failure — logs an error and returns.
     @MainActor
     static func save(engine: EngineClient, projectPath: String) {
         guard engine.projectRoot != nil else {
@@ -125,7 +138,8 @@ enum SessionState {
             )
         }
 
-        // Snapshot completion history
+        // Snapshot completion history (persisted for offline inspection;
+        // not restored at load time — JSONL log is source of truth)
         let historySnapshots: [HistoryEntrySnapshot] = engine.completionHistory.map { entry in
             HistoryEntrySnapshot(
                 type: entry.type,
@@ -162,6 +176,7 @@ enum SessionState {
         }
 
         let snapshot = SessionSnapshot(
+            schemaVersion: currentSchemaVersion,
             projectPath: projectPath,
             timestamp: Date(),
             workers: workerSnapshots,
@@ -186,7 +201,7 @@ enum SessionState {
             try data.write(to: filePath, options: .atomic)
             logger.info("save: session saved to \(filePath.path) (\(workerSnapshots.count) workers)")
         } catch {
-            logger.warning("save: failed to write session file — \(error.localizedDescription)")
+            logger.error("save: FAILED to persist session — \(error.localizedDescription)")
         }
     }
 
@@ -194,6 +209,8 @@ enum SessionState {
 
     /// Loads a session snapshot from disk for the given project path.
     /// Returns `nil` if no session file exists or if the file is corrupt.
+    /// Corrupt files are removed to prevent repeated decode failures on
+    /// every subsequent project selection.
     static func load(projectPath: String) -> SessionSnapshot? {
         let filePath = sessionFilePath(for: projectPath)
         guard FileManager.default.fileExists(atPath: filePath.path) else {
@@ -208,7 +225,8 @@ enum SessionState {
             logger.info("load: session loaded from \(filePath.path) (\(snapshot.workers.count) workers)")
             return snapshot
         } catch {
-            logger.warning("load: failed to decode session file at \(filePath.path) — \(error.localizedDescription)")
+            logger.error("load: corrupt session file at \(filePath.path) — \(error.localizedDescription). Removing to prevent repeated failures.")
+            try? FileManager.default.removeItem(at: filePath)
             return nil
         }
     }
@@ -216,18 +234,21 @@ enum SessionState {
     // MARK: - Delete
 
     /// Removes the session file for the given project path.
-    /// Non-fatal on failure — logs a warning and returns.
-    static func delete(projectPath: String) {
+    /// Returns `true` on success (or if no file existed).
+    @discardableResult
+    static func delete(projectPath: String) -> Bool {
         let filePath = sessionFilePath(for: projectPath)
         guard FileManager.default.fileExists(atPath: filePath.path) else {
-            return
+            return true
         }
 
         do {
             try FileManager.default.removeItem(at: filePath)
             logger.info("delete: session file removed at \(filePath.path)")
+            return true
         } catch {
-            logger.warning("delete: failed to remove session file at \(filePath.path) — \(error.localizedDescription)")
+            logger.error("delete: failed to remove session file at \(filePath.path) — \(error.localizedDescription)")
+            return false
         }
     }
 }
