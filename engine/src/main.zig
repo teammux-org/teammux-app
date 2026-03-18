@@ -557,23 +557,30 @@ export fn tm_github_create_pr(engine: ?*Engine, worker_id: u32, title: ?[*:0]con
         return null;
     };
     const alloc = e.allocator;
-    const title_slice = std.mem.span(title orelse return null);
-    const body_slice = std.mem.span(body orelse return null);
+    const title_slice = std.mem.span(title orelse {
+        e.setError("PR creation failed: title is NULL") catch {};
+        return null;
+    });
+    const body_slice = std.mem.span(body orelse {
+        e.setError("PR creation failed: body is NULL") catch {};
+        return null;
+    });
     const branch_name = w.branch_name;
     const pr = e.github_client.createPr(alloc, branch_name, title_slice, body_slice) catch {
         e.setError("PR creation failed: gh CLI error") catch {};
-        // Route TM_MSG_ERROR through bus on failure
         routePrError(e, worker_id, "gh pr create failed");
         return null;
     };
+
+    // Route TM_MSG_PR_READY=14 through bus immediately after creation succeeds.
+    // Done before C struct allocation so bus notification is not lost if alloc fails.
+    routePrReady(e, worker_id, pr.url, branch_name, title_slice);
+
     const c_pr = alloc.create(CPr) catch return null;
     const url_z = alloc.dupeZ(u8, pr.url) catch { alloc.destroy(c_pr); return null; };
     const title_z = alloc.dupeZ(u8, pr.title) catch { alloc.free(url_z); alloc.destroy(c_pr); return null; };
     const diff_z = alloc.dupeZ(u8, pr.diff_url) catch { alloc.free(title_z); alloc.free(url_z); alloc.destroy(c_pr); return null; };
     c_pr.* = .{ .pr_number = pr.pr_number, .pr_url = url_z.ptr, .title = title_z.ptr, .state = 0, .diff_url = diff_z.ptr, .worker_id = worker_id };
-
-    // Route TM_MSG_PR_READY=14 through bus (best-effort — PR was already created)
-    routePrReady(e, worker_id, pr.url, branch_name, title_slice);
 
     alloc.free(pr.url); alloc.free(pr.title); alloc.free(pr.state); alloc.free(pr.diff_url);
     return c_pr;
@@ -868,11 +875,18 @@ fn handlePrReadyCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
 }
 
 /// Route TM_MSG_PR_READY=14 through the bus after successful PR creation.
+/// Best-effort — the PR already exists on GitHub regardless of bus delivery.
 fn routePrReady(engine: *Engine, worker_id: u32, pr_url: []const u8, branch: []const u8, title_slice: []const u8) void {
-    var b = &(engine.message_bus orelse return);
+    var b = &(engine.message_bus orelse {
+        std.log.warn("[teammux] routePrReady: bus not initialized, TM_MSG_PR_READY for worker {d} dropped", .{worker_id});
+        return;
+    });
     const payload = std.fmt.allocPrint(engine.allocator,
         \\{{"worker_id":{d},"pr_url":"{s}","branch":"{s}","title":"{s}"}}
-    , .{ worker_id, pr_url, branch, title_slice }) catch return;
+    , .{ worker_id, pr_url, branch, title_slice }) catch {
+        std.log.warn("[teammux] routePrReady: payload allocation failed for worker {d}", .{worker_id});
+        return;
+    };
     defer engine.allocator.free(payload);
     b.send(0, worker_id, .pr_ready, payload) catch |err| {
         std.log.warn("[teammux] TM_MSG_PR_READY bus send failed: {s}", .{@errorName(err)});
@@ -881,12 +895,20 @@ fn routePrReady(engine: *Engine, worker_id: u32, pr_url: []const u8, branch: []c
 
 /// Route TM_MSG_ERROR through the bus when PR creation fails.
 fn routePrError(engine: *Engine, worker_id: u32, message: []const u8) void {
-    var b = &(engine.message_bus orelse return);
+    var b = &(engine.message_bus orelse {
+        std.log.warn("[teammux] routePrError: bus not initialized, TM_MSG_ERROR for worker {d} dropped", .{worker_id});
+        return;
+    });
     const payload = std.fmt.allocPrint(engine.allocator,
         \\{{"worker_id":{d},"error":"{s}"}}
-    , .{ worker_id, message }) catch return;
+    , .{ worker_id, message }) catch {
+        std.log.warn("[teammux] routePrError: payload allocation failed for worker {d}", .{worker_id});
+        return;
+    };
     defer engine.allocator.free(payload);
-    b.send(0, worker_id, .err, payload) catch {};
+    b.send(0, worker_id, .err, payload) catch |err| {
+        std.log.warn("[teammux] TM_MSG_ERROR bus send failed for worker {d}: {s}", .{ worker_id, @errorName(err) });
+    };
 }
 
 /// Extract a quoted string value for a given key from JSON.

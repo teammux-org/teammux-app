@@ -355,44 +355,80 @@ pub const GitHubClient = struct {
     /// Route a PullRequestEvent as TM_MSG_PR_STATUS=15 through the bus.
     /// Extracts PR status, URL, and worker ID from the event payload.
     fn routePrStatusEvent(self: *GitHubClient, allocator: std.mem.Allocator, event: std.json.Value, branch: []const u8) void {
-        const send_fn = self.bus_send_fn orelse return;
+        const send_fn = self.bus_send_fn orelse return; // Feature not wired — acceptable silent return
 
         const obj = switch (event) {
             .object => |o| o,
-            else => return,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: event is not an object", .{});
+                return;
+            },
         };
-        const payload_obj = switch (obj.get("payload") orelse return) {
+        const payload_obj = switch (obj.get("payload") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing payload in PullRequestEvent", .{});
+            return;
+        }) {
             .object => |o| o,
-            else => return,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: payload is not an object", .{});
+                return;
+            },
         };
 
         // Determine status from action + merged flag
-        const action = switch (payload_obj.get("action") orelse return) {
+        const action = switch (payload_obj.get("action") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing action in PullRequestEvent", .{});
+            return;
+        }) {
             .string => |s| s,
-            else => return,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: action is not a string", .{});
+                return;
+            },
         };
-        const status = mapPrAction(payload_obj, action) orelse return;
+        const status = mapPrAction(payload_obj, action) orelse return; // Irrelevant action (e.g. "labeled") — acceptable silent skip
 
         // Extract PR URL from payload.pull_request.html_url
-        const pr_obj = switch (payload_obj.get("pull_request") orelse return) {
+        const pr_obj = switch (payload_obj.get("pull_request") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing pull_request object", .{});
+            return;
+        }) {
             .object => |o| o,
-            else => return,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: pull_request is not an object", .{});
+                return;
+            },
         };
-        const pr_url = switch (pr_obj.get("html_url") orelse return) {
+        const pr_url = switch (pr_obj.get("html_url") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing html_url in pull_request", .{});
+            return;
+        }) {
             .string => |s| s,
-            else => return,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: html_url is not a string", .{});
+                return;
+            },
         };
 
         // Extract worker ID from branch name
-        const worker_id = extractWorkerIdFromBranch(branch) orelse return;
+        const worker_id = extractWorkerIdFromBranch(branch) orelse {
+            std.log.warn("[teammux] routePrStatusEvent: cannot extract worker_id from branch '{s}'", .{branch});
+            return;
+        };
 
         // Build payload JSON: {"pr_url":"...","status":"...","worker_id":N}
         const payload_json = std.fmt.allocPrint(allocator,
             \\{{"pr_url":"{s}","status":"{s}","worker_id":{d}}}
-        , .{ pr_url, status, worker_id }) catch return;
+        , .{ pr_url, status, worker_id }) catch {
+            std.log.warn("[teammux] routePrStatusEvent: payload allocation failed", .{});
+            return;
+        };
         defer allocator.free(payload_json);
 
-        const payload_z = allocator.dupeZ(u8, payload_json) catch return;
+        const payload_z = allocator.dupeZ(u8, payload_json) catch {
+            std.log.warn("[teammux] routePrStatusEvent: payload dupeZ failed", .{});
+            return;
+        };
         defer allocator.free(payload_z);
 
         const rc = send_fn(0, worker_id, @intFromEnum(bus.MessageType.pr_status), payload_z.ptr, self.bus_send_userdata);
