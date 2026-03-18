@@ -1286,6 +1286,62 @@ fn freeCOwnershipEntry(ptr: ?*COwnershipEntry) void {
     std.heap.c_allocator.destroy(entry);
 }
 
+export fn tm_ownership_update(
+    engine: ?*Engine,
+    worker_id: u32,
+    write_patterns: ?[*]const ?[*:0]const u8,
+    write_count: u32,
+    deny_patterns: ?[*]const ?[*:0]const u8,
+    deny_count: u32,
+) c_int {
+    const e = engine orelse return 99;
+
+    // Convert C string arrays to Zig slices
+    const write_slices = e.allocator.alloc([]const u8, write_count) catch {
+        e.setError("tm_ownership_update: allocation failed") catch {};
+        return 14; // TM_ERR_OWNERSHIP
+    };
+    defer e.allocator.free(write_slices);
+
+    const deny_slices = e.allocator.alloc([]const u8, deny_count) catch {
+        e.setError("tm_ownership_update: allocation failed") catch {};
+        return 14;
+    };
+    defer e.allocator.free(deny_slices);
+
+    if (write_count > 0) {
+        const w_ptrs = write_patterns orelse {
+            e.setError("tm_ownership_update: write_patterns NULL with non-zero count") catch {};
+            return 14;
+        };
+        for (0..write_count) |i| {
+            write_slices[i] = std.mem.span(w_ptrs[i] orelse {
+                e.setError("tm_ownership_update: NULL write pattern") catch {};
+                return 14;
+            });
+        }
+    }
+
+    if (deny_count > 0) {
+        const d_ptrs = deny_patterns orelse {
+            e.setError("tm_ownership_update: deny_patterns NULL with non-zero count") catch {};
+            return 14;
+        };
+        for (0..deny_count) |i| {
+            deny_slices[i] = std.mem.span(d_ptrs[i] orelse {
+                e.setError("tm_ownership_update: NULL deny pattern") catch {};
+                return 14;
+            });
+        }
+    }
+
+    e.ownership_registry.updateWorkerRules(worker_id, write_slices, deny_slices) catch {
+        e.setError("tm_ownership_update: update failed") catch {};
+        return 14;
+    };
+    return 0;
+}
+
 // ─── Git interceptor ─────────────────────────────────────
 
 export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {

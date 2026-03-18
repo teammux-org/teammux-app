@@ -491,6 +491,16 @@ tm_ownership_entry_t** tm_ownership_get(tm_engine_t* engine,
 // Free entries returned by tm_ownership_get.
 void tm_ownership_free(tm_ownership_entry_t** entries, uint32_t count);
 
+// Atomically replace all ownership rules for a worker. Removes old
+// entries and inserts new write/deny patterns. On allocation failure,
+// old rules are preserved unchanged. Does NOT reinstall the interceptor —
+// callers must call tm_interceptor_install separately if needed.
+// Called internally by hot-reload; also available for programmatic updates.
+tm_result_t tm_ownership_update(tm_engine_t* engine,
+                                  uint32_t worker_id,
+                                  const char** write_patterns, uint32_t write_count,
+                                  const char** deny_patterns, uint32_t deny_count);
+
 // -----------------------------------------------------------------
 // Git interceptor
 // -----------------------------------------------------------------
