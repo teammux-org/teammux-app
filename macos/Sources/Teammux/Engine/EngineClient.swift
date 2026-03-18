@@ -416,6 +416,8 @@ final class EngineClient: ObservableObject {
                     Self.logger.error("spawnWorker: cleanup dismiss failed for worker \(workerId): \(dismissMsg)")
                 }
                 workerRoles.removeValue(forKey: workerId)
+                workerWorktrees.removeValue(forKey: workerId)
+                workerBranches.removeValue(forKey: workerId)
                 worktreeReadyQueue.removeAll { $0.id == workerId }
                 refreshRoster()
                 return 0
