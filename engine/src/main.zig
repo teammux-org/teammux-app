@@ -662,6 +662,7 @@ fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         return;
     }
 
+    // Validate message field exists (value not needed — we forward raw args as payload)
     _ = extractJsonStringValue(args, "message") orelse {
         std.log.warn("[teammux] /teammux-ask: missing message", .{});
         return;
@@ -715,6 +716,7 @@ fn handleDelegationCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         return;
     }
 
+    // Validate task field exists (value not needed — we forward raw args as payload)
     _ = extractJsonStringValue(args, "task") orelse {
         std.log.warn("[teammux] /teammux-delegate: missing task", .{});
         return;
@@ -905,7 +907,6 @@ export fn tm_peer_question(engine: ?*Engine, from_id: u32, target_id: u32, messa
         e.setError("tm_peer_question: message is NULL") catch {};
         return 99;
     });
-    _ = msg;
 
     if (from_id == target_id) {
         e.setError("tm_peer_question: cannot ask yourself") catch {};
@@ -922,15 +923,21 @@ export fn tm_peer_question(engine: ?*Engine, from_id: u32, target_id: u32, messa
     });
 
     // Build payload JSON: {"worker_id": from, "target_worker_id": target, "message": "..."}
+    const msg_esc = jsonEscape(std.heap.c_allocator, msg) catch {
+        e.setError("tm_peer_question: payload allocation failed") catch {};
+        return 99;
+    };
+    defer std.heap.c_allocator.free(msg_esc);
+
     const payload = std.fmt.allocPrint(std.heap.c_allocator,
         \\{{"worker_id":{d},"target_worker_id":{d},"message":"{s}"}}
-    , .{ from_id, target_id, std.mem.span(message.?) }) catch {
+    , .{ from_id, target_id, msg_esc }) catch {
         e.setError("tm_peer_question: payload allocation failed") catch {};
         return 99;
     };
     defer std.heap.c_allocator.free(payload);
 
-    // Route to Team Lead (worker 0)
+    // Route to Team Lead (worker 0) — Team Lead relays to target
     b.send(0, from_id, .peer_question, payload) catch |err| {
         e.setError(if (err == error.DeliveryFailed) "peer question delivery failed" else "peer question bus send failed") catch {};
         return 8; // TM_ERR_BUS
@@ -944,7 +951,6 @@ export fn tm_peer_delegate(engine: ?*Engine, from_id: u32, target_id: u32, task:
         e.setError("tm_peer_delegate: task is NULL") catch {};
         return 99;
     });
-    _ = tsk;
 
     if (from_id == target_id) {
         e.setError("tm_peer_delegate: cannot delegate to yourself") catch {};
@@ -961,9 +967,15 @@ export fn tm_peer_delegate(engine: ?*Engine, from_id: u32, target_id: u32, task:
     });
 
     // Build payload JSON: {"worker_id": from, "target_worker_id": target, "task": "..."}
+    const tsk_esc = jsonEscape(std.heap.c_allocator, tsk) catch {
+        e.setError("tm_peer_delegate: payload allocation failed") catch {};
+        return 99;
+    };
+    defer std.heap.c_allocator.free(tsk_esc);
+
     const payload = std.fmt.allocPrint(std.heap.c_allocator,
         \\{{"worker_id":{d},"target_worker_id":{d},"task":"{s}"}}
-    , .{ from_id, target_id, std.mem.span(task.?) }) catch {
+    , .{ from_id, target_id, tsk_esc }) catch {
         e.setError("tm_peer_delegate: payload allocation failed") catch {};
         return 99;
     };
@@ -3409,11 +3421,14 @@ test "/teammux-ask routes to Team Lead PTY (worker 0), not target" {
         var to_id: u32 = 99;
         var from_id: u32 = 99;
         var msg_type: c_int = -1;
+        var payload_buf: [512]u8 = undefined;
+        var payload_len: usize = 0;
     };
     BusState.called = false;
     BusState.to_id = 99;
     BusState.from_id = 99;
     BusState.msg_type = -1;
+    BusState.payload_len = 0;
 
     const cb = struct {
         fn f(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
@@ -3422,6 +3437,12 @@ test "/teammux-ask routes to Team Lead PTY (worker 0), not target" {
                 BusState.to_id = m.to;
                 BusState.from_id = m.from;
                 BusState.msg_type = m.msg_type;
+                if (m.payload) |p| {
+                    const slice = std.mem.span(p);
+                    const len = @min(slice.len, BusState.payload_buf.len);
+                    @memcpy(BusState.payload_buf[0..len], slice[0..len]);
+                    BusState.payload_len = len;
+                }
             }
             return 0;
         }
@@ -3441,6 +3462,8 @@ test "/teammux-ask routes to Team Lead PTY (worker 0), not target" {
     try std.testing.expect(BusState.to_id == 0); // Team Lead
     try std.testing.expect(BusState.from_id == 2); // sender
     try std.testing.expect(BusState.msg_type == @intFromEnum(bus.MessageType.peer_question));
+    // Verify payload contains the message text
+    try std.testing.expect(std.mem.indexOf(u8, BusState.payload_buf[0..BusState.payload_len], "how should I handle auth?") != null);
 }
 
 test "/teammux-delegate routes directly to target worker PTY" {
@@ -3467,11 +3490,14 @@ test "/teammux-delegate routes directly to target worker PTY" {
         var to_id: u32 = 99;
         var from_id: u32 = 99;
         var msg_type: c_int = -1;
+        var payload_buf: [512]u8 = undefined;
+        var payload_len: usize = 0;
     };
     BusState.called = false;
     BusState.to_id = 99;
     BusState.from_id = 99;
     BusState.msg_type = -1;
+    BusState.payload_len = 0;
 
     const cb = struct {
         fn f(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
@@ -3480,6 +3506,12 @@ test "/teammux-delegate routes directly to target worker PTY" {
                 BusState.to_id = m.to;
                 BusState.from_id = m.from;
                 BusState.msg_type = m.msg_type;
+                if (m.payload) |p| {
+                    const slice = std.mem.span(p);
+                    const len = @min(slice.len, BusState.payload_buf.len);
+                    @memcpy(BusState.payload_buf[0..len], slice[0..len]);
+                    BusState.payload_len = len;
+                }
             }
             return 0;
         }
@@ -3499,6 +3531,8 @@ test "/teammux-delegate routes directly to target worker PTY" {
     try std.testing.expect(BusState.to_id == 7); // target worker directly
     try std.testing.expect(BusState.from_id == 3); // sender
     try std.testing.expect(BusState.msg_type == @intFromEnum(bus.MessageType.delegation));
+    // Verify payload contains the task text
+    try std.testing.expect(std.mem.indexOf(u8, BusState.payload_buf[0..BusState.payload_len], "write unit tests for auth") != null);
 }
 
 test "/teammux-ask invalid target_worker_id does not send" {
@@ -3603,6 +3637,107 @@ test "/teammux-ask null args does not crash" {
     defer alloc.free(cmd_z);
 
     // Pass null args — should log warning and return, not crash
+    commandRoutingCallback(cmd_z.ptr, null, e);
+}
+
+test "/teammux-delegate invalid target_worker_id does not send" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "delbad1", root);
+
+    try e.roster.workers.put(3, try coordinator_mod.makeTestWorker(alloc, 3));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 3, \"target_worker_id\": 99, \"task\": \"missing worker\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-delegate self-targeting does not send" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "delself", root);
+
+    try e.roster.workers.put(3, try coordinator_mod.makeTestWorker(alloc, 3));
+
+    const BusState = struct {
+        var called: bool = false;
+    };
+    BusState.called = false;
+
+    const cb = struct {
+        fn f(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            BusState.called = true;
+            return 0;
+        }
+    }.f;
+
+    e.message_bus.?.subscribe(cb, null);
+
+    const args_json = "{\"worker_id\": 3, \"target_worker_id\": 3, \"task\": \"self delegate\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    try std.testing.expect(!BusState.called);
+}
+
+test "/teammux-delegate null args does not crash" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
+    defer alloc.free(cmd_z);
+
     commandRoutingCallback(cmd_z.ptr, null, e);
 }
 

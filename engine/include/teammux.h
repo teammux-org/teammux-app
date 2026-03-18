@@ -439,8 +439,9 @@ void tm_question_free(tm_question_t* question);
 
 // Send a peer question from one worker to another, routed via Team Lead
 // (worker 0). Creates TM_MSG_PEER_QUESTION message, routes through bus
-// to Team Lead PTY. Returns TM_ERR_INVALID_WORKER if target_id is not
-// in roster or equals from_id. Returns TM_ERR_BUS if bus not initialized.
+// to Team Lead PTY. Returns TM_ERR_UNKNOWN if engine or message is NULL.
+// Returns TM_ERR_INVALID_WORKER if target_id is not in roster or equals
+// from_id. Returns TM_ERR_BUS if bus not initialized.
 tm_result_t tm_peer_question(tm_engine_t* engine,
                               uint32_t from_id,
                               uint32_t target_id,
@@ -448,6 +449,7 @@ tm_result_t tm_peer_question(tm_engine_t* engine,
 
 // Delegate a task directly to a target worker. Creates TM_MSG_DELEGATION
 // message, routes through bus directly to target worker PTY.
+// Returns TM_ERR_UNKNOWN if engine or task is NULL.
 // Returns TM_ERR_INVALID_WORKER if target_id is not in roster or equals
 // from_id. Returns TM_ERR_BUS if bus not initialized.
 tm_result_t tm_peer_delegate(tm_engine_t* engine,
