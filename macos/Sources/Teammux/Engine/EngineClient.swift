@@ -89,6 +89,12 @@ final class EngineClient: ObservableObject {
     /// `WorkerTerminalView` uses this to show a transient banner overlay.
     @Published var hotReloadedWorkers: Set<UInt32> = []
 
+    /// Dispatch history from the Team Lead coordinator. Ordered
+    /// chronologically; when more than 100 events exist, the oldest are
+    /// trimmed. Updated by `refreshDispatchHistory()` after each dispatch
+    /// and available for UI refresh (e.g. when the Dispatch tab appears).
+    @Published var dispatchHistory: [DispatchEvent] = []
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -258,6 +264,7 @@ final class EngineClient: ObservableObject {
         for (_, task) in hotReloadTimers { task.cancel() }
         hotReloadTimers.removeAll()
         hotReloadedWorkers.removeAll()
+        dispatchHistory.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -1556,6 +1563,124 @@ final class EngineClient: ObservableObject {
         if workerQuestions.removeValue(forKey: workerId) == nil {
             Self.logger.warning("clearQuestion: no active question for worker \(workerId)")
         }
+    }
+
+    // MARK: - Coordinator
+
+    /// Dispatch a task instruction to a specific worker.
+    /// Wraps `tm_dispatch_task()`. Returns `true` if the engine accepted the dispatch.
+    /// On failure, sets `lastError` with a diagnostic message.
+    /// On success, refreshes `dispatchHistory` from the engine.
+    func dispatchTask(workerId: UInt32, instruction: String) -> Bool {
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("dispatchTask: engine not created")
+            return false
+        }
+
+        let result = instruction.withCString { cInstruction in
+            tm_dispatch_task(engine, workerId, cInstruction)
+        }
+
+        guard result == TM_OK else {
+            let msg = lastEngineError() ?? "tm_dispatch_task failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("dispatchTask failed for worker \(workerId): \(msg)")
+            return false
+        }
+
+        refreshDispatchHistory()
+        Self.logger.info("dispatchTask: dispatched to worker \(workerId)")
+        return true
+    }
+
+    /// Dispatch a response to a specific worker (e.g. answering a question).
+    /// Wraps `tm_dispatch_response()`. Returns `true` if the engine accepted the dispatch.
+    /// On failure, sets `lastError` with a diagnostic message.
+    /// On success, refreshes `dispatchHistory` from the engine.
+    func dispatchResponse(workerId: UInt32, response: String) -> Bool {
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("dispatchResponse: engine not created")
+            return false
+        }
+
+        let result = response.withCString { cResponse in
+            tm_dispatch_response(engine, workerId, cResponse)
+        }
+
+        guard result == TM_OK else {
+            let msg = lastEngineError() ?? "tm_dispatch_response failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("dispatchResponse failed for worker \(workerId): \(msg)")
+            return false
+        }
+
+        refreshDispatchHistory()
+        Self.logger.info("dispatchResponse: dispatched to worker \(workerId)")
+        return true
+    }
+
+    /// Refresh `dispatchHistory` from the engine's coordinator.
+    /// Wraps `tm_dispatch_history()` (and `tm_dispatch_history_free()` when
+    /// the engine returns a non-NULL result). On failure, sets `lastError`.
+    /// Called internally after each dispatch; also available for UI refresh
+    /// (e.g. when the Dispatch tab appears).
+    func refreshDispatchHistory() {
+        guard let engine else {
+            Self.logger.warning("refreshDispatchHistory: engine not created")
+            return
+        }
+
+        var count: UInt32 = 0
+        guard let eventsPtr = tm_dispatch_history(engine, &count) else {
+            if let msg = lastEngineError() {
+                lastError = msg
+                Self.logger.error("refreshDispatchHistory: tm_dispatch_history failed: \(msg)")
+            } else {
+                Self.logger.info("refreshDispatchHistory: no dispatch history")
+            }
+            dispatchHistory = []
+            return
+        }
+
+        guard count > 0 else {
+            tm_dispatch_history_free(eventsPtr, count)
+            dispatchHistory = []
+            return
+        }
+
+        var events: [DispatchEvent] = []
+        for i in 0..<Int(count) {
+            guard let ptr = eventsPtr[i] else {
+                Self.logger.warning("refreshDispatchHistory: NULL event at index \(i) of \(count) — skipping")
+                continue
+            }
+            let instruction: String = {
+                guard let p = ptr.pointee.instruction, p.pointee != 0 else {
+                    Self.logger.warning("refreshDispatchHistory: NULL instruction at index \(i)")
+                    return ""
+                }
+                return String(cString: p)
+            }()
+            let event = DispatchEvent(
+                targetWorkerId: ptr.pointee.target_worker_id,
+                instruction: instruction,
+                timestamp: Date(timeIntervalSince1970: TimeInterval(ptr.pointee.timestamp)),
+                delivered: ptr.pointee.delivered,
+                kind: DispatchKind(rawValue: ptr.pointee.kind) ?? .task
+            )
+            events.append(event)
+        }
+
+        tm_dispatch_history_free(eventsPtr, count)
+
+        // Defensive cap — engine caps at 100 internally, but enforce here too.
+        if events.count > 100 {
+            events = Array(events.suffix(100))
+        }
+
+        dispatchHistory = events
     }
 
     // MARK: - Private: Coordination handlers
