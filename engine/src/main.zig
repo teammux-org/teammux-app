@@ -3264,10 +3264,10 @@ test "S12 integration: tm_interceptor_install blocks git commit -a (S1 fix)" {
     try std.testing.expect(std.mem.indexOf(u8, content, "Cannot stage all files") != null);
 }
 
-test "S12 integration: tm_dispatch_task routes through bus to subscriber (S5/S8 path)" {
+test "S12 integration: tm_dispatch_task routes through bus to subscriber (S5 path)" {
     // Verifies the full dispatch path: tm_dispatch_task C API export →
     // coordinator.dispatchTask → message bus → subscriber callback.
-    // This is the S5 (coordinator engine) + S8 (Swift bridge boundary) path.
+    // This is the S5 (coordinator engine) path through the C API boundary.
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});

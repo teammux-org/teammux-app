@@ -15,7 +15,8 @@ const wrapper_file_name = "git";
 // ─────────────────────────────────────────────────────────
 
 /// Write a git wrapper script into {worktree_path}/.git-wrapper/git that
-/// intercepts `git add` and blocks denied file patterns. When deny_patterns
+/// intercepts `git add` (per-file deny checks, bulk-stage blocking) and
+/// `git commit -a/--all` (TD12) for denied file patterns. When deny_patterns
 /// is empty, writes a minimal pass-through wrapper.
 ///
 /// The wrapper embeds deny patterns as a bash array and the write scope
