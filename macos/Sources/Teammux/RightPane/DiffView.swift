@@ -9,7 +9,7 @@ import SwiftUI
 struct DiffView: View {
     @ObservedObject var engine: EngineClient
 
-    @State private var selectedWorkerId: UInt32? = nil
+    @Binding var selectedWorkerId: UInt32?
     @State private var diffFiles: [DiffFile] = []
     @State private var isLoading = false
     @State private var diffError: String?

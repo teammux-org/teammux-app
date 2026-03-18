@@ -9,6 +9,8 @@ import SwiftUI
 /// identifiers, and payload text.
 struct LiveFeedView: View {
     @ObservedObject var engine: EngineClient
+    @Binding var activeTab: RightTab
+    @Binding var diffSelectedWorkerId: UInt32?
 
     var body: some View {
         VStack(spacing: 0) {
