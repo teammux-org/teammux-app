@@ -11,7 +11,7 @@
 - **Goal:** Git worktree isolation, fully autonomous Team Lead, persistent sessions, PR lifecycle end-to-end, worker-to-worker messaging, CLAUDE.md context viewer
 - **Session structure:** 16 parallel streams + 1 main thread orchestrator
 - **Merge order:** T1-T7 (Wave 1, parallel) → T8-T12 (Wave 2, parallel per dependency) → T13-T15 (Wave 3, parallel) → T16 (last)
-- **Status:** COMPLETE — all 16 streams merged, v0.1.4 tagged
+- **Status:** COMPLETE — T1-T15 merged, T16 in PR, v0.1.4 tagged on merge
 - **Shipped:** March 2026
 
 ---
@@ -771,4 +771,4 @@ Animation: .easeInOut(duration: 0.2) on open/close.
 **Tech debt resolved:** TD15-TD20 (6 items)
 **Tech debt open:** TD21-TD28 (8 items, deferred to v0.1.5/v0.2)
 **Engine tests:** 356 passing (14 files)
-**Tag:** v0.1.4
+**Tag:** v0.1.4 (apply after T16 merges to main)

@@ -5110,9 +5110,9 @@ test "T16 integration 1: worktree create/path/branch/remove via C API" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.name", "T" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.name", "T" });
     const readme = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
     defer alloc.free(readme);
     {
@@ -5120,8 +5120,8 @@ test "T16 integration 1: worktree create/path/branch/remove via C API" {
         try f.writeAll("# T16");
         f.close();
     }
-    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
-    worktree.runGit(alloc, root, &.{ "commit", "-m", "init" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "add", "." });
+    try worktree.runGit(alloc, root, &.{ "commit", "-m", "init" });
 
     const root_z = try alloc.dupeZ(u8, root);
     defer alloc.free(root_z);
@@ -5142,11 +5142,12 @@ test "T16 integration 1: worktree create/path/branch/remove via C API" {
         dir.close();
     }
 
-    // Branch has teammux/ prefix
+    // Branch has teammux/ prefix and contains worker ID
     const branch_ptr = tm_worktree_branch(engine_ptr, 5);
     try std.testing.expect(branch_ptr != null);
     const branch_str = std.mem.span(branch_ptr.?);
     try std.testing.expect(branch_str.len >= 8 and std.mem.eql(u8, branch_str[0..8], "teammux/"));
+    try std.testing.expect(std.mem.indexOf(u8, branch_str, "5-") != null);
 
     // Remove cleans up registry
     try std.testing.expect(tm_worktree_remove(engine_ptr, 5) == 0);
@@ -5205,7 +5206,10 @@ test "T16 integration 2: tm_peer_question routes to Team Lead (worker 0)" {
 
     try std.testing.expect(PQState.to_id == 0); // Team Lead only
     try std.testing.expect(PQState.msg_type == @intFromEnum(bus.MessageType.peer_question));
-    try std.testing.expect(std.mem.indexOf(u8, PQState.payload_buf[0..PQState.payload_len], "how should I handle auth?") != null);
+    const pq_payload = PQState.payload_buf[0..PQState.payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, pq_payload, "how should I handle auth?") != null);
+    // Team Lead needs target_worker_id to relay the question
+    try std.testing.expect(std.mem.indexOf(u8, pq_payload, "\"target_worker_id\":5") != null);
 }
 
 test "T16 integration 3: tm_peer_delegate routes to target worker directly" {
@@ -5273,9 +5277,9 @@ test "T16 integration 4: TM_MSG_PR_READY routed through bus with PR URL" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.name", "T" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.name", "T" });
     const readme = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
     defer alloc.free(readme);
     {
@@ -5283,8 +5287,8 @@ test "T16 integration 4: TM_MSG_PR_READY routed through bus with PR URL" {
         try f.writeAll("# T16");
         f.close();
     }
-    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
-    worktree.runGit(alloc, root, &.{ "commit", "-m", "init" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "add", "." });
+    try worktree.runGit(alloc, root, &.{ "commit", "-m", "init" });
 
     const e = try Engine.create(alloc, root);
     defer e.destroy();
@@ -5339,9 +5343,9 @@ test "T16 integration 5: JSONL history survives engine destroy and recreate" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.name", "T" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.name", "T" });
     const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
     defer alloc.free(readme_path);
     {
@@ -5349,12 +5353,15 @@ test "T16 integration 5: JSONL history survives engine destroy and recreate" {
         try f.writeAll("# T16");
         f.close();
     }
-    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
-    worktree.runGit(alloc, root, &.{ "commit", "-m", "init" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "add", "." });
+    try worktree.runGit(alloc, root, &.{ "commit", "-m", "init" });
 
     const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
     defer alloc.free(teammux_dir);
-    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    std.fs.makeDirAbsolute(teammux_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
     const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
     defer alloc.free(cfg_path);
     {
@@ -5366,7 +5373,7 @@ test "T16 integration 5: JSONL history survives engine destroy and recreate" {
     const root_z = try alloc.dupeZ(u8, root);
     defer alloc.free(root_z);
 
-    // First engine lifecycle: write completion to JSONL
+    // First engine lifecycle: write completion and question to JSONL
     {
         var engine_ptr: ?*Engine = null;
         try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
@@ -5378,9 +5385,15 @@ test "T16 integration 5: JSONL history survives engine destroy and recreate" {
         const det_z = try alloc.dupeZ(u8, "JWT implemented");
         defer alloc.free(det_z);
         try std.testing.expect(tm_worker_complete(engine_ptr, 3, sum_z.ptr, det_z.ptr) == 0);
+
+        const q_z = try alloc.dupeZ(u8, "JWT or session tokens?");
+        defer alloc.free(q_z);
+        const ctx_z = try alloc.dupeZ(u8, "auth module");
+        defer alloc.free(ctx_z);
+        try std.testing.expect(tm_worker_question(engine_ptr, 5, q_z.ptr, ctx_z.ptr) == 0);
     }
 
-    // Second engine lifecycle: load and verify persisted entry
+    // Second engine lifecycle: load and verify both entries persisted in order
     {
         var engine_ptr: ?*Engine = null;
         try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
@@ -5391,12 +5404,18 @@ test "T16 integration 5: JSONL history survives engine destroy and recreate" {
         const entries = tm_history_load(engine_ptr, &count);
         defer tm_history_free(entries, count);
 
-        try std.testing.expect(count >= 1);
+        try std.testing.expect(count == 2);
         try std.testing.expect(entries != null);
-        const entry = entries.?[0].?;
-        try std.testing.expect(entry.worker_id == 3);
-        try std.testing.expectEqualStrings("completion", std.mem.span(entry.entry_type.?));
-        try std.testing.expectEqualStrings("auth module complete", std.mem.span(entry.content.?));
+
+        const e0 = entries.?[0].?;
+        try std.testing.expect(e0.worker_id == 3);
+        try std.testing.expectEqualStrings("completion", std.mem.span(e0.entry_type.?));
+        try std.testing.expectEqualStrings("auth module complete", std.mem.span(e0.content.?));
+
+        const e1 = entries.?[1].?;
+        try std.testing.expect(e1.worker_id == 5);
+        try std.testing.expectEqualStrings("question", std.mem.span(e1.entry_type.?));
+        try std.testing.expectEqualStrings("JWT or session tokens?", std.mem.span(e1.content.?));
     }
 }
 
@@ -5407,9 +5426,9 @@ test "T16 integration 6: exit 126 in all enforcement blocks, no bare exit 1" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.name", "T" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.name", "T" });
     const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
     defer alloc.free(readme_path);
     {
@@ -5417,13 +5436,13 @@ test "T16 integration 6: exit 126 in all enforcement blocks, no bare exit 1" {
         try f.writeAll("# T16");
         f.close();
     }
-    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
-    worktree.runGit(alloc, root, &.{ "commit", "-m", "init" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "add", "." });
+    try worktree.runGit(alloc, root, &.{ "commit", "-m", "init" });
 
     const root_z = try alloc.dupeZ(u8, root);
     defer alloc.free(root_z);
     var engine_ptr: ?*Engine = null;
-    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
     defer tm_engine_destroy(engine_ptr);
 
     const bin_z = try alloc.dupeZ(u8, "/usr/bin/echo");
@@ -5455,13 +5474,14 @@ test "T16 integration 6: exit 126 in all enforcement blocks, no bare exit 1" {
     try std.testing.expect(std.mem.indexOf(u8, content, "exit 126") != null);
     // No bare "exit 1" followed by newline (would indicate old enforcement)
     try std.testing.expect(std.mem.indexOf(u8, content, "exit 1\n") == null);
-    // All four enforcement types present
+    // All five enforcement types present (add + four elif blocks)
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"add\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"commit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"stash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"apply\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"push\"") != null);
 
-    _ = tm_worker_dismiss(engine_ptr, worker_id);
+    try std.testing.expect(tm_worker_dismiss(engine_ptr, worker_id) == 0);
 }
 
 test "T16 integration 7: TD18 ownership and interceptor updated after rule change" {
@@ -5471,9 +5491,9 @@ test "T16 integration 7: TD18 ownership and interceptor updated after rule chang
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.name", "T" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.name", "T" });
     const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
     defer alloc.free(readme_path);
     {
@@ -5481,13 +5501,13 @@ test "T16 integration 7: TD18 ownership and interceptor updated after rule chang
         try f.writeAll("# T16");
         f.close();
     }
-    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
-    worktree.runGit(alloc, root, &.{ "commit", "-m", "init" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "add", "." });
+    try worktree.runGit(alloc, root, &.{ "commit", "-m", "init" });
 
     const root_z = try alloc.dupeZ(u8, root);
     defer alloc.free(root_z);
     var engine_ptr: ?*Engine = null;
-    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
     defer tm_engine_destroy(engine_ptr);
 
     const bin_z = try alloc.dupeZ(u8, "/usr/bin/echo");
@@ -5505,7 +5525,7 @@ test "T16 integration 7: TD18 ownership and interceptor updated after rule chang
     try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, old_deny_z.ptr, false) == 0);
     try std.testing.expect(tm_interceptor_install(engine_ptr, worker_id) == 0);
 
-    // Update ownership with new patterns (simulates hot-reload path)
+    // Update ownership with new patterns (equivalent to hot-reload outcome via C API)
     const new_deny_z = try alloc.dupeZ(u8, "src/new/**");
     defer alloc.free(new_deny_z);
     const new_write_z = try alloc.dupeZ(u8, "src/api/**");
@@ -5517,12 +5537,14 @@ test "T16 integration 7: TD18 ownership and interceptor updated after rule chang
     // Reinstall interceptor with new patterns
     try std.testing.expect(tm_interceptor_install(engine_ptr, worker_id) == 0);
 
-    // Verify ownership reflects new rules
+    // Verify ownership reflects new rules after atomic swap
     var allowed: bool = undefined;
     try std.testing.expect(tm_ownership_check(engine_ptr, worker_id, "src/new/file.ts", &allowed) == 0);
     try std.testing.expect(!allowed); // denied by new pattern
     try std.testing.expect(tm_ownership_check(engine_ptr, worker_id, "src/api/handler.ts", &allowed) == 0);
     try std.testing.expect(allowed); // allowed by new write pattern
+    // src/old/ files are denied by implicit default (rule 4: no explicit allow), NOT by old
+    // deny pattern — wrapper file check below proves old pattern was fully removed
 
     // Verify wrapper reflects new patterns, not old
     const e = engine_ptr.?;
@@ -5536,7 +5558,7 @@ test "T16 integration 7: TD18 ownership and interceptor updated after rule chang
     try std.testing.expect(std.mem.indexOf(u8, content, "src/new/**") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "src/old/**") == null);
 
-    _ = tm_worker_dismiss(engine_ptr, worker_id);
+    try std.testing.expect(tm_worker_dismiss(engine_ptr, worker_id) == 0);
 }
 
 test "T16 integration 8: config.toml worktree_root override respected" {
@@ -5546,9 +5568,9 @@ test "T16 integration 8: config.toml worktree_root override respected" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    worktree.runGit(alloc, root, &.{ "init", "-b", "main" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" }) catch return;
-    worktree.runGit(alloc, root, &.{ "config", "user.name", "T" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "init", "-b", "main" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.email", "t@t.com" });
+    try worktree.runGit(alloc, root, &.{ "config", "user.name", "T" });
     const readme_path = try std.fmt.allocPrint(alloc, "{s}/README.md", .{root});
     defer alloc.free(readme_path);
     {
@@ -5556,15 +5578,18 @@ test "T16 integration 8: config.toml worktree_root override respected" {
         try f.writeAll("# T16");
         f.close();
     }
-    worktree.runGit(alloc, root, &.{ "add", "." }) catch return;
-    worktree.runGit(alloc, root, &.{ "commit", "-m", "init" }) catch return;
+    try worktree.runGit(alloc, root, &.{ "add", "." });
+    try worktree.runGit(alloc, root, &.{ "commit", "-m", "init" });
 
     // Write config.toml with custom worktree_root pointing inside tmpDir
     const custom_wt_root = try std.fmt.allocPrint(alloc, "{s}/custom-worktrees", .{root});
     defer alloc.free(custom_wt_root);
     const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
     defer alloc.free(teammux_dir);
-    std.fs.makeDirAbsolute(teammux_dir) catch {};
+    std.fs.makeDirAbsolute(teammux_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
     const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
     defer alloc.free(cfg_path);
     const cfg_content = try std.fmt.allocPrint(alloc, "[project]\nname = \"t16-wt\"\nworktree_root = \"{s}\"\n", .{custom_wt_root});
