@@ -4844,14 +4844,14 @@ test "routePrReady sends TM_MSG_PR_READY to bus" {
 
     if (e.message_bus) |*b| b.subscribe(cb, null);
 
-    routePrReady(e, 2, "https://github.com/o/r/pull/1", "teammux/worker-2-auth", "Add auth");
+    routePrReady(e, 2, "https://github.com/o/r/pull/1", "teammux/2-implement-auth", "Add auth");
 
     try std.testing.expect(State.received);
     try std.testing.expect(State.msg_type == @intFromEnum(bus.MessageType.pr_ready));
     const payload_slice = State.payload_buf[0..State.payload_len];
     try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"worker_id\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload_slice, "https://github.com/o/r/pull/1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "teammux/worker-2-auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "teammux/2-implement-auth") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload_slice, "Add auth") != null);
 }
 

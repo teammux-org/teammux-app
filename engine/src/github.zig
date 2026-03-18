@@ -639,7 +639,8 @@ fn isGhAvailable(allocator: std.mem.Allocator) bool {
 }
 
 /// Extract worker ID from a teammux branch name.
-/// Pattern: teammux/worker-{id}-* or refs/heads/teammux/worker-{id}-*
+/// T1's makeBranch produces: teammux/{worker_id}-{slug}
+/// Pattern: teammux/{id}-* or refs/heads/teammux/{id}-*
 /// Returns null if pattern does not match.
 pub fn extractWorkerIdFromBranch(branch: []const u8) ?u32 {
     // Strip refs/heads/ prefix if present
@@ -648,12 +649,12 @@ pub fn extractWorkerIdFromBranch(branch: []const u8) ?u32 {
     else
         branch;
 
-    // Must start with teammux/worker-
-    const prefix = "teammux/worker-";
+    // Must start with teammux/
+    const prefix = "teammux/";
     if (!std.mem.startsWith(u8, stripped, prefix)) return null;
 
     const after_prefix = stripped[prefix.len..];
-    // Find end of digits (stop at '-' or end of string)
+    // Parse leading digits before the first '-'
     var end: usize = 0;
     while (end < after_prefix.len and after_prefix[end] >= '0' and after_prefix[end] <= '9') : (end += 1) {}
     if (end == 0) return null;
@@ -844,7 +845,7 @@ test "github - processEvents fires callback for push on teammux branch" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"100","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+        \\[{"id":"100","type":"PushEvent","payload":{"ref":"refs/heads/teammux/1-push-feature"}}]
     ;
 
     try client.processEvents(json);
@@ -861,7 +862,7 @@ test "github - processEvents fires callback for PR on teammux branch" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"200","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"head":{"ref":"teammux/worker-2"}}}}]
+        \\[{"id":"200","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"head":{"ref":"teammux/2-implement-auth"}}}}]
     ;
 
     try client.processEvents(json);
@@ -894,7 +895,7 @@ test "github - processEvents deduplicates by event ID" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"400","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+        \\[{"id":"400","type":"PushEvent","payload":{"ref":"refs/heads/teammux/1-dedup-feature"}}]
     ;
 
     try client.processEvents(json);
@@ -906,8 +907,8 @@ test "github - processEvents deduplicates by event ID" {
 }
 
 test "github - isTeammuxBranch matches correct patterns" {
-    try std.testing.expect(isTeammuxBranch("refs/heads/teammux/worker-1"));
-    try std.testing.expect(isTeammuxBranch("teammux/worker-2"));
+    try std.testing.expect(isTeammuxBranch("refs/heads/teammux/1-push-feature"));
+    try std.testing.expect(isTeammuxBranch("teammux/2-implement-auth"));
     try std.testing.expect(!isTeammuxBranch("refs/heads/main"));
     try std.testing.expect(!isTeammuxBranch("feature/something"));
 }
@@ -979,9 +980,9 @@ test "github - processEvents handles multi-event batch with dedup" {
 
     // Batch: 2 teammux branches + 1 main (newest first)
     const json =
-        \\[{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-3"}},
+        \\[{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/3-fix-bug"}},
         \\{"id":"602","type":"PushEvent","payload":{"ref":"refs/heads/main"}},
-        \\{"id":"601","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+        \\{"id":"601","type":"PushEvent","payload":{"ref":"refs/heads/teammux/1-add-tests"}}]
     ;
 
     try client.processEvents(json);
@@ -993,8 +994,8 @@ test "github - processEvents handles multi-event batch with dedup" {
     test_data.callback_count = 0;
     test_data.push_count = 0;
     const json2 =
-        \\[{"id":"604","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-4"}},
-        \\{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-3"}}]
+        \\[{"id":"604","type":"PushEvent","payload":{"ref":"refs/heads/teammux/4-refactor"}},
+        \\{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/3-fix-bug"}}]
     ;
 
     try client.processEvents(json2);
@@ -1005,18 +1006,19 @@ test "github - processEvents handles multi-event batch with dedup" {
 // ─── T7 tests ────────────────────────────────────────────
 
 test "github - extractWorkerIdFromBranch parses valid patterns" {
-    try std.testing.expect(extractWorkerIdFromBranch("teammux/worker-2-auth").? == 2);
-    try std.testing.expect(extractWorkerIdFromBranch("teammux/worker-0-setup").? == 0);
-    try std.testing.expect(extractWorkerIdFromBranch("teammux/worker-42-long-name").? == 42);
-    try std.testing.expect(extractWorkerIdFromBranch("refs/heads/teammux/worker-7-fix").? == 7);
+    // T1 makeBranch format: teammux/{worker_id}-{slug}
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/2-implement-auth").? == 2);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/0-setup").? == 0);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/42-long-task-name").? == 42);
+    try std.testing.expect(extractWorkerIdFromBranch("refs/heads/teammux/7-fix-bug").? == 7);
 }
 
 test "github - extractWorkerIdFromBranch returns null for invalid patterns" {
     try std.testing.expect(extractWorkerIdFromBranch("main") == null);
     try std.testing.expect(extractWorkerIdFromBranch("teammux/feature-branch") == null);
-    try std.testing.expect(extractWorkerIdFromBranch("teammux/worker-") == null);
-    try std.testing.expect(extractWorkerIdFromBranch("feature/worker-2-auth") == null);
-    try std.testing.expect(extractWorkerIdFromBranch("teammux/worker-abc-auth") == null);
+    try std.testing.expect(extractWorkerIdFromBranch("feature/2-auth") == null);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/abc-auth") == null);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/worker-2-auth") == null);
 }
 
 test "github - extractJsonStringSimple parses url from gh JSON output" {
@@ -1078,7 +1080,7 @@ test "github - processEvents routes PR status for teammux branch via bus_send_fn
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"700","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"html_url":"https://github.com/o/r/pull/1","merged":false,"head":{"ref":"teammux/worker-3-auth"}}}}]
+        \\[{"id":"700","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"html_url":"https://github.com/o/r/pull/1","merged":false,"head":{"ref":"teammux/3-implement-auth"}}}}]
     ;
 
     try client.processEvents(json);
@@ -1109,7 +1111,7 @@ test "github - processEvents detects merged PR status" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"701","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/2","merged":true,"head":{"ref":"teammux/worker-5-fix"}}}}]
+        \\[{"id":"701","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/2","merged":true,"head":{"ref":"teammux/5-fix-login"}}}}]
     ;
 
     try client.processEvents(json);
@@ -1133,7 +1135,7 @@ test "github - processEvents detects closed (not merged) PR status" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"702","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/3","merged":false,"head":{"ref":"teammux/worker-1-feat"}}}}]
+        \\[{"id":"702","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/3","merged":false,"head":{"ref":"teammux/1-add-feature"}}}}]
     ;
 
     try client.processEvents(json);
@@ -1180,7 +1182,7 @@ test "github - processEvents maps reopened action to open status" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"710","type":"PullRequestEvent","payload":{"action":"reopened","pull_request":{"html_url":"https://github.com/o/r/pull/10","merged":false,"head":{"ref":"teammux/worker-8-reopen"}}}}]
+        \\[{"id":"710","type":"PullRequestEvent","payload":{"action":"reopened","pull_request":{"html_url":"https://github.com/o/r/pull/10","merged":false,"head":{"ref":"teammux/8-reopen-task"}}}}]
     ;
 
     try client.processEvents(json);
@@ -1205,7 +1207,7 @@ test "github - processEvents defaults to closed when merged field missing" {
 
     // closed action but no "merged" field in pull_request — should default to "closed"
     const json =
-        \\[{"id":"711","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/11","head":{"ref":"teammux/worker-9-close"}}}}]
+        \\[{"id":"711","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/11","head":{"ref":"teammux/9-close-task"}}}}]
     ;
 
     try client.processEvents(json);
