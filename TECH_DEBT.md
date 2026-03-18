@@ -29,16 +29,16 @@
 | TD13 | commands.zig / EngineClient | /teammux-complete and /teammux-question have no Swift-side handlers| S2/S6  | NO       | RESOLVED |
 | TD14 | TeamBuilderView             | Role picker in setup flow deferred                                 | S3/S9  | NO       | RESOLVED |
 
-## v0.1.4 — Current sprint targets
+## v0.1.4 — Resolved
 
-| ID   | Module                      | Issue                                                              | Stream | Breaking | Status |
-|------|-----------------------------|--------------------------------------------------------------------|--------|----------|--------|
-| TD15 | coordinator.zig             | Worker-to-worker direct messaging not routed                       | T2/T9  | NO       | OPEN   |
-| TD16 | LiveFeedView                | Completion history not persisted across sessions                   | T5/T10 | NO       | OPEN   |
-| TD17 | interceptor.zig             | git stash / git apply bypass not intercepted                       | T3     | NO       | OPEN   |
-| TD18 | hotreload.zig               | Role hot-reload does not update ownership registry                 | T4     | NO       | OPEN   |
-| TD19 | interceptor.zig             | Interceptor exit code indistinguishable from git errors            | T3     | NO       | OPEN   |
-| TD20 | EngineClient                | lastError is shared mutable state — stale errors bleed across calls| T6     | NO       | OPEN   |
+| ID   | Module                      | Issue                                                              | Stream | Breaking | Status   |
+|------|-----------------------------|--------------------------------------------------------------------|--------|----------|----------|
+| TD15 | coordinator.zig             | Worker-to-worker direct messaging not routed                       | T2/T9  | NO       | RESOLVED |
+| TD16 | LiveFeedView                | Completion history not persisted across sessions                   | T5/T10 | NO       | RESOLVED |
+| TD17 | interceptor.zig             | git stash / git apply bypass not intercepted                       | T3     | NO       | RESOLVED |
+| TD18 | hotreload.zig               | Role hot-reload does not update ownership registry                 | T4     | NO       | RESOLVED |
+| TD19 | interceptor.zig             | Interceptor exit code indistinguishable from git errors            | T3     | NO       | RESOLVED |
+| TD20 | EngineClient                | lastError is shared mutable state — stale errors bleed across calls| T6     | NO       | RESOLVED |
 
 ## v0.1.4 — New debt introduced this sprint
 

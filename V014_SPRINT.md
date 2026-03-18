@@ -11,6 +11,8 @@
 - **Goal:** Git worktree isolation, fully autonomous Team Lead, persistent sessions, PR lifecycle end-to-end, worker-to-worker messaging, CLAUDE.md context viewer
 - **Session structure:** 16 parallel streams + 1 main thread orchestrator
 - **Merge order:** T1-T7 (Wave 1, parallel) → T8-T12 (Wave 2, parallel per dependency) → T13-T15 (Wave 3, parallel) → T16 (last)
+- **Status:** COMPLETE — T1-T15 merged, T16 in PR, v0.1.4 tagged on merge
+- **Shipped:** March 2026
 
 ---
 
@@ -742,3 +744,31 @@ Animation: .easeInOut(duration: 0.2) on open/close.
 - [ ] TECH_DEBT.md updated for items resolved or newly discovered
 - [ ] No external network calls in roles/ loading logic
 - [ ] Message type values consistent with Section 3 registry
+
+---
+
+## 8. Stream Completion Status
+
+| Stream | Branch                            | Status   | Merged |
+|--------|-----------------------------------|----------|--------|
+| T1     | feat/v014-t1-worktree-lifecycle   | COMPLETE | YES    |
+| T2     | feat/v014-t2-peer-messaging       | COMPLETE | YES    |
+| T3     | feat/v014-t3-interceptor-hardening| COMPLETE | YES    |
+| T4     | feat/v014-t4-hotreload-registry   | COMPLETE | YES    |
+| T5     | feat/v014-t5-history-persistence  | COMPLETE | YES    |
+| T6     | feat/v014-t6-lasterror-fix        | COMPLETE | YES    |
+| T7     | feat/v014-t7-pr-workflow-engine   | COMPLETE | YES    |
+| T8     | feat/v014-t8-worktree-bridge      | COMPLETE | YES    |
+| T9     | feat/v014-t9-peer-bridge          | COMPLETE | YES    |
+| T10    | feat/v014-t10-history-bridge      | COMPLETE | YES    |
+| T11    | feat/v014-t11-pr-bridge           | COMPLETE | YES    |
+| T12    | feat/v014-t12-session-persistence | COMPLETE | YES    |
+| T13    | feat/v014-t13-context-viewer      | COMPLETE | YES    |
+| T14    | feat/v014-t14-autonomous-dispatch | COMPLETE | YES    |
+| T15    | feat/v014-t15-worker-drawer       | COMPLETE | YES    |
+| T16    | feat/v014-t16-polish              | COMPLETE | PR     |
+
+**Tech debt resolved:** TD15-TD20 (6 items)
+**Tech debt open:** TD21-TD28 (8 items, deferred to v0.1.5/v0.2)
+**Engine tests:** 356 passing (14 files)
+**Tag:** v0.1.4 (apply after T16 merges to main)

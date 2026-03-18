@@ -46,4 +46,4 @@ macOS 15 Sequoia, Apple Silicon only — com.teammux.app
 - v0.1.1 — bus retry, webhook polling, MergeCoordinator, Team Lead review UI
 - v0.1.2 — role definitions, FileOwnershipRegistry, PTY interceptor, 31 role library
 - v0.1.3 — coordination loop, completion signaling, hot-reload, interceptor hardening, role selector, dispatch UI
-- v0.1.4 — in progress: git worktree isolation, fully autonomous Team Lead, persistent sessions, PR lifecycle, worker-to-worker messaging, CLAUDE.md context viewer
+- v0.1.4 — git worktree isolation, fully autonomous Team Lead, persistent sessions, PR lifecycle, worker-to-worker messaging, CLAUDE.md context viewer (16 streams)
