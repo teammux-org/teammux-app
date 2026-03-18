@@ -211,16 +211,18 @@ tm_worker_id_t tm_worker_spawn(
 tm_result_t       tm_worker_dismiss(tm_engine_t* engine, tm_worker_id_t worker_id);
 
 // -----------------------------------------------------------------
-// Worktree lifecycle (standalone registry)
+// Worktree lifecycle
 //
 // Manages git worktree directories for isolated worker environments.
 // Default path: ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/
 // Configurable via config.toml [project] worktree_root key.
+// Not thread-safe — all tm_worktree_* calls must be serialized.
 // -----------------------------------------------------------------
 
-// Create a git worktree for a worker. Resolves path from config or
-// default, runs git worktree add, stores in registry.
-// Returns TM_ERR_WORKTREE on git failure, TM_ERR_CONFIG on path error.
+// Create a git worktree for a worker. task_description is slugified into
+// the branch name (teammux/{worker_id}-{slug}). task_description must not
+// be NULL. Returns TM_ERR_CONFIG if task_description is NULL.
+// Returns TM_ERR_WORKTREE on git failure, path resolution, or mkdir failure.
 tm_result_t tm_worktree_create(tm_engine_t* engine,
                                 uint32_t worker_id,
                                 const char* task_description);
@@ -231,12 +233,14 @@ tm_result_t tm_worktree_remove(tm_engine_t* engine, uint32_t worker_id);
 
 // Get the absolute path to a worker's worktree directory.
 // Returns NULL if worker has no worktree registered.
-// Returned string is owned by the registry — do not free.
+// Returned string is valid until the next call to tm_worktree_path
+// or tm_engine_destroy. Caller must not free. Copy if needed long-term.
 const char* tm_worktree_path(tm_engine_t* engine, uint32_t worker_id);
 
 // Get the git branch name for a worker's worktree.
 // Returns NULL if worker has no worktree registered.
-// Returned string is owned by the registry — do not free.
+// Returned string is valid until the next call to tm_worktree_branch
+// or tm_engine_destroy. Caller must not free. Copy if needed long-term.
 const char* tm_worktree_branch(tm_engine_t* engine, uint32_t worker_id);
 
 // Get current roster snapshot. Returns NULL on failure. Caller must call tm_roster_free().

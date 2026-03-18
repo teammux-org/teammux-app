@@ -6,6 +6,8 @@ const worktree = @import("worktree.zig");
 // Types
 // ─────────────────────────────────────────────────────────
 
+/// A registered git worktree. Both `path` and `branch` are heap-allocated
+/// and owned by the WorktreeRegistry — freed on removeWorker() or deinit().
 pub const WorktreeEntry = struct {
     path: []const u8,
     branch: []const u8,
@@ -40,10 +42,9 @@ pub const WorktreeRegistry = struct {
 // Branch slugification
 // ─────────────────────────────────────────────────────────
 
-/// Slugify task description for branch naming.
-/// Lowercase, spaces/underscores→hyphens, strip non-alphanum (except hyphens),
-/// no consecutive hyphens, trim trailing hyphens, truncate to 40 chars.
-/// Returns owned string: teammux/{worker_id}-{slug}
+/// Build a git branch name from worker ID and task description.
+/// Format: teammux/{worker_id}-{slug} where slug is the slugified task
+/// (truncated to 40 chars). Returns owned string — caller must free.
 pub fn makeBranch(allocator: std.mem.Allocator, worker_id: u32, task_description: []const u8) ![]u8 {
     const slug = try slugifyTask(allocator, task_description, 40);
     defer allocator.free(slug);
@@ -54,7 +55,10 @@ pub fn makeBranch(allocator: std.mem.Allocator, worker_id: u32, task_description
 /// (except hyphens), no consecutive hyphens, trim trailing hyphens,
 /// truncate to max_len.
 pub fn slugifyTask(allocator: std.mem.Allocator, input: []const u8, max_len: usize) ![]u8 {
-    var buf = try allocator.alloc(u8, @min(input.len, max_len));
+    const alloc_size = @min(input.len, max_len);
+    if (alloc_size == 0) return try allocator.alloc(u8, 0);
+
+    var buf = try allocator.alloc(u8, alloc_size);
     var len: usize = 0;
 
     for (input) |c| {
@@ -78,6 +82,11 @@ pub fn slugifyTask(allocator: std.mem.Allocator, input: []const u8, max_len: usi
     // Trim trailing hyphens
     while (len > 0 and buf[len - 1] == '-') {
         len -= 1;
+    }
+
+    if (len == 0) {
+        allocator.free(buf);
+        return try allocator.alloc(u8, 0);
     }
 
     if (len == buf.len) return buf;
@@ -156,37 +165,35 @@ pub fn create(
     const branch = try makeBranch(allocator, worker_id, task_description);
     errdefer allocator.free(branch);
 
-    // 4. mkdir -p for root directory
-    std.fs.makeDirAbsolute(root) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return error.MkdirFailed,
-    };
+    // 4. mkdir -p for root directory (recursive — handles missing parents)
+    if (root.len > 0 and root[0] == '/') {
+        var root_dir = std.fs.openDirAbsolute("/", .{}) catch return error.MkdirFailed;
+        defer root_dir.close();
+        root_dir.makePath(root[1..]) catch return error.MkdirFailed;
+    } else {
+        std.fs.cwd().makePath(root) catch return error.MkdirFailed;
+    }
 
     // 5. git worktree add
-    worktree.runGit(allocator, project_path, &.{ "worktree", "add", wt_path, "-b", branch }) catch {
+    worktree.runGit(allocator, project_path, &.{ "worktree", "add", wt_path, "-b", branch }) catch |err| {
+        std.log.warn("[teammux] git worktree add failed for worker {d} at {s}: {}", .{ worker_id, wt_path, err });
         return error.GitFailed;
     };
 
-    // 6. Store in registry
+    // 6. Store in registry (free old entry if duplicate worker_id)
+    if (registry.entries.fetchRemove(worker_id)) |old| {
+        allocator.free(old.value.path);
+        allocator.free(old.value.branch);
+    }
     try registry.entries.put(worker_id, .{
         .path = wt_path,
         .branch = branch,
     });
 }
 
-/// Remove a git worktree for a worker.
-/// Runs git worktree remove --force, then frees registry entry.
-/// Logs but does not fail if git removal fails.
-pub fn remove(
-    registry: *WorktreeRegistry,
-    project_path: []const u8,
-) void {
-    _ = registry;
-    _ = project_path;
-}
-
 /// Remove a specific worker's worktree.
 /// Runs git worktree remove --force, then frees registry entry.
+/// Logs but does not fail if git removal fails (fire-and-forget cleanup).
 pub fn removeWorker(
     registry: *WorktreeRegistry,
     project_path: []const u8,
@@ -256,6 +263,18 @@ test "lifecycle - slugifyTask empty input" {
     const slug = try slugifyTask(std.testing.allocator, "", 40);
     defer std.testing.allocator.free(slug);
     try std.testing.expect(slug.len == 0);
+}
+
+test "lifecycle - slugifyTask all special chars produces empty slug" {
+    const slug = try slugifyTask(std.testing.allocator, "!@#$%^&*()", 40);
+    defer std.testing.allocator.free(slug);
+    try std.testing.expect(slug.len == 0);
+}
+
+test "lifecycle - makeBranch with empty slug produces valid branch" {
+    const branch = try makeBranch(std.testing.allocator, 3, "!@#$");
+    defer std.testing.allocator.free(branch);
+    try std.testing.expectEqualStrings("teammux/3-", branch);
 }
 
 test "lifecycle - makeBranch includes worker ID and prefix" {

@@ -323,19 +323,17 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     const e = engine orelse return 0xFFFFFFFF;
     const td = std.mem.span(task_description orelse return 0xFFFFFFFF);
 
-    // Pre-allocate worker ID for lifecycle registry (peek at roster.next_id)
-    const upcoming_id = e.roster.next_id;
-
-    // Create worktree BEFORE roster spawn — graceful degradation on failure
-    const cfg_ptr: ?*const config.Config = if (e.cfg) |*c| c else null;
-    worktree_lifecycle.create(&e.wt_registry, cfg_ptr, e.project_root, upcoming_id, td) catch |err| {
-        std.log.warn("[teammux] worktree lifecycle create failed for worker {d}: {s}", .{ upcoming_id, @errorName(err) });
-    };
-
     const id = e.roster.spawn(e.project_root, std.mem.span(agent_binary orelse return 0xFFFFFFFF), @enumFromInt(agent_type), std.mem.span(worker_name orelse return 0xFFFFFFFF), td) catch |err| {
         e.setError(switch (err) { error.GitFailed => "git worktree add failed", else => "worker spawn failed" }) catch {};
         return 0xFFFFFFFF;
     };
+
+    // Create lifecycle worktree AFTER roster spawn using actual ID — graceful degradation on failure
+    const cfg_ptr: ?*const config.Config = if (e.cfg) |*c| c else null;
+    worktree_lifecycle.create(&e.wt_registry, cfg_ptr, e.project_root, id, td) catch |err| {
+        std.log.warn("[teammux] worktree lifecycle create failed for worker {d}: {s}", .{ id, @errorName(err) });
+    };
+
     return id;
 }
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
@@ -361,7 +359,10 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
 
 export fn tm_worktree_create(engine: ?*Engine, worker_id: u32, task_description: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
-    const td = std.mem.span(task_description orelse return 7); // TM_ERR_CONFIG
+    const td = std.mem.span(task_description orelse {
+        e.setError("tm_worktree_create: task_description must not be NULL") catch {};
+        return 7; // TM_ERR_CONFIG
+    });
     const cfg_ptr: ?*const config.Config = if (e.cfg) |*c| c else null;
     worktree_lifecycle.create(&e.wt_registry, cfg_ptr, e.project_root, worker_id, td) catch |err| {
         e.setError(switch (err) {
