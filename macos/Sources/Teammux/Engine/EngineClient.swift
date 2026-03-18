@@ -119,6 +119,12 @@ final class EngineClient: ObservableObject {
     /// not appended to during the session. Cleared on `destroy()`.
     @Published var completionHistory: [HistoryEntry] = []
 
+    /// Active pull requests per worker ID. Populated when a worker signals
+    /// PR creation via `TM_MSG_PR_READY` or when `createPR()` succeeds from
+    /// the UI. Status updated on `TM_MSG_PR_STATUS`. Keyed by worker ID —
+    /// only the latest PR per worker is tracked.
+    @Published var workerPRs: [UInt32: PREvent] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -297,6 +303,7 @@ final class EngineClient: ObservableObject {
         peerQuestions.removeAll()
         peerDelegations.removeAll()
         completionHistory.removeAll()
+        workerPRs.removeAll()
         githubStatus = .disconnected
         lastError = nil
     }
@@ -652,6 +659,24 @@ final class EngineClient: ObservableObject {
         )
 
         tm_pr_free(prPtr)
+
+        // Populate workerPRs so the PR card appears immediately in GitView.
+        // A subsequent TM_MSG_PR_READY from the bus will replace this entry.
+        let workerInfo = roster.first { $0.id == workerId }
+        if workerInfo == nil {
+            Self.logger.warning("createPR: worker \(workerId) not found in roster, PR card will lack branch name")
+        }
+        let prEvent = PREvent(
+            id: workerPRs[workerId]?.id ?? UUID(),
+            workerId: workerId,
+            branchName: workerInfo?.branchName ?? "",
+            prUrl: pr.url,
+            title: pr.title,
+            status: .open,
+            timestamp: Date()
+        )
+        workerPRs[workerId] = prEvent
+
         return pr
     }
 
@@ -1303,7 +1328,7 @@ final class EngineClient: ObservableObject {
                 )
                 client.messages.append(msg)
 
-                // Route to workerCompletions / workerQuestions / peerQuestions / peerDelegations
+                // Route to workerCompletions / workerQuestions / peerQuestions / peerDelegations / workerPRs
                 if type == .completion {
                     client.handleCompletionMessage(from: from, payload: payload, timestamp: timestamp, gitCommit: gitCommit)
                 } else if type == .question {
@@ -1312,6 +1337,10 @@ final class EngineClient: ObservableObject {
                     client.handlePeerQuestionMessage(from: from, payload: payload, timestamp: timestamp)
                 } else if type == .delegation {
                     client.handleDelegationMessage(from: from, payload: payload, timestamp: timestamp)
+                } else if type == .prReady {
+                    client.handlePRReadyMessage(payload: payload, timestamp: timestamp)
+                } else if type == .prStatus {
+                    client.handlePRStatusMessage(payload: payload)
                 }
             }
             return TM_OK
@@ -2071,6 +2100,140 @@ final class EngineClient: ObservableObject {
             }
         } catch {
             let msg = "handleDelegationMessage: JSON parse failed for worker \(envelopeFrom): \(error.localizedDescription)"
+            Self.logger.error("\(msg)")
+            lastError = msg
+        }
+    }
+
+    // MARK: - PR Workflow
+
+    /// Parse a TM_MSG_PR_READY payload and upsert into `workerPRs`.
+    /// Payload format: Required: `worker_id`, `pr_url`. Optional: `branch`, `title`.
+    private func handlePRReadyMessage(payload: String, timestamp: Date) {
+        guard let data = payload.data(using: .utf8) else {
+            let msg = "handlePRReadyMessage: payload is not valid UTF-8"
+            Self.logger.error("\(msg)")
+            lastError = msg
+            return
+        }
+
+        do {
+            guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let msg = "handlePRReadyMessage: payload is not a JSON object"
+                Self.logger.error("\(msg)")
+                lastError = msg
+                return
+            }
+
+            guard let workerId: UInt32 = {
+                if let id = dict["worker_id"] as? UInt32 { return id }
+                if let id = dict["worker_id"] as? Int, id >= 0, id <= Int(UInt32.max) {
+                    return UInt32(id)
+                }
+                return nil
+            }() else {
+                let msg = "handlePRReadyMessage: missing or invalid worker_id"
+                Self.logger.error("\(msg)")
+                lastError = msg
+                return
+            }
+
+            guard let prUrl = dict["pr_url"] as? String, !prUrl.isEmpty else {
+                let msg = "handlePRReadyMessage: missing or empty pr_url for worker \(workerId)"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+
+            let branch = dict["branch"] as? String ?? ""
+            if branch.isEmpty {
+                Self.logger.warning("handlePRReadyMessage: missing branch for worker \(workerId), PR card will show degraded info")
+            }
+            let title = dict["title"] as? String ?? ""
+            if title.isEmpty {
+                Self.logger.warning("handlePRReadyMessage: missing title for worker \(workerId), PR card will show degraded info")
+            }
+
+            if let existing = workerPRs[workerId] {
+                Self.logger.warning("handlePRReadyMessage: overwriting existing PR for worker \(workerId), previous URL: \(existing.prUrl)")
+            }
+
+            let prEvent = PREvent(
+                id: workerPRs[workerId]?.id ?? UUID(),
+                workerId: workerId,
+                branchName: branch,
+                prUrl: prUrl,
+                title: title,
+                status: .open,
+                timestamp: timestamp
+            )
+            workerPRs[workerId] = prEvent
+        } catch {
+            let msg = "handlePRReadyMessage: JSON parse failed: \(error.localizedDescription)"
+            Self.logger.error("\(msg)")
+            lastError = msg
+        }
+    }
+
+    /// Parse a TM_MSG_PR_STATUS payload and update the status on an existing PREvent,
+    /// or create a minimal PREvent if none exists yet (e.g. webhook fires before PR_READY).
+    /// Payload format: Required: `worker_id`, `status`. Optional: `pr_url`.
+    private func handlePRStatusMessage(payload: String) {
+        guard let data = payload.data(using: .utf8) else {
+            let msg = "handlePRStatusMessage: payload is not valid UTF-8"
+            Self.logger.error("\(msg)")
+            lastError = msg
+            return
+        }
+
+        do {
+            guard let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let msg = "handlePRStatusMessage: payload is not a JSON object"
+                Self.logger.error("\(msg)")
+                lastError = msg
+                return
+            }
+
+            guard let workerId: UInt32 = {
+                if let id = dict["worker_id"] as? UInt32 { return id }
+                if let id = dict["worker_id"] as? Int, id >= 0, id <= Int(UInt32.max) {
+                    return UInt32(id)
+                }
+                return nil
+            }() else {
+                let msg = "handlePRStatusMessage: missing or invalid worker_id"
+                Self.logger.error("\(msg)")
+                lastError = msg
+                return
+            }
+
+            guard let statusStr = dict["status"] as? String,
+                  let newStatus = PRStatus(rawValue: statusStr) else {
+                let msg = "handlePRStatusMessage: missing or invalid status for worker \(workerId)"
+                Self.logger.warning("\(msg)")
+                lastError = msg
+                return
+            }
+
+            if workerPRs[workerId] != nil {
+                workerPRs[workerId]?.status = newStatus
+            } else {
+                // PR_STATUS arrived before PR_READY (possible if webhook fires first).
+                // Create a minimal PREvent so the status is not lost.
+                let prUrl = dict["pr_url"] as? String ?? ""
+                let prEvent = PREvent(
+                    workerId: workerId,
+                    branchName: "",
+                    prUrl: prUrl,
+                    title: "",
+                    status: newStatus,
+                    timestamp: Date()
+                )
+                workerPRs[workerId] = prEvent
+                Self.logger.warning("handlePRStatusMessage: created stub PREvent from status update for worker \(workerId) (status: \(newStatus.rawValue)), PR_READY not yet received — card will show degraded info")
+            }
+        } catch {
+            let msg = "handlePRStatusMessage: JSON parse failed: \(error.localizedDescription)"
             Self.logger.error("\(msg)")
             lastError = msg
         }

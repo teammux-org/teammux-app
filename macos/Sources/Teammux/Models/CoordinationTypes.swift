@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 // MARK: - CompletionReport
 
@@ -203,6 +204,71 @@ struct HistoryEntry: Identifiable, Equatable, Sendable {
         self.roleId = roleId
         self.content = content
         self.gitCommit = gitCommit
+        self.timestamp = timestamp
+    }
+}
+
+// MARK: - PRStatus
+
+/// Status of a GitHub pull request created by a worker.
+/// Initially `.open` when created via `TM_MSG_PR_READY` or `createPR()`;
+/// updated via the `status` field in `TM_MSG_PR_STATUS` payloads.
+/// Distinct from `PRState` in TeamMessage.swift, which maps to the C
+/// `tm_pr_state_t` for the GitHub API bridge.
+enum PRStatus: String, Sendable, Codable {
+    case open
+    case merged
+    case closed
+
+    var label: String {
+        switch self {
+        case .open:   return "Open"
+        case .merged: return "Merged"
+        case .closed: return "Closed"
+        }
+    }
+
+    var color: SwiftUI.Color {
+        switch self {
+        case .open:   return .green
+        case .merged: return .purple
+        case .closed: return .secondary
+        }
+    }
+}
+
+// MARK: - PREvent
+
+/// A pull request created by a worker, populated when `createPR()` succeeds
+/// from the UI or when a `TM_MSG_PR_READY` message arrives on the bus.
+/// Status updates arrive via `TM_MSG_PR_STATUS`.
+///
+/// The engine does not provide UUIDs — `id` is generated Swift-side for
+/// SwiftUI `ForEach` / `Identifiable` conformance.
+struct PREvent: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let workerId: UInt32
+    let branchName: String
+    let prUrl: String
+    let title: String
+    var status: PRStatus
+    let timestamp: Date
+
+    init(
+        id: UUID = UUID(),
+        workerId: UInt32,
+        branchName: String,
+        prUrl: String,
+        title: String,
+        status: PRStatus = .open,
+        timestamp: Date
+    ) {
+        self.id = id
+        self.workerId = workerId
+        self.branchName = branchName
+        self.prUrl = prUrl
+        self.title = title
+        self.status = status
         self.timestamp = timestamp
     }
 }
