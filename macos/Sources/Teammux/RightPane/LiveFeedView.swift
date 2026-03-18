@@ -31,8 +31,10 @@ struct LiveFeedView: View {
             }
 
             // Feed content
-            if engine.messages.isEmpty && engine.workerCompletions.isEmpty && engine.workerQuestions.isEmpty {
-                emptyState
+            if engine.messages.isEmpty {
+                if engine.workerCompletions.isEmpty && engine.workerQuestions.isEmpty {
+                    emptyState
+                }
             } else {
                 feedList
             }
