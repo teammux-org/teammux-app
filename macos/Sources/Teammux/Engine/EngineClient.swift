@@ -1795,9 +1795,7 @@ final class EngineClient: ObservableObject {
             }
         }
 
-        if !entries.isEmpty {
-            Self.logger.info("Loaded \(entries.count) history entries, seeded \(seenCompletions.count) completions and \(seenQuestions.count) questions")
-        }
+        Self.logger.info("loadAndSeedHistory: loaded \(entries.count) history entries, seeded \(seenCompletions.count) completions and \(seenQuestions.count) questions")
     }
 
     /// Bridge `tm_history_load` → `[HistoryEntry]`, sorted newest-first.
@@ -1810,15 +1808,24 @@ final class EngineClient: ObservableObject {
 
         var count: UInt32 = 0
         guard let entriesPtr = tm_history_load(engine, &count) else {
+            if let msg = lastEngineError() {
+                Self.logger.error("loadCompletionHistory: tm_history_load failed: \(msg)")
+            }
             return []
         }
 
         var entries: [HistoryEntry] = []
         for i in 0..<Int(count) {
-            guard let ptr = entriesPtr[i] else { continue }
+            guard let ptr = entriesPtr[i] else {
+                Self.logger.warning("loadCompletionHistory: NULL entry at index \(i) of \(count) — skipping")
+                continue
+            }
 
             let typeStr = String(cString: ptr.pointee.type)
-            guard let entryType = HistoryEntryType(rawValue: typeStr) else { continue }
+            guard let entryType = HistoryEntryType(rawValue: typeStr) else {
+                Self.logger.warning("loadCompletionHistory: unknown entry type '\(typeStr)' at index \(i) — skipping")
+                continue
+            }
 
             let roleId: String? = {
                 let s = String(cString: ptr.pointee.role_id)
