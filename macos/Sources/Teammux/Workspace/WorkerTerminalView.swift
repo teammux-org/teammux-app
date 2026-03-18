@@ -4,12 +4,47 @@ import os
 
 // MARK: - WorkerTerminalView
 
+/// SwiftUI wrapper that composes the terminal surface with overlay banners.
+///
+/// Observes `engine.hotReloadedWorkers` to show a transient "role updated"
+/// banner when the worker's role TOML file changes. The banner auto-dismisses
+/// after 3 seconds (managed by EngineClient).
+struct WorkerTerminalView: View {
+    let worker: WorkerInfo
+    @ObservedObject var engine: EngineClient
+
+    var body: some View {
+        WorkerTerminalSurface(worker: worker, engine: engine)
+            .overlay(alignment: .top) {
+                if engine.hotReloadedWorkers.contains(worker.id) {
+                    hotReloadBanner
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .padding(.top, 8)
+                }
+            }
+            .animation(.easeInOut(duration: 0.3), value: engine.hotReloadedWorkers.contains(worker.id))
+    }
+
+    // MARK: - Hot-reload banner
+
+    private var hotReloadBanner: some View {
+        Text("\u{21BB} Role updated — context refreshed")
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+    }
+}
+
+// MARK: - WorkerTerminalSurface
+
 /// NSViewRepresentable wrapping a Ghostty.SurfaceView for a single worker.
 ///
 /// Creates a terminal surface configured with the worker's agent binary,
 /// worktree path, and task description as initial input. Falls back to
 /// a plain black NSView if the Ghostty app instance is not available.
-struct WorkerTerminalView: NSViewRepresentable {
+private struct WorkerTerminalSurface: NSViewRepresentable {
     private static let logger = Logger(subsystem: "com.teammux.app", category: "WorkerTerminalView")
 
     @EnvironmentObject var ghosttyApp: Ghostty.App
@@ -45,7 +80,9 @@ struct WorkerTerminalView: NSViewRepresentable {
         }
 
         let surfaceView = Ghostty.SurfaceView(app, baseConfig: config)
-        engine.registerSurface(surfaceView, for: worker.id)
+        engine.registerSurface(surfaceView, for: worker.id) { [weak surfaceView] text in
+            surfaceView?.surfaceModel?.sendText(text)
+        }
         return surfaceView
     }
 
