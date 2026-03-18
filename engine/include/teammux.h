@@ -458,6 +458,38 @@ tm_result_t tm_peer_delegate(tm_engine_t* engine,
                               const char* task);
 
 // -----------------------------------------------------------------
+// Completion history persistence (TD16)
+//
+// Persists completion and question events to JSONL file at
+// {project_root}/.teammux/logs/completion_history.jsonl.
+// Entries are appended on every tm_worker_complete / tm_worker_question
+// call and on every /teammux-complete and /teammux-question command file.
+// Atomic write via read-rewrite-rename pattern.
+// -----------------------------------------------------------------
+
+typedef struct {
+    const char* type;           // "completion" or "question"
+    uint32_t    worker_id;
+    const char* role_id;        // empty string if unknown at engine layer
+    const char* content;        // summary (completion) or question text
+    const char* git_commit;     // HEAD at event time, may be NULL
+    uint64_t    timestamp;
+} tm_history_entry_t;
+
+// Load all history entries from the JSONL file.
+// Returns heap-allocated array. Returns NULL if no entries or error
+// (*count will be 0). Malformed lines are skipped silently.
+// Caller must call tm_history_free().
+tm_history_entry_t** tm_history_load(tm_engine_t* engine, uint32_t* count);
+
+// Free entries returned by tm_history_load.
+void tm_history_free(tm_history_entry_t** entries, uint32_t count);
+
+// Clear all history entries (truncates the JSONL file to zero length).
+// Missing file is a no-op (returns TM_OK).
+tm_result_t tm_history_clear(tm_engine_t* engine);
+
+// -----------------------------------------------------------------
 // Utility
 // -----------------------------------------------------------------
 
