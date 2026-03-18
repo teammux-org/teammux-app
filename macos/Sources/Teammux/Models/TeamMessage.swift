@@ -6,7 +6,8 @@ import os
 /// Maps to `tm_message_type_t` in teammux.h.
 /// TASK=0, INSTRUCTION=1, CONTEXT=2, STATUS_REQ=3, STATUS_RPT=4,
 /// COMPLETION=5, ERROR=6, BROADCAST=7, QUESTION=8, DISPATCH=10,
-/// RESPONSE=11, PEER_QUESTION=12, DELEGATION=13
+/// RESPONSE=11, PEER_QUESTION=12, DELEGATION=13,
+/// PR_READY=14, PR_STATUS=15
 enum MessageType: Int, CaseIterable, Sendable {
     case task         = 0
     case instruction  = 1
@@ -21,6 +22,8 @@ enum MessageType: Int, CaseIterable, Sendable {
     case response     = 11
     case peerQuestion = 12
     case delegation   = 13
+    case prReady      = 14
+    case prStatus     = 15
 
     private static let logger = Logger(subsystem: "com.teammux.app", category: "MessageType")
 
@@ -40,6 +43,8 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .response:     return .teal
         case .peerQuestion: return .cyan
         case .delegation:   return .purple
+        case .prReady:      return .green
+        case .prStatus:     return .purple
         }
     }
 
@@ -59,6 +64,8 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .response:     return "Response"
         case .peerQuestion: return "Peer Question"
         case .delegation:   return "Delegation"
+        case .prReady:      return "PR Ready"
+        case .prStatus:     return "PR Status"
         }
     }
 

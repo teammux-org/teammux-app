@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import os
 
 // MARK: - GitView
@@ -63,8 +64,33 @@ struct GitView: View {
 
     // MARK: - Git list
 
+    /// Sorted PR events for display: open first, then merged, then closed.
+    private var sortedPREvents: [PREvent] {
+        engine.workerPRs.values.sorted { a, b in
+            let order: (PRStatus) -> Int = { status in
+                switch status {
+                case .open:   return 0
+                case .merged: return 1
+                case .closed: return 2
+                }
+            }
+            if order(a.status) != order(b.status) {
+                return order(a.status) < order(b.status)
+            }
+            return a.timestamp > b.timestamp
+        }
+    }
+
     private var gitList: some View {
         List {
+            if !engine.workerPRs.isEmpty {
+                Section("Pull Requests") {
+                    ForEach(sortedPREvents) { prEvent in
+                        PRCardView(prEvent: prEvent, engine: engine)
+                    }
+                }
+            }
+
             Section("Main branch") {
                 HStack(spacing: 8) {
                     Circle()
@@ -417,5 +443,141 @@ struct GitWorkerRow: View {
             }
             isCreatingPR = false
         }
+    }
+}
+
+// MARK: - PRCardView
+
+/// A card in the Pull Requests section showing a worker's PR with status badge,
+/// title, branch name, and action buttons (Approve, Reject, Open in GitHub).
+struct PRCardView: View {
+    let prEvent: PREvent
+    @ObservedObject var engine: EngineClient
+
+    @State private var isMergeActionInFlight = false
+    @State private var actionError: String?
+
+    /// Worker name from the roster, or a fallback label.
+    private var workerName: String {
+        engine.roster.first { $0.id == prEvent.workerId }?.name ?? "Worker \(prEvent.workerId)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Header: status badge + title
+            HStack(spacing: 8) {
+                prStatusBadge
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(prEvent.title.isEmpty ? workerName : prEvent.title)
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    if !prEvent.branchName.isEmpty {
+                        Text(prEvent.branchName)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+
+                Spacer()
+
+                Text(workerName)
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+            }
+
+            // Actions: Approve / Reject / Open in GitHub
+            HStack(spacing: 8) {
+                if prEvent.status == .open {
+                    Button(action: approveMerge) {
+                        if isMergeActionInFlight {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("Approve", systemImage: "checkmark.circle")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(.green)
+                    .disabled(isMergeActionInFlight)
+
+                    Button(action: rejectMerge) {
+                        Label("Reject", systemImage: "xmark.circle")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(.red)
+                    .disabled(isMergeActionInFlight)
+                }
+
+                Spacer()
+
+                if !prEvent.prUrl.isEmpty {
+                    Button(action: openInGitHub) {
+                        Label("Open in GitHub", systemImage: "arrow.up.right.square")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            if let error = actionError {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    // MARK: - Status badge
+
+    private var prStatusBadge: some View {
+        Text(prEvent.status.label)
+            .font(.system(size: 9, weight: .medium))
+            .foregroundColor(prEvent.status.color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(prEvent.status.color.opacity(0.12))
+            .cornerRadius(4)
+    }
+
+    // MARK: - Actions
+
+    private func approveMerge() {
+        isMergeActionInFlight = true
+        actionError = nil
+        Task { @MainActor in
+            let success = engine.approveMerge(workerId: prEvent.workerId, strategy: .merge)
+            if !success {
+                actionError = engine.lastError ?? "Failed to approve merge"
+            }
+            isMergeActionInFlight = false
+        }
+    }
+
+    private func rejectMerge() {
+        isMergeActionInFlight = true
+        actionError = nil
+        Task { @MainActor in
+            let success = engine.rejectMerge(workerId: prEvent.workerId)
+            if !success {
+                actionError = engine.lastError ?? "Failed to reject merge"
+            }
+            isMergeActionInFlight = false
+        }
+    }
+
+    private func openInGitHub() {
+        guard let url = URL(string: prEvent.prUrl) else { return }
+        NSWorkspace.shared.open(url)
     }
 }
