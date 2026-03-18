@@ -1,5 +1,6 @@
 const std = @import("std");
 const worktree = @import("worktree.zig");
+const bus = @import("bus.zig");
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -44,6 +45,11 @@ pub const Diff = struct {
 // GitHub Client
 // ─────────────────────────────────────────────────────────
 
+/// Callback for routing messages to the bus.
+/// Args: (to_worker_id, from_worker_id, msg_type_int, payload_json, userdata) → tm_result_t
+/// See also: commands.BusSendFn (identical signature).
+pub const BusSendFn = *const fn (u32, u32, c_int, ?[*:0]const u8, ?*anyopaque) callconv(.c) c_int;
+
 pub const GitHubClient = struct {
     allocator: std.mem.Allocator,
     repo: ?[]const u8,
@@ -55,6 +61,8 @@ pub const GitHubClient = struct {
     event_callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
     event_userdata: ?*anyopaque,
     last_event_id: ?[]const u8,
+    bus_send_fn: ?BusSendFn,
+    bus_send_userdata: ?*anyopaque,
 
     pub fn init(allocator: std.mem.Allocator, repo: ?[]const u8) GitHubClient {
         return .{
@@ -68,6 +76,8 @@ pub const GitHubClient = struct {
             .event_callback = null,
             .event_userdata = null,
             .last_event_id = null,
+            .bus_send_fn = null,
+            .bus_send_userdata = null,
         };
     }
 
@@ -100,6 +110,7 @@ pub const GitHubClient = struct {
     }
 
     /// Create a GitHub PR for a worker's branch → main.
+    /// gh pr create outputs the PR URL as plain text to stdout on success.
     pub fn createPr(
         self: *GitHubClient,
         allocator: std.mem.Allocator,
@@ -109,21 +120,20 @@ pub const GitHubClient = struct {
     ) !Pr {
         const repo = self.repo orelse return error.NoRepo;
 
-        // Use gh CLI to create PR
         const result = try runGhCommand(allocator, &.{
-            "pr",  "create",
-            "--repo", repo,
-            "--head", branch,
+            "pr",     "create",
+            "--repo",  repo,
+            "--head",  branch,
             "--title", title,
             "--body",  body,
         });
         defer allocator.free(result);
 
-        // Parse PR URL from output (gh pr create outputs the URL)
+        // gh pr create outputs the PR URL as plain text
         const url = try allocator.dupe(u8, std.mem.trim(u8, result, &[_]u8{ '\n', '\r', ' ' }));
 
         return .{
-            .pr_number = 0, // Would parse from URL in production
+            .pr_number = 0,
             .url = url,
             .title = try allocator.dupe(u8, title),
             .state = try allocator.dupe(u8, "open"),
@@ -317,6 +327,11 @@ pub const GitHubClient = struct {
             const branch = extractBranch(event, event_type) orelse continue;
             if (!isTeammuxBranch(branch)) continue;
 
+            // Route PR status changes through bus for teammux/* branches
+            if (std.mem.eql(u8, event_type, "PullRequestEvent")) {
+                self.routePrStatusEvent(allocator, event, branch);
+            }
+
             const mapped_type = mapEventType(event_type) orelse continue;
 
             const callback = self.event_callback orelse continue;
@@ -335,6 +350,91 @@ pub const GitHubClient = struct {
             const new_id = allocator.dupe(u8, nid) catch return;
             if (self.last_event_id) |old| allocator.free(old);
             self.last_event_id = new_id;
+        }
+    }
+
+    /// Route a PullRequestEvent as TM_MSG_PR_STATUS=15 through the bus.
+    /// Extracts PR status, URL, and worker ID from the event payload.
+    fn routePrStatusEvent(self: *GitHubClient, allocator: std.mem.Allocator, event: std.json.Value, branch: []const u8) void {
+        const send_fn = self.bus_send_fn orelse return; // Feature not wired — acceptable silent return
+
+        const obj = switch (event) {
+            .object => |o| o,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: event is not an object", .{});
+                return;
+            },
+        };
+        const payload_obj = switch (obj.get("payload") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing payload in PullRequestEvent", .{});
+            return;
+        }) {
+            .object => |o| o,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: payload is not an object", .{});
+                return;
+            },
+        };
+
+        // Determine status from action + merged flag
+        const action = switch (payload_obj.get("action") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing action in PullRequestEvent", .{});
+            return;
+        }) {
+            .string => |s| s,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: action is not a string", .{});
+                return;
+            },
+        };
+        const status = mapPrAction(payload_obj, action) orelse return; // Irrelevant action (e.g. "labeled") — acceptable silent skip
+
+        // Extract PR URL from payload.pull_request.html_url
+        const pr_obj = switch (payload_obj.get("pull_request") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing pull_request object", .{});
+            return;
+        }) {
+            .object => |o| o,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: pull_request is not an object", .{});
+                return;
+            },
+        };
+        const pr_url = switch (pr_obj.get("html_url") orelse {
+            std.log.warn("[teammux] routePrStatusEvent: missing html_url in pull_request", .{});
+            return;
+        }) {
+            .string => |s| s,
+            else => {
+                std.log.warn("[teammux] routePrStatusEvent: html_url is not a string", .{});
+                return;
+            },
+        };
+
+        // Extract worker ID from branch name
+        const worker_id = extractWorkerIdFromBranch(branch) orelse {
+            std.log.warn("[teammux] routePrStatusEvent: cannot extract worker_id from branch '{s}'", .{branch});
+            return;
+        };
+
+        // Build payload JSON: {"pr_url":"...","status":"...","worker_id":N}
+        const payload_json = std.fmt.allocPrint(allocator,
+            \\{{"pr_url":"{s}","status":"{s}","worker_id":{d}}}
+        , .{ pr_url, status, worker_id }) catch {
+            std.log.warn("[teammux] routePrStatusEvent: payload allocation failed", .{});
+            return;
+        };
+        defer allocator.free(payload_json);
+
+        const payload_z = allocator.dupeZ(u8, payload_json) catch {
+            std.log.warn("[teammux] routePrStatusEvent: payload dupeZ failed", .{});
+            return;
+        };
+        defer allocator.free(payload_z);
+
+        const rc = send_fn(0, worker_id, @intFromEnum(bus.MessageType.pr_status), payload_z.ptr, self.bus_send_userdata);
+        if (rc != 0) {
+            std.log.warn("[teammux] PR status bus send failed: rc={d}", .{rc});
         }
     }
 
@@ -538,6 +638,78 @@ fn isGhAvailable(allocator: std.mem.Allocator) bool {
     return term == .Exited and term.Exited == 0;
 }
 
+/// Extract worker ID from a teammux branch name.
+/// T1's makeBranch produces: teammux/{worker_id}-{slug}
+/// Pattern: teammux/{id}-* or refs/heads/teammux/{id}-*
+/// Returns null if pattern does not match.
+pub fn extractWorkerIdFromBranch(branch: []const u8) ?u32 {
+    // Strip refs/heads/ prefix if present
+    const stripped = if (std.mem.startsWith(u8, branch, "refs/heads/"))
+        branch["refs/heads/".len..]
+    else
+        branch;
+
+    // Must start with teammux/
+    const prefix = "teammux/";
+    if (!std.mem.startsWith(u8, stripped, prefix)) return null;
+
+    const after_prefix = stripped[prefix.len..];
+    // Parse leading digits before the first '-'
+    var end: usize = 0;
+    while (end < after_prefix.len and after_prefix[end] >= '0' and after_prefix[end] <= '9') : (end += 1) {}
+    if (end == 0) return null;
+
+    return std.fmt.parseInt(u32, after_prefix[0..end], 10) catch null;
+}
+
+/// Map GitHub PullRequestEvent action to PR status string.
+/// "closed" with merged=true → "merged", "closed" with merged=false → "closed",
+/// "opened"/"reopened" → "open". Returns null for irrelevant actions.
+fn mapPrAction(payload_obj: std.json.ObjectMap, action: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, action, "opened") or std.mem.eql(u8, action, "reopened")) {
+        return "open";
+    }
+    if (std.mem.eql(u8, action, "closed")) {
+        // Check if merged
+        const pr_obj = switch (payload_obj.get("pull_request") orelse return "closed") {
+            .object => |o| o,
+            else => return "closed",
+        };
+        const merged = switch (pr_obj.get("merged") orelse return "closed") {
+            .bool => |b| b,
+            else => return "closed",
+        };
+        return if (merged) "merged" else "closed";
+    }
+    return null;
+}
+
+/// Extract a quoted string value for a given key from a flat JSON string.
+/// Simple scan approach matching the codebase pattern in commands.zig.
+fn extractJsonStringSimple(json: []const u8, key: []const u8) ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    const search = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return null;
+
+    const key_pos = std.mem.indexOf(u8, json, search) orelse return null;
+    const after_key = json[key_pos + search.len ..];
+
+    var i: usize = 0;
+    while (i < after_key.len and (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1) {}
+    if (i >= after_key.len or after_key[i] != '"') return null;
+    i += 1; // skip opening quote
+
+    const start = i;
+    while (i < after_key.len) : (i += 1) {
+        if (after_key[i] == '\\' and i + 1 < after_key.len) {
+            i += 1;
+            continue;
+        }
+        if (after_key[i] == '"') break;
+    }
+    if (i >= after_key.len) return null;
+    return after_key[start..i];
+}
+
 // ─────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────
@@ -673,7 +845,7 @@ test "github - processEvents fires callback for push on teammux branch" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"100","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+        \\[{"id":"100","type":"PushEvent","payload":{"ref":"refs/heads/teammux/1-push-feature"}}]
     ;
 
     try client.processEvents(json);
@@ -690,7 +862,7 @@ test "github - processEvents fires callback for PR on teammux branch" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"200","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"head":{"ref":"teammux/worker-2"}}}}]
+        \\[{"id":"200","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"head":{"ref":"teammux/2-implement-auth"}}}}]
     ;
 
     try client.processEvents(json);
@@ -723,7 +895,7 @@ test "github - processEvents deduplicates by event ID" {
     client.event_userdata = @ptrCast(&test_data);
 
     const json =
-        \\[{"id":"400","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+        \\[{"id":"400","type":"PushEvent","payload":{"ref":"refs/heads/teammux/1-dedup-feature"}}]
     ;
 
     try client.processEvents(json);
@@ -735,8 +907,8 @@ test "github - processEvents deduplicates by event ID" {
 }
 
 test "github - isTeammuxBranch matches correct patterns" {
-    try std.testing.expect(isTeammuxBranch("refs/heads/teammux/worker-1"));
-    try std.testing.expect(isTeammuxBranch("teammux/worker-2"));
+    try std.testing.expect(isTeammuxBranch("refs/heads/teammux/1-push-feature"));
+    try std.testing.expect(isTeammuxBranch("teammux/2-implement-auth"));
     try std.testing.expect(!isTeammuxBranch("refs/heads/main"));
     try std.testing.expect(!isTeammuxBranch("feature/something"));
 }
@@ -808,9 +980,9 @@ test "github - processEvents handles multi-event batch with dedup" {
 
     // Batch: 2 teammux branches + 1 main (newest first)
     const json =
-        \\[{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-3"}},
+        \\[{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/3-fix-bug"}},
         \\{"id":"602","type":"PushEvent","payload":{"ref":"refs/heads/main"}},
-        \\{"id":"601","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-1"}}]
+        \\{"id":"601","type":"PushEvent","payload":{"ref":"refs/heads/teammux/1-add-tests"}}]
     ;
 
     try client.processEvents(json);
@@ -822,11 +994,239 @@ test "github - processEvents handles multi-event batch with dedup" {
     test_data.callback_count = 0;
     test_data.push_count = 0;
     const json2 =
-        \\[{"id":"604","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-4"}},
-        \\{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/worker-3"}}]
+        \\[{"id":"604","type":"PushEvent","payload":{"ref":"refs/heads/teammux/4-refactor"}},
+        \\{"id":"603","type":"PushEvent","payload":{"ref":"refs/heads/teammux/3-fix-bug"}}]
     ;
 
     try client.processEvents(json2);
     try std.testing.expect(test_data.callback_count == 1);
     try std.testing.expectEqualStrings("604", client.last_event_id.?);
+}
+
+// ─── T7 tests ────────────────────────────────────────────
+
+test "github - extractWorkerIdFromBranch parses valid patterns" {
+    // T1 makeBranch format: teammux/{worker_id}-{slug}
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/2-implement-auth").? == 2);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/0-setup").? == 0);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/42-long-task-name").? == 42);
+    try std.testing.expect(extractWorkerIdFromBranch("refs/heads/teammux/7-fix-bug").? == 7);
+}
+
+test "github - extractWorkerIdFromBranch returns null for invalid patterns" {
+    try std.testing.expect(extractWorkerIdFromBranch("main") == null);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/feature-branch") == null);
+    try std.testing.expect(extractWorkerIdFromBranch("feature/2-auth") == null);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/abc-auth") == null);
+    try std.testing.expect(extractWorkerIdFromBranch("teammux/worker-2-auth") == null);
+}
+
+test "github - extractJsonStringSimple parses url from gh JSON output" {
+    const json = "{\"url\":\"https://github.com/owner/repo/pull/42\"}";
+    const url = extractJsonStringSimple(json, "url");
+    try std.testing.expect(url != null);
+    try std.testing.expectEqualStrings("https://github.com/owner/repo/pull/42", url.?);
+}
+
+test "github - extractJsonStringSimple returns null for missing key" {
+    const json = "{\"other\":\"value\"}";
+    try std.testing.expect(extractJsonStringSimple(json, "url") == null);
+}
+
+test "github - extractJsonStringSimple handles whitespace" {
+    const json = "{ \"url\" : \"https://example.com\" }";
+    const url = extractJsonStringSimple(json, "url");
+    try std.testing.expect(url != null);
+    try std.testing.expectEqualStrings("https://example.com", url.?);
+}
+
+const BusTestData = struct {
+    call_count: u32 = 0,
+    last_to: u32 = 99,
+    last_from: u32 = 99,
+    last_msg_type: c_int = -1,
+    last_payload: [512]u8 = undefined,
+    last_payload_len: usize = 0,
+};
+
+fn testBusSend(to: u32, from: u32, msg_type: c_int, payload: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) c_int {
+    if (userdata) |ud| {
+        const data: *BusTestData = @ptrCast(@alignCast(ud));
+        data.call_count += 1;
+        data.last_to = to;
+        data.last_from = from;
+        data.last_msg_type = msg_type;
+        if (payload) |p| {
+            const slice = std.mem.span(p);
+            const len = @min(slice.len, data.last_payload.len);
+            @memcpy(data.last_payload[0..len], slice[0..len]);
+            data.last_payload_len = len;
+        }
+    }
+    return 0;
+}
+
+test "github - processEvents routes PR status for teammux branch via bus_send_fn" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    // Also need event_callback set (processEvents uses it for generic forwarding)
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"700","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"html_url":"https://github.com/o/r/pull/1","merged":false,"head":{"ref":"teammux/3-implement-auth"}}}}]
+    ;
+
+    try client.processEvents(json);
+
+    // Bus should have been called with TM_MSG_PR_STATUS=15
+    try std.testing.expect(bus_data.call_count == 1);
+    try std.testing.expect(bus_data.last_msg_type == @intFromEnum(bus.MessageType.pr_status));
+    try std.testing.expect(bus_data.last_to == 0); // Team Lead
+    try std.testing.expect(bus_data.last_from == 3); // worker_id from branch
+
+    // Payload should contain status "open"
+    const payload_slice = bus_data.last_payload[0..bus_data.last_payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"status\":\"open\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"worker_id\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "https://github.com/o/r/pull/1") != null);
+}
+
+test "github - processEvents detects merged PR status" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"701","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/2","merged":true,"head":{"ref":"teammux/5-fix-login"}}}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(bus_data.call_count == 1);
+
+    const payload_slice = bus_data.last_payload[0..bus_data.last_payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"status\":\"merged\"") != null);
+    try std.testing.expect(bus_data.last_from == 5);
+}
+
+test "github - processEvents detects closed (not merged) PR status" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"702","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/3","merged":false,"head":{"ref":"teammux/1-add-feature"}}}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(bus_data.call_count == 1);
+
+    const payload_slice = bus_data.last_payload[0..bus_data.last_payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"status\":\"closed\"") != null);
+    try std.testing.expect(bus_data.last_from == 1);
+}
+
+test "github - processEvents does not route PR status for non-teammux branch" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"703","type":"PullRequestEvent","payload":{"action":"opened","pull_request":{"html_url":"https://github.com/o/r/pull/4","merged":false,"head":{"ref":"feature/some-branch"}}}}]
+    ;
+
+    try client.processEvents(json);
+    // Bus should NOT have been called (non-teammux branch)
+    try std.testing.expect(bus_data.call_count == 0);
+    // Event callback also not called (filtered by isTeammuxBranch)
+    try std.testing.expect(test_data.callback_count == 0);
+}
+
+test "github - processEvents maps reopened action to open status" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    const json =
+        \\[{"id":"710","type":"PullRequestEvent","payload":{"action":"reopened","pull_request":{"html_url":"https://github.com/o/r/pull/10","merged":false,"head":{"ref":"teammux/8-reopen-task"}}}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(bus_data.call_count == 1);
+
+    const payload_slice = bus_data.last_payload[0..bus_data.last_payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"status\":\"open\"") != null);
+    try std.testing.expect(bus_data.last_from == 8);
+}
+
+test "github - processEvents defaults to closed when merged field missing" {
+    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    defer client.deinit();
+
+    var bus_data = BusTestData{};
+    client.bus_send_fn = testBusSend;
+    client.bus_send_userdata = @ptrCast(&bus_data);
+
+    var test_data = TestCallbackData{};
+    client.event_callback = testPollCallback;
+    client.event_userdata = @ptrCast(&test_data);
+
+    // closed action but no "merged" field in pull_request — should default to "closed"
+    const json =
+        \\[{"id":"711","type":"PullRequestEvent","payload":{"action":"closed","pull_request":{"html_url":"https://github.com/o/r/pull/11","head":{"ref":"teammux/9-close-task"}}}}]
+    ;
+
+    try client.processEvents(json);
+    try std.testing.expect(bus_data.call_count == 1);
+
+    const payload_slice = bus_data.last_payload[0..bus_data.last_payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"status\":\"closed\"") != null);
+    try std.testing.expect(bus_data.last_from == 9);
+}
+
+test "github - extractJsonStringSimple handles escaped quotes in value" {
+    const json = "{\"title\":\"Fix \\\"null\\\" handling\"}";
+    const title = extractJsonStringSimple(json, "title");
+    try std.testing.expect(title != null);
+    // extractJsonStringSimple skips escaped quotes — returns content between outer quotes
+    try std.testing.expect(std.mem.indexOf(u8, title.?, "null") != null);
+}
+
+test "github - extractJsonStringSimple returns null for truncated input" {
+    const json = "{\"url\":\"https://example.com";
+    try std.testing.expect(extractJsonStringSimple(json, "url") == null);
 }

@@ -161,10 +161,14 @@ pub const Engine = struct {
             self.setError("history logger init failed") catch {};
             return err;
         };
+        // Wire bus routing for PR status events from GitHub polling
+        self.github_client.bus_send_fn = busSendBridge;
+        self.github_client.bus_send_userdata = self;
     }
 
-    /// Bridge function for CommandWatcher → MessageBus routing.
-    /// Called by commands.zig when /teammux-complete or /teammux-question is detected.
+    /// Bridge function for MessageBus routing from both CommandWatcher and GitHubClient.
+    /// Called by commands.zig for /teammux-complete and /teammux-question, and by
+    /// github.zig for TM_MSG_PR_STATUS events from GitHub polling.
     /// Returns 0 on success, 8 (TM_ERR_BUS) on bus failure, 99 (TM_ERR_UNKNOWN) on invalid input.
     fn busSendBridge(to: u32, from: u32, msg_type: c_int, payload: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) c_int {
         const self: *Engine = @ptrCast(@alignCast(userdata orelse return 99));
@@ -181,7 +185,7 @@ pub const Engine = struct {
             return 8;
         });
         b.send(to, from, msg_enum, payload_span) catch |err| {
-            self.setError(if (err == error.DeliveryFailed) "completion/question delivery failed after retries exhausted" else "completion/question bus send failed") catch {};
+            self.setError(if (err == error.DeliveryFailed) "bus message delivery failed after retries exhausted" else "bus message send failed") catch {};
             return 8;
         };
 
@@ -554,17 +558,39 @@ export fn tm_github_create_pr(engine: ?*Engine, worker_id: u32, title: ?[*:0]con
         return null;
     };
     const alloc = e.allocator;
-    const pr = e.github_client.createPr(alloc, w.branch_name, std.mem.span(title orelse return null), std.mem.span(body orelse return null)) catch {
+    const title_slice = std.mem.span(title orelse {
+        e.setError("PR creation failed: title is NULL") catch {};
+        return null;
+    });
+    const body_slice = std.mem.span(body orelse {
+        e.setError("PR creation failed: body is NULL") catch {};
+        return null;
+    });
+    const branch_name = w.branch_name;
+    const pr = e.github_client.createPr(alloc, branch_name, title_slice, body_slice) catch {
         e.setError("PR creation failed: gh CLI error") catch {};
+        routePrError(e, worker_id, "gh pr create failed");
         return null;
     };
+
+    // Route TM_MSG_PR_READY=14 through bus immediately after creation succeeds.
+    // Done before C struct allocation so bus notification is not lost if alloc fails.
+    routePrReady(e, worker_id, pr.url, branch_name, title_slice);
+
     const c_pr = alloc.create(CPr) catch return null;
     const url_z = alloc.dupeZ(u8, pr.url) catch { alloc.destroy(c_pr); return null; };
     const title_z = alloc.dupeZ(u8, pr.title) catch { alloc.free(url_z); alloc.destroy(c_pr); return null; };
     const diff_z = alloc.dupeZ(u8, pr.diff_url) catch { alloc.free(title_z); alloc.free(url_z); alloc.destroy(c_pr); return null; };
     c_pr.* = .{ .pr_number = pr.pr_number, .pr_url = url_z.ptr, .title = title_z.ptr, .state = 0, .diff_url = diff_z.ptr, .worker_id = worker_id };
+
     alloc.free(pr.url); alloc.free(pr.title); alloc.free(pr.state); alloc.free(pr.diff_url);
     return c_pr;
+}
+
+/// Forwarding wrapper for tm_github_create_pr. The branch parameter is unused;
+/// the actual branch is resolved from the roster via worker_id.
+export fn tm_pr_create(engine: ?*Engine, worker_id: u32, title: ?[*:0]const u8, body: ?[*:0]const u8, _: ?[*:0]const u8) ?*CPr {
+    return tm_github_create_pr(engine, worker_id, title, body);
 }
 export fn tm_pr_free(pr: ?*CPr) void {
     if (pr) |p| { freeNullTerminated(p.pr_url); freeNullTerminated(p.title); freeNullTerminated(p.diff_url); std.heap.c_allocator.destroy(p); }
@@ -624,6 +650,10 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
     }
     if (std.mem.eql(u8, cmd, "/teammux-delegate")) {
         handleDelegationCommand(engine, args_ptr);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "/teammux-pr-ready")) {
+        handlePrReadyCommand(engine, args_ptr);
         return;
     }
 
@@ -796,6 +826,95 @@ fn handleDelegationCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         std.log.warn("[teammux] /teammux-delegate: bus send failed: {s}", .{@errorName(err)});
         // Notify sender that delivery failed
         b.send(from_id, 0, .err, "\"[Teammux] peer message delivery failed\"") catch {};
+    };
+}
+
+/// Handle /teammux-pr-ready command. Parses worker_id, title, and summary from JSON args,
+/// then delegates to tm_github_create_pr (which routes TM_MSG_PR_READY on success, TM_MSG_ERROR on failure).
+fn handlePrReadyCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
+    const args = std.mem.span(args_ptr orelse {
+        std.log.warn("[teammux] /teammux-pr-ready: args is NULL (expected JSON body)", .{});
+        return;
+    });
+
+    // Parse worker_id
+    const id_str = extractJsonStringValue(args, "worker_id") orelse
+        extractJsonNumber(args, "worker_id");
+    if (id_str == null) {
+        std.log.warn("[teammux] /teammux-pr-ready: missing worker_id", .{});
+        return;
+    }
+    const worker_id = std.fmt.parseInt(u32, id_str.?, 10) catch {
+        std.log.warn("[teammux] /teammux-pr-ready: invalid worker_id", .{});
+        return;
+    };
+
+    const title_val = extractJsonStringValue(args, "title") orelse {
+        std.log.warn("[teammux] /teammux-pr-ready: missing title", .{});
+        return;
+    };
+    const summary = extractJsonStringValue(args, "summary") orelse "";
+
+    // Create PR via tm_github_create_pr (which also routes TM_MSG_PR_READY)
+    const title_z = engine.allocator.dupeZ(u8, title_val) catch {
+        std.log.warn("[teammux] /teammux-pr-ready: alloc failed", .{});
+        return;
+    };
+    defer engine.allocator.free(title_z);
+    const summary_z = engine.allocator.dupeZ(u8, summary) catch {
+        std.log.warn("[teammux] /teammux-pr-ready: alloc failed", .{});
+        return;
+    };
+    defer engine.allocator.free(summary_z);
+
+    const result = tm_github_create_pr(engine, worker_id, title_z.ptr, summary_z.ptr);
+    if (result) |pr| {
+        tm_pr_free(pr);
+    } else {
+        std.log.warn("[teammux] /teammux-pr-ready: PR creation failed for worker {d}", .{worker_id});
+    }
+}
+
+/// Route TM_MSG_PR_READY=14 through the bus after successful PR creation.
+/// Best-effort — the PR already exists on GitHub regardless of bus delivery.
+fn routePrReady(engine: *Engine, worker_id: u32, pr_url: []const u8, branch: []const u8, title_slice: []const u8) void {
+    var b = &(engine.message_bus orelse {
+        std.log.warn("[teammux] routePrReady: bus not initialized, TM_MSG_PR_READY for worker {d} dropped", .{worker_id});
+        return;
+    });
+    // Escape title for safe JSON interpolation (user-controlled input may contain quotes)
+    const escaped_title = jsonEscape(engine.allocator, title_slice) catch {
+        std.log.warn("[teammux] routePrReady: title escape failed for worker {d}", .{worker_id});
+        return;
+    };
+    defer engine.allocator.free(escaped_title);
+    const payload = std.fmt.allocPrint(engine.allocator,
+        \\{{"worker_id":{d},"pr_url":"{s}","branch":"{s}","title":"{s}"}}
+    , .{ worker_id, pr_url, branch, escaped_title }) catch {
+        std.log.warn("[teammux] routePrReady: payload allocation failed for worker {d}", .{worker_id});
+        return;
+    };
+    defer engine.allocator.free(payload);
+    b.send(0, worker_id, .pr_ready, payload) catch |err| {
+        std.log.warn("[teammux] TM_MSG_PR_READY bus send failed: {s}", .{@errorName(err)});
+    };
+}
+
+/// Route TM_MSG_ERROR through the bus when PR creation fails.
+fn routePrError(engine: *Engine, worker_id: u32, message: []const u8) void {
+    var b = &(engine.message_bus orelse {
+        std.log.warn("[teammux] routePrError: bus not initialized, TM_MSG_ERROR for worker {d} dropped", .{worker_id});
+        return;
+    });
+    const payload = std.fmt.allocPrint(engine.allocator,
+        \\{{"worker_id":{d},"error":"{s}"}}
+    , .{ worker_id, message }) catch {
+        std.log.warn("[teammux] routePrError: payload allocation failed for worker {d}", .{worker_id});
+        return;
+    };
+    defer engine.allocator.free(payload);
+    b.send(0, worker_id, .err, payload) catch |err| {
+        std.log.warn("[teammux] TM_MSG_ERROR bus send failed for worker {d}: {s}", .{ worker_id, @errorName(err) });
     };
 }
 
@@ -4604,6 +4723,232 @@ test "S12 integration: tm_dispatch_task routes through bus to subscriber (S5 pat
 
     // Invalid worker returns TM_ERR_INVALID_WORKER
     try std.testing.expect(tm_dispatch_task(e, 999, instruction_z.ptr) == 12);
+}
+
+// ─── T7 tests: PR workflow ────────────────────────────────
+
+test "tm_pr_create null engine returns null" {
+    try std.testing.expect(tm_pr_create(null, 0, null, null, null) == null);
+}
+
+test "tm_github_create_pr null engine returns null" {
+    try std.testing.expect(tm_github_create_pr(null, 0, null, null) == null);
+}
+
+test "command routing wrapper routes /teammux-pr-ready" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    // Start session to initialize bus
+    e.sessionStart() catch {};
+
+    const PrState = struct {
+        var command_forwarded: bool = false;
+    };
+    PrState.command_forwarded = false;
+
+    const swift_cb = struct {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            PrState.command_forwarded = true;
+        }
+    }.cb;
+    e.cmd_cb = swift_cb;
+
+    // /teammux-pr-ready should be handled internally, NOT forwarded to Swift
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": 1, \"title\": \"test PR\", \"summary\": \"summary\"}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    // Should NOT have been forwarded to Swift callback
+    try std.testing.expect(!PrState.command_forwarded);
+}
+
+test "command routing wrapper still forwards unknown commands" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const FwdState = struct {
+        var forwarded: bool = false;
+    };
+    FwdState.forwarded = false;
+
+    const swift_cb = struct {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            FwdState.forwarded = true;
+        }
+    }.cb;
+    e.cmd_cb = swift_cb;
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-unknown") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    try std.testing.expect(FwdState.forwarded);
+}
+
+test "routePrReady sends TM_MSG_PR_READY to bus" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    // Init git repo for bus git_commit
+    worktree.runGit(alloc, project_root, &.{ "init", "-b", "main" }) catch {};
+    worktree.runGit(alloc, project_root, &.{ "config", "user.email", "t@t.com" }) catch {};
+    worktree.runGit(alloc, project_root, &.{ "config", "user.name", "T" }) catch {};
+    const readme = try std.fmt.allocPrint(alloc, "{s}/README.md", .{project_root});
+    defer alloc.free(readme);
+    {
+        const f = try std.fs.createFileAbsolute(readme, .{});
+        try f.writeAll("#");
+        f.close();
+    }
+    worktree.runGit(alloc, project_root, &.{ "add", "." }) catch {};
+    worktree.runGit(alloc, project_root, &.{ "commit", "-m", "init" }) catch {};
+
+    const e = Engine.create(alloc, project_root) catch return;
+    defer e.destroy();
+    e.sessionStart() catch return;
+
+    const State = struct {
+        var received: bool = false;
+        var msg_type: c_int = -1;
+        var payload_buf: [512]u8 = undefined;
+        var payload_len: usize = 0;
+    };
+    State.received = false;
+    State.msg_type = -1;
+    State.payload_len = 0;
+
+    const cb = struct {
+        fn f(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                State.received = true;
+                State.msg_type = m.msg_type;
+                if (m.payload) |p| {
+                    const s = std.mem.span(p);
+                    const len = @min(s.len, State.payload_buf.len);
+                    @memcpy(State.payload_buf[0..len], s[0..len]);
+                    State.payload_len = len;
+                }
+            }
+            return 0;
+        }
+    }.f;
+
+    if (e.message_bus) |*b| b.subscribe(cb, null);
+
+    routePrReady(e, 2, "https://github.com/o/r/pull/1", "teammux/2-implement-auth", "Add auth");
+
+    try std.testing.expect(State.received);
+    try std.testing.expect(State.msg_type == @intFromEnum(bus.MessageType.pr_ready));
+    const payload_slice = State.payload_buf[0..State.payload_len];
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "\"worker_id\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "https://github.com/o/r/pull/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "teammux/2-implement-auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload_slice, "Add auth") != null);
+}
+
+test "routePrError sends TM_MSG_ERROR to bus" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(project_root);
+
+    worktree.runGit(alloc, project_root, &.{ "init", "-b", "main" }) catch {};
+    worktree.runGit(alloc, project_root, &.{ "config", "user.email", "t@t.com" }) catch {};
+    worktree.runGit(alloc, project_root, &.{ "config", "user.name", "T" }) catch {};
+    const readme = try std.fmt.allocPrint(alloc, "{s}/README.md", .{project_root});
+    defer alloc.free(readme);
+    {
+        const f = try std.fs.createFileAbsolute(readme, .{});
+        try f.writeAll("#");
+        f.close();
+    }
+    worktree.runGit(alloc, project_root, &.{ "add", "." }) catch {};
+    worktree.runGit(alloc, project_root, &.{ "commit", "-m", "init" }) catch {};
+
+    const e = Engine.create(alloc, project_root) catch return;
+    defer e.destroy();
+    e.sessionStart() catch return;
+
+    const ErrState = struct {
+        var received: bool = false;
+        var msg_type: c_int = -1;
+    };
+    ErrState.received = false;
+    ErrState.msg_type = -1;
+
+    const cb = struct {
+        fn f(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                ErrState.received = true;
+                ErrState.msg_type = m.msg_type;
+            }
+            return 0;
+        }
+    }.f;
+
+    if (e.message_bus) |*b| b.subscribe(cb, null);
+
+    routePrError(e, 3, "gh pr create failed");
+
+    try std.testing.expect(ErrState.received);
+    try std.testing.expect(ErrState.msg_type == @intFromEnum(bus.MessageType.err));
+}
+
+test "/teammux-pr-ready with null args does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+
+    // Null args — should return cleanly without crashing
+    commandRoutingCallback(cmd_z.ptr, null, e);
+}
+
+test "/teammux-pr-ready missing worker_id does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{\"title\": \"test\"}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+}
+
+test "/teammux-pr-ready non-numeric worker_id does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": \"abc\", \"title\": \"test\"}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+}
+
+test "/teammux-pr-ready missing title does not crash" {
+    const e = Engine.create(std.testing.allocator, "/tmp") catch return;
+    defer e.destroy();
+
+    const cmd_z = std.testing.allocator.dupeZ(u8, "/teammux-pr-ready") catch return;
+    defer std.testing.allocator.free(cmd_z);
+    const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": 1}") catch return;
+    defer std.testing.allocator.free(args_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; }

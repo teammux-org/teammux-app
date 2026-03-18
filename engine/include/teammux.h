@@ -67,6 +67,8 @@ typedef enum {
     TM_MSG_RESPONSE       = 11,  // Team Lead responds to worker question
     TM_MSG_PEER_QUESTION  = 12,  // Worker-to-worker question via Team Lead relay
     TM_MSG_DELEGATION     = 13,  // Worker-to-worker task delegation direct
+    TM_MSG_PR_READY       = 14,  // Engine signals PR created for worker
+    TM_MSG_PR_STATUS      = 15,  // GitHub PR status change (open/closed/merged)
 } tm_message_type_t;
 
 typedef enum {
@@ -301,6 +303,15 @@ tm_pr_t* tm_github_create_pr(
     const char*    body
 );
 void tm_pr_free(tm_pr_t* pr);
+
+// Create a PR and route TM_MSG_PR_READY through the bus.
+// Alias for tm_github_create_pr — both functions perform bus routing identically.
+// The branch parameter is unused; the actual branch is resolved from the worker's
+// roster entry. Retained in the signature for forward compatibility.
+// Returns heap-allocated tm_pr_t on success, NULL on failure. Caller must call tm_pr_free().
+tm_pr_t* tm_pr_create(tm_engine_t* engine, uint32_t worker_id,
+                       const char* title, const char* body,
+                       const char* branch);
 
 tm_result_t tm_github_merge_pr(
     tm_engine_t*        engine,
