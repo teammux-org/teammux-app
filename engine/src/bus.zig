@@ -19,6 +19,8 @@ pub const MessageType = enum(c_int) {
     response = 11,
     peer_question = 12,
     delegation = 13,
+    pr_ready = 14,
+    pr_status = 15,
 
     pub fn toString(self: MessageType) []const u8 {
         return switch (self) {
@@ -35,6 +37,8 @@ pub const MessageType = enum(c_int) {
             .response => "response",
             .peer_question => "peer_question",
             .delegation => "delegation",
+            .pr_ready => "pr_ready",
+            .pr_status => "pr_status",
         };
     }
 };
