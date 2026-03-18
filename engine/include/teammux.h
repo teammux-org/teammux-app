@@ -210,6 +210,35 @@ tm_worker_id_t tm_worker_spawn(
 
 tm_result_t       tm_worker_dismiss(tm_engine_t* engine, tm_worker_id_t worker_id);
 
+// -----------------------------------------------------------------
+// Worktree lifecycle (standalone registry)
+//
+// Manages git worktree directories for isolated worker environments.
+// Default path: ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/
+// Configurable via config.toml [project] worktree_root key.
+// -----------------------------------------------------------------
+
+// Create a git worktree for a worker. Resolves path from config or
+// default, runs git worktree add, stores in registry.
+// Returns TM_ERR_WORKTREE on git failure, TM_ERR_CONFIG on path error.
+tm_result_t tm_worktree_create(tm_engine_t* engine,
+                                uint32_t worker_id,
+                                const char* task_description);
+
+// Remove a worker's git worktree. Runs git worktree remove --force,
+// frees registry entry. Idempotent — safe if worker has no worktree.
+tm_result_t tm_worktree_remove(tm_engine_t* engine, uint32_t worker_id);
+
+// Get the absolute path to a worker's worktree directory.
+// Returns NULL if worker has no worktree registered.
+// Returned string is owned by the registry — do not free.
+const char* tm_worktree_path(tm_engine_t* engine, uint32_t worker_id);
+
+// Get the git branch name for a worker's worktree.
+// Returns NULL if worker has no worktree registered.
+// Returned string is owned by the registry — do not free.
+const char* tm_worktree_branch(tm_engine_t* engine, uint32_t worker_id);
+
 // Get current roster snapshot. Returns NULL on failure. Caller must call tm_roster_free().
 tm_roster_t*      tm_roster_get(tm_engine_t* engine);
 void              tm_roster_free(tm_roster_t* roster);
