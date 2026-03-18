@@ -220,7 +220,10 @@ pub const RoleWatcher = struct {
         };
         defer role_def.deinit(self.allocator);
 
-        // TD18: Update ownership registry and interceptor with new patterns
+        // TD18: Update ownership registry and interceptor with new patterns.
+        // These two operations are independent — if one fails, the other may
+        // still succeed, creating a transient inconsistency that self-heals
+        // on the next role file change.
         if (self.ownership_registry) |registry| {
             registry.updateWorkerRules(
                 self.worker_id,
