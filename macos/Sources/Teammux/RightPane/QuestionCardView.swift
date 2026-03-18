@@ -5,8 +5,9 @@ import SwiftUI
 /// A card displaying a worker's question with an inline text field for the
 /// Team Lead's response.
 ///
-/// "Dispatch" sends the response via `engine.dispatchResponse(workerId:response:)`
-/// then clears the question via `engine.clearQuestion(workerId:)`.
+/// "Dispatch" calls `engine.dispatchResponse(workerId:response:)` and clears the
+/// question only on success. On failure the card stays visible so the Team Lead
+/// knows the response was not delivered.
 /// "Dismiss" clears the question without responding.
 struct QuestionCardView: View {
     let request: QuestionRequest
@@ -97,8 +98,10 @@ struct QuestionCardView: View {
     private func dispatchResponse() {
         let trimmed = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        _ = engine.dispatchResponse(workerId: request.workerId, response: trimmed)
-        engine.clearQuestion(workerId: request.workerId)
+        let success = engine.dispatchResponse(workerId: request.workerId, response: trimmed)
+        if success {
+            engine.clearQuestion(workerId: request.workerId)
+        }
     }
 
     // MARK: - Helpers

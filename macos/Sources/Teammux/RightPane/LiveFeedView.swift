@@ -80,14 +80,20 @@ struct LiveFeedView: View {
         .frame(maxHeight: 200)
     }
 
-    /// Sorted completion reports for stable ForEach ordering.
+    /// Sorted completion reports for stable ForEach ordering (timestamp, then workerId tiebreak).
     private var completionReports: [CompletionReport] {
-        engine.workerCompletions.values.sorted { $0.timestamp < $1.timestamp }
+        engine.workerCompletions.values.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp < $1.timestamp }
+            return $0.workerId < $1.workerId
+        }
     }
 
-    /// Sorted question requests for stable ForEach ordering.
+    /// Sorted question requests for stable ForEach ordering (timestamp, then workerId tiebreak).
     private var questionRequests: [QuestionRequest] {
-        engine.workerQuestions.values.sorted { $0.timestamp < $1.timestamp }
+        engine.workerQuestions.values.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp < $1.timestamp }
+            return $0.workerId < $1.workerId
+        }
     }
 
     // MARK: - Header
