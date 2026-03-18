@@ -45,8 +45,9 @@ pub const Diff = struct {
 // GitHub Client
 // ─────────────────────────────────────────────────────────
 
-/// Callback for routing messages to the bus (same pattern as commands.zig).
+/// Callback for routing messages to the bus.
 /// Args: (to_worker_id, from_worker_id, msg_type_int, payload_json, userdata) → tm_result_t
+/// See also: commands.BusSendFn (identical signature).
 pub const BusSendFn = *const fn (u32, u32, c_int, ?[*:0]const u8, ?*anyopaque) callconv(.c) c_int;
 
 pub const GitHubClient = struct {

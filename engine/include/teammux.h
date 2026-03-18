@@ -305,8 +305,10 @@ tm_pr_t* tm_github_create_pr(
 void tm_pr_free(tm_pr_t* pr);
 
 // Create a PR and route TM_MSG_PR_READY through the bus.
-// Thin wrapper around tm_github_create_pr with bus routing side effect.
-// branch parameter accepted for API surface but actual branch resolved from roster.
+// Alias for tm_github_create_pr — both functions perform bus routing identically.
+// The branch parameter is unused; the actual branch is resolved from the worker's
+// roster entry. Retained in the signature for forward compatibility.
+// Returns heap-allocated tm_pr_t on success, NULL on failure. Caller must call tm_pr_free().
 tm_pr_t* tm_pr_create(tm_engine_t* engine, uint32_t worker_id,
                        const char* title, const char* body,
                        const char* branch);
