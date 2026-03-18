@@ -162,7 +162,7 @@ struct DispatchWorkerRow: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(instruction.trimmingCharacters(in: .whitespaces).isEmpty || isDispatching)
+                .disabled(instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isDispatching)
             }
 
             if let error = dispatchError {
@@ -180,7 +180,7 @@ struct DispatchWorkerRow: View {
     // MARK: - Dispatch action
 
     private func dispatchAction() {
-        let trimmed = instruction.trimmingCharacters(in: .whitespaces)
+        let trimmed = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         isDispatching = true

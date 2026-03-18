@@ -38,6 +38,7 @@
 | TD17 | interceptor.zig  | git stash / git apply bypass not intercepted        | v0.3   | NO       | OPEN   |
 | TD18 | hotreload.zig    | Role hot-reload does not update ownership registry  | v0.2   | NO       | OPEN   |
 | TD19 | interceptor.zig  | Interceptor exit code indistinguishable from git errors | v0.2   | NO       | OPEN   |
+| TD20 | EngineClient     | lastError is shared mutable state — stale errors from unrelated operations | v0.2 | NO | OPEN |
 
 ## Notes
 - TD10: Role definition changes after spawn do not update active worker CLAUDE.md. stream-S4 implements kqueue watcher on role TOML, regenerates CLAUDE.md and injects update via message bus on change.
@@ -50,4 +51,5 @@
 - TD17: git stash pop and git apply can restore denied files to the working tree. Not intercepted. Deferred to v0.3 — lower risk than commit bypass.
 - TD18: When a role TOML changes, the active worker gets a refreshed CLAUDE.md. The FileOwnershipRegistry is NOT updated — deny patterns in the registry still reflect the original role. Deferred to v0.2.
 - TD19: Interceptor wrapper uses exit 1 for both git-add and git-commit blocks. Callers cannot distinguish "Teammux blocked this" from "git itself failed." Use a distinctive exit code (e.g., 126) for interceptor enforcement. Affects both add and commit blocks.
+- TD20: EngineClient.lastError is a single @Published String? written by 50+ methods. When one method fails, lastError may still contain an error from a previous unrelated call. Affects GitWorkerRow, DispatchWorkerRow, QuestionCardView, and any future view reading lastError on failure. Fix: return Result<T, Error> from engine methods or clear lastError at method entry. Deferred to v0.2.
 - Merge order v0.1.3: S1 (any time) → S2/S3/S4/S5 (parallel) → S6/S7/S8/S9 (parallel wave 2) → S10/S11 (parallel wave 3) → S12 (last)
