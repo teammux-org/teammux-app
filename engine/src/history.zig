@@ -6,37 +6,62 @@ const commands = @import("commands.zig");
 // ─────────────────────────────────────────────────────────
 // Completion history JSONL persistence (TD16)
 //
-// Append-only writer for completion and question events.
+// Persists completion and question events to a JSONL file.
 // File: {project_root}/.teammux/logs/completion_history.jsonl
-// Atomic write via temp-file-and-rename pattern.
+// New entries are appended (append semantics) via atomic
+// read-rewrite-rename to prevent partial writes on crash.
+//
+// Threading: callers must serialize access externally.
+// The engine guarantees single-threaded access via its
+// event loop. Concurrent writers are not supported (TD24).
 // ─────────────────────────────────────────────────────────
 
+/// Maximum JSONL file size for read operations (10 MB).
+const max_history_file_bytes: usize = 10 * 1024 * 1024;
+
+pub const EventKind = enum {
+    completion,
+    question,
+
+    pub fn toString(self: EventKind) []const u8 {
+        return switch (self) {
+            .completion => "completion",
+            .question => "question",
+        };
+    }
+
+    pub fn fromString(s: []const u8) ?EventKind {
+        if (std.mem.eql(u8, s, "completion")) return .completion;
+        if (std.mem.eql(u8, s, "question")) return .question;
+        return null;
+    }
+};
+
 pub const HistoryEntry = struct {
-    entry_type: []const u8, // "completion" or "question"
+    entry_type: EventKind,
     worker_id: u32,
-    role_id: []const u8, // empty string if unknown
+    role_id: []const u8, // empty string if unknown at engine layer
     content: []const u8, // summary for completion, question text for question
     git_commit: ?[]const u8, // null if unavailable
     timestamp: u64,
 };
 
-/// Owned version of HistoryEntry — all string fields are heap-allocated
-/// and must be freed with freeOwnedEntry.
+/// Owned version of HistoryEntry — all string fields are heap-allocated.
+/// Free with deinit() using the same allocator that created the entry.
 pub const OwnedHistoryEntry = struct {
-    entry_type: []const u8,
+    entry_type: EventKind,
     worker_id: u32,
     role_id: []const u8,
     content: []const u8,
     git_commit: ?[]const u8,
     timestamp: u64,
-};
 
-pub fn freeOwnedEntry(allocator: std.mem.Allocator, entry: OwnedHistoryEntry) void {
-    allocator.free(entry.entry_type);
-    allocator.free(entry.role_id);
-    allocator.free(entry.content);
-    if (entry.git_commit) |gc| allocator.free(gc);
-}
+    pub fn deinit(self: OwnedHistoryEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.role_id);
+        allocator.free(self.content);
+        if (self.git_commit) |gc| allocator.free(gc);
+    }
+};
 
 pub const HistoryLogger = struct {
     allocator: std.mem.Allocator,
@@ -80,29 +105,35 @@ pub const HistoryLogger = struct {
         self.allocator.free(self.tmp_path);
         self.allocator.free(self.file_path);
         self.allocator.free(self.dir_path);
+        self.* = undefined;
     }
 
-    /// Append a history entry via atomic temp-file-and-rename.
+    /// Append a history entry via atomic read-rewrite-rename.
     /// Reads existing file content, writes existing + new line to .tmp,
     /// then renames .tmp over the original file.
     pub fn append(self: *HistoryLogger, entry: HistoryEntry) !void {
-        // Serialize entry to JSON line
         const json_line = try serializeEntry(self.allocator, entry);
         defer self.allocator.free(json_line);
 
-        // Read existing file content (empty if file doesn't exist)
-        const existing = std.fs.cwd().readFileAlloc(self.allocator, self.file_path, 10 * 1024 * 1024) catch |err| switch (err) {
-            error.FileNotFound => "",
+        // Read existing file content (empty string literal if file doesn't exist,
+        // heap-allocated slice otherwise — track which for correct cleanup)
+        var heap_allocated = true;
+        const existing = std.fs.cwd().readFileAlloc(self.allocator, self.file_path, max_history_file_bytes) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                heap_allocated = false;
+                break :blk "";
+            },
             else => return err,
         };
-        const free_existing = existing.len > 0;
-        defer if (free_existing) self.allocator.free(existing);
+        defer if (heap_allocated) self.allocator.free(existing);
 
         // Write existing + new line to .tmp
         const tmp_file = try std.fs.createFileAbsolute(self.tmp_path, .{});
         errdefer {
             tmp_file.close();
-            std.fs.deleteFileAbsolute(self.tmp_path) catch {};
+            std.fs.deleteFileAbsolute(self.tmp_path) catch |err| {
+                std.log.warn("[teammux] history: failed to clean up temp file: {}", .{err});
+            };
         }
         if (existing.len > 0) try tmp_file.writeAll(existing);
         try tmp_file.writeAll(json_line);
@@ -116,28 +147,38 @@ pub const HistoryLogger = struct {
     }
 
     /// Load all history entries from the JSONL file.
-    /// Malformed lines are skipped silently. Missing file returns empty list.
+    /// Malformed lines are skipped with a warning. Missing file returns empty list.
+    /// OutOfMemory is propagated (not masked as "malformed").
     pub fn load(self: *HistoryLogger) !std.ArrayList(OwnedHistoryEntry) {
         var entries: std.ArrayList(OwnedHistoryEntry) = .{};
         errdefer {
-            for (entries.items) |e| freeOwnedEntry(self.allocator, e);
+            for (entries.items) |e| e.deinit(self.allocator);
             entries.deinit(self.allocator);
         }
 
-        const content = std.fs.cwd().readFileAlloc(self.allocator, self.file_path, 10 * 1024 * 1024) catch |err| switch (err) {
+        const content = std.fs.cwd().readFileAlloc(self.allocator, self.file_path, max_history_file_bytes) catch |err| switch (err) {
             error.FileNotFound => return entries,
             else => return err,
         };
         defer self.allocator.free(content);
 
+        var line_num: usize = 0;
+        var skipped: usize = 0;
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line| {
+            line_num += 1;
             if (line.len == 0) continue;
-            const entry = parseEntry(self.allocator, line) catch {
-                std.log.warn("[teammux] history: skipping malformed JSONL line", .{});
+            const entry = parseEntry(self.allocator, line) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                skipped += 1;
+                const preview_len = @min(line.len, 80);
+                std.log.warn("[teammux] history: skipping malformed line {d}: {s}", .{ line_num, line[0..preview_len] });
                 continue;
             };
             try entries.append(self.allocator, entry);
+        }
+        if (skipped > 0) {
+            std.log.warn("[teammux] history: {d} malformed lines skipped out of {d} total", .{ skipped, line_num });
         }
 
         return entries;
@@ -159,10 +200,8 @@ pub const HistoryLogger = struct {
 // JSON serialization
 // ─────────────────────────────────────────────────────────
 
-/// Serialize a HistoryEntry to a JSON line string.
 fn serializeEntry(allocator: std.mem.Allocator, entry: HistoryEntry) ![]u8 {
-    const type_esc = try jsonEscape(allocator, entry.entry_type);
-    defer allocator.free(type_esc);
+    const type_str = entry.entry_type.toString();
     const role_esc = try jsonEscape(allocator, entry.role_id);
     defer allocator.free(role_esc);
     const content_esc = try jsonEscape(allocator, entry.content);
@@ -173,11 +212,11 @@ fn serializeEntry(allocator: std.mem.Allocator, entry: HistoryEntry) ![]u8 {
         defer allocator.free(gc_esc);
         return std.fmt.allocPrint(allocator,
             \\{{"type":"{s}","worker_id":{d},"role_id":"{s}","content":"{s}","git_commit":"{s}","timestamp":{d}}}
-        , .{ type_esc, entry.worker_id, role_esc, content_esc, gc_esc, entry.timestamp });
+        , .{ type_str, entry.worker_id, role_esc, content_esc, gc_esc, entry.timestamp });
     } else {
         return std.fmt.allocPrint(allocator,
             \\{{"type":"{s}","worker_id":{d},"role_id":"{s}","content":"{s}","git_commit":null,"timestamp":{d}}}
-        , .{ type_esc, entry.worker_id, role_esc, content_esc, entry.timestamp });
+        , .{ type_str, entry.worker_id, role_esc, content_esc, entry.timestamp });
     }
 }
 
@@ -186,24 +225,23 @@ fn serializeEntry(allocator: std.mem.Allocator, entry: HistoryEntry) ![]u8 {
 // ─────────────────────────────────────────────────────────
 
 /// Parse a JSONL line into an OwnedHistoryEntry.
-/// All string fields are heap-allocated. Caller must free with freeOwnedEntry.
+/// All string fields are heap-allocated. Caller must free with deinit().
 fn parseEntry(allocator: std.mem.Allocator, line: []const u8) !OwnedHistoryEntry {
     const entry_type_raw = commands.extractJsonString(line, "type") orelse return error.InvalidJson;
-    const entry_type = try allocator.dupe(u8, entry_type_raw);
-    errdefer allocator.free(entry_type);
+    const entry_type = EventKind.fromString(entry_type_raw) orelse return error.InvalidJson;
 
     const worker_id = commands.extractJsonUint(line, "worker_id") orelse return error.InvalidJson;
 
     const role_id_raw = commands.extractJsonString(line, "role_id") orelse "";
-    const role_id = try allocator.dupe(u8, role_id_raw);
+    const role_id = try jsonUnescape(allocator, role_id_raw);
     errdefer allocator.free(role_id);
 
     const content_raw = commands.extractJsonString(line, "content") orelse return error.InvalidJson;
-    const content = try allocator.dupe(u8, content_raw);
+    const content = try jsonUnescape(allocator, content_raw);
     errdefer allocator.free(content);
 
     const git_commit_raw = commands.extractJsonString(line, "git_commit");
-    const git_commit = if (git_commit_raw) |gc| try allocator.dupe(u8, gc) else null;
+    const git_commit = if (git_commit_raw) |gc| try jsonUnescape(allocator, gc) else null;
     errdefer if (git_commit) |gc| allocator.free(gc);
 
     const timestamp = extractJsonUint64(line, "timestamp") orelse return error.InvalidJson;
@@ -220,8 +258,9 @@ fn parseEntry(allocator: std.mem.Allocator, line: []const u8) !OwnedHistoryEntry
 
 /// Extract a u64 value for a given key from JSON.
 fn extractJsonUint64(json: []const u8, key: []const u8) ?u64 {
-    const search = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{key}) catch return null;
-    defer std.heap.page_allocator.free(search);
+    // Build search string on stack to avoid heap allocation
+    var search_buf: [128]u8 = undefined;
+    const search = std.fmt.bufPrint(&search_buf, "\"{s}\"", .{key}) catch return null;
 
     const key_pos = std.mem.indexOf(u8, json, search) orelse return null;
     const after_key = json[key_pos + search.len ..];
@@ -241,11 +280,10 @@ fn extractJsonUint64(json: []const u8, key: []const u8) ?u64 {
 }
 
 // ─────────────────────────────────────────────────────────
-// JSON escape (self-contained for module independence)
+// JSON escape / unescape
 // ─────────────────────────────────────────────────────────
 
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    // Fast path: if no special chars, just dupe
     var needs_escape = false;
     for (input) |c| {
         if (c == '"' or c == '\\' or c <= 0x1F) {
@@ -301,9 +339,93 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         }
     }
     if (pos < buf.len) {
-        return allocator.realloc(buf, pos) catch {
-            return buf[0..pos];
-        };
+        return try allocator.realloc(buf, pos);
+    }
+    return buf;
+}
+
+/// Reverse JSON string escaping: \" → ", \\ → \, \n → newline, etc.
+/// Allocates and returns a new heap string with escape sequences resolved.
+fn jsonUnescape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    // Fast path: no escape sequences
+    if (std.mem.indexOf(u8, input, "\\") == null) {
+        return try allocator.dupe(u8, input);
+    }
+
+    const buf = try allocator.alloc(u8, input.len);
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '\\' and i + 1 < input.len) {
+            switch (input[i + 1]) {
+                '"' => {
+                    buf[pos] = '"';
+                    pos += 1;
+                    i += 2;
+                },
+                '\\' => {
+                    buf[pos] = '\\';
+                    pos += 1;
+                    i += 2;
+                },
+                'n' => {
+                    buf[pos] = '\n';
+                    pos += 1;
+                    i += 2;
+                },
+                'r' => {
+                    buf[pos] = '\r';
+                    pos += 1;
+                    i += 2;
+                },
+                't' => {
+                    buf[pos] = '\t';
+                    pos += 1;
+                    i += 2;
+                },
+                'b' => {
+                    buf[pos] = 0x08;
+                    pos += 1;
+                    i += 2;
+                },
+                'f' => {
+                    buf[pos] = 0x0C;
+                    pos += 1;
+                    i += 2;
+                },
+                'u' => {
+                    // \uXXXX — parse 4 hex digits as a single byte (ASCII range only)
+                    if (i + 5 < input.len) {
+                        const hex_val = std.fmt.parseInt(u8, input[i + 2 .. i + 6], 16) catch {
+                            buf[pos] = input[i];
+                            pos += 1;
+                            i += 1;
+                            continue;
+                        };
+                        buf[pos] = hex_val;
+                        pos += 1;
+                        i += 6;
+                    } else {
+                        buf[pos] = input[i];
+                        pos += 1;
+                        i += 1;
+                    }
+                },
+                else => {
+                    buf[pos] = input[i];
+                    pos += 1;
+                    i += 1;
+                },
+            }
+        } else {
+            buf[pos] = input[i];
+            pos += 1;
+            i += 1;
+        }
+    }
+
+    if (pos < buf.len) {
+        return try allocator.realloc(buf, pos);
     }
     return buf;
 }
@@ -313,15 +435,25 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 // ─────────────────────────────────────────────────────────
 
 /// Capture HEAD commit hash from a worker's worktree.
-/// Returns null on any failure (no commits, git missing, empty worktree path).
+/// Returns null on any failure. Logs warnings for non-trivial failures
+/// so operators can diagnose broken worktrees.
 pub fn captureGitCommit(allocator: std.mem.Allocator, worktree_path: []const u8) ?[]u8 {
     if (worktree_path.len == 0) return null;
-    const result = merge.runGitCapture(allocator, worktree_path, &.{ "rev-parse", "HEAD" }) catch return null;
+    const result = merge.runGitCapture(allocator, worktree_path, &.{ "rev-parse", "HEAD" }) catch |err| {
+        std.log.warn("[teammux] history: git rev-parse HEAD failed for '{s}': {}", .{ worktree_path, err });
+        return null;
+    };
     defer result.deinit(allocator);
-    if (result.exit_code != 0) return null;
+    if (result.exit_code != 0) {
+        std.log.warn("[teammux] history: git rev-parse HEAD exited {d} for '{s}'", .{ result.exit_code, worktree_path });
+        return null;
+    }
     const trimmed = std.mem.trim(u8, result.stdout, &[_]u8{ '\n', '\r', ' ' });
     if (trimmed.len == 0) return null;
-    return allocator.dupe(u8, trimmed) catch null;
+    return allocator.dupe(u8, trimmed) catch |err| {
+        std.log.warn("[teammux] history: dupe git commit failed: {}", .{err});
+        return null;
+    };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -338,7 +470,7 @@ test "history - append completion entry" {
     defer logger.deinit();
 
     try logger.append(.{
-        .entry_type = "completion",
+        .entry_type = .completion,
         .worker_id = 2,
         .role_id = "frontend-engineer",
         .content = "Implemented JWT auth",
@@ -366,7 +498,7 @@ test "history - append question entry" {
     defer logger.deinit();
 
     try logger.append(.{
-        .entry_type = "question",
+        .entry_type = .question,
         .worker_id = 3,
         .role_id = "backend-engineer",
         .content = "Should I use JWT?",
@@ -391,58 +523,68 @@ test "history - load round-trip" {
     var logger = try HistoryLogger.init(std.testing.allocator, root);
     defer logger.deinit();
 
-    // Append 3 entries
-    try logger.append(.{
-        .entry_type = "completion",
-        .worker_id = 1,
-        .role_id = "fe",
-        .content = "task one done",
-        .git_commit = "aaa1111",
-        .timestamp = 100,
-    });
-    try logger.append(.{
-        .entry_type = "question",
-        .worker_id = 2,
-        .role_id = "be",
-        .content = "how to do X?",
-        .git_commit = null,
-        .timestamp = 200,
-    });
-    try logger.append(.{
-        .entry_type = "completion",
-        .worker_id = 3,
-        .role_id = "",
-        .content = "task three done",
-        .git_commit = "ccc3333",
-        .timestamp = 300,
-    });
+    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "fe", .content = "task one done", .git_commit = "aaa1111", .timestamp = 100 });
+    try logger.append(.{ .entry_type = .question, .worker_id = 2, .role_id = "be", .content = "how to do X?", .git_commit = null, .timestamp = 200 });
+    try logger.append(.{ .entry_type = .completion, .worker_id = 3, .role_id = "", .content = "task three done", .git_commit = "ccc3333", .timestamp = 300 });
 
-    // Load and verify
     var entries = try logger.load();
     defer {
-        for (entries.items) |e| freeOwnedEntry(std.testing.allocator, e);
+        for (entries.items) |e| e.deinit(std.testing.allocator);
         entries.deinit(std.testing.allocator);
     }
 
     try std.testing.expect(entries.items.len == 3);
 
-    try std.testing.expectEqualStrings("completion", entries.items[0].entry_type);
+    try std.testing.expect(entries.items[0].entry_type == .completion);
     try std.testing.expect(entries.items[0].worker_id == 1);
     try std.testing.expectEqualStrings("fe", entries.items[0].role_id);
     try std.testing.expectEqualStrings("task one done", entries.items[0].content);
     try std.testing.expectEqualStrings("aaa1111", entries.items[0].git_commit.?);
     try std.testing.expect(entries.items[0].timestamp == 100);
 
-    try std.testing.expectEqualStrings("question", entries.items[1].entry_type);
+    try std.testing.expect(entries.items[1].entry_type == .question);
     try std.testing.expect(entries.items[1].worker_id == 2);
     try std.testing.expectEqualStrings("how to do X?", entries.items[1].content);
     try std.testing.expect(entries.items[1].git_commit == null);
     try std.testing.expect(entries.items[1].timestamp == 200);
 
-    try std.testing.expectEqualStrings("completion", entries.items[2].entry_type);
+    try std.testing.expect(entries.items[2].entry_type == .completion);
     try std.testing.expect(entries.items[2].worker_id == 3);
     try std.testing.expectEqualStrings("", entries.items[2].role_id);
     try std.testing.expect(entries.items[2].timestamp == 300);
+}
+
+test "history - round-trip with JSON-special characters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var logger = try HistoryLogger.init(std.testing.allocator, root);
+    defer logger.deinit();
+
+    const special_content = "He said \"hello\" and\\or\nnewline\ttab";
+    const special_role = "role-with-\"quotes\"";
+
+    try logger.append(.{
+        .entry_type = .completion,
+        .worker_id = 1,
+        .role_id = special_role,
+        .content = special_content,
+        .git_commit = "abc\"def",
+        .timestamp = 100,
+    });
+
+    var entries = try logger.load();
+    defer {
+        for (entries.items) |e| e.deinit(std.testing.allocator);
+        entries.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(entries.items.len == 1);
+    try std.testing.expectEqualStrings(special_content, entries.items[0].content);
+    try std.testing.expectEqualStrings(special_role, entries.items[0].role_id);
+    try std.testing.expectEqualStrings("abc\"def", entries.items[0].git_commit.?);
 }
 
 test "history - clear truncates" {
@@ -454,34 +596,47 @@ test "history - clear truncates" {
     var logger = try HistoryLogger.init(std.testing.allocator, root);
     defer logger.deinit();
 
-    try logger.append(.{
-        .entry_type = "completion",
-        .worker_id = 1,
-        .role_id = "",
-        .content = "done",
-        .git_commit = null,
-        .timestamp = 100,
-    });
+    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "", .content = "done", .git_commit = null, .timestamp = 100 });
 
-    // Verify file has content
     {
         const stat = try std.fs.cwd().statFile(logger.file_path);
         try std.testing.expect(stat.size > 0);
     }
 
-    // Clear
     try logger.clear();
 
-    // Verify file is empty (still exists, size 0)
     {
         const stat = try std.fs.cwd().statFile(logger.file_path);
         try std.testing.expect(stat.size == 0);
     }
 
-    // Load returns empty
     var entries = try logger.load();
     defer entries.deinit(std.testing.allocator);
     try std.testing.expect(entries.items.len == 0);
+}
+
+test "history - append after clear produces correct single entry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var logger = try HistoryLogger.init(std.testing.allocator, root);
+    defer logger.deinit();
+
+    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "", .content = "first", .git_commit = null, .timestamp = 100 });
+    try logger.clear();
+    try logger.append(.{ .entry_type = .question, .worker_id = 2, .role_id = "", .content = "second", .git_commit = null, .timestamp = 200 });
+
+    var entries = try logger.load();
+    defer {
+        for (entries.items) |e| e.deinit(std.testing.allocator);
+        entries.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expect(entries.items.len == 1);
+    try std.testing.expectEqualStrings("second", entries.items[0].content);
+    try std.testing.expect(entries.items[0].entry_type == .question);
 }
 
 test "history - atomic write temp rename" {
@@ -493,22 +648,13 @@ test "history - atomic write temp rename" {
     var logger = try HistoryLogger.init(std.testing.allocator, root);
     defer logger.deinit();
 
-    try logger.append(.{
-        .entry_type = "completion",
-        .worker_id = 1,
-        .role_id = "",
-        .content = "first",
-        .git_commit = null,
-        .timestamp = 100,
-    });
+    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "", .content = "first", .git_commit = null, .timestamp = 100 });
 
     // Verify .tmp is NOT left behind after successful append
     _ = std.fs.cwd().statFile(logger.tmp_path) catch |err| {
         try std.testing.expect(err == error.FileNotFound);
         return;
     };
-    // If we get here, .tmp still exists — test should fail
-    // (rename removes .tmp by moving it to the destination)
     return error.TmpFileLeftBehind;
 }
 
@@ -521,7 +667,6 @@ test "history - missing file load returns empty" {
     var logger = try HistoryLogger.init(std.testing.allocator, root);
     defer logger.deinit();
 
-    // No file written — load should return empty, not error
     var entries = try logger.load();
     defer entries.deinit(std.testing.allocator);
     try std.testing.expect(entries.items.len == 0);
@@ -533,11 +678,9 @@ test "history - missing directory handled by init" {
     const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
 
-    // .teammux/logs/ does not exist yet — init should create it
     var logger = try HistoryLogger.init(std.testing.allocator, root);
     defer logger.deinit();
 
-    // Verify directory was created
     const logs_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/.teammux/logs", .{root});
     defer std.testing.allocator.free(logs_dir);
     var dir = try std.fs.openDirAbsolute(logs_dir, .{});
@@ -553,7 +696,6 @@ test "history - malformed line skipped" {
     var logger = try HistoryLogger.init(std.testing.allocator, root);
     defer logger.deinit();
 
-    // Write a mix of garbage and valid JSONL directly
     const garbage_and_valid =
         \\this is not json
         \\{"type":"completion","worker_id":1,"role_id":"","content":"valid entry","git_commit":null,"timestamp":999}
@@ -567,11 +709,10 @@ test "history - malformed line skipped" {
 
     var entries = try logger.load();
     defer {
-        for (entries.items) |e| freeOwnedEntry(std.testing.allocator, e);
+        for (entries.items) |e| e.deinit(std.testing.allocator);
         entries.deinit(std.testing.allocator);
     }
 
-    // Only 2 valid entries should be loaded, garbage skipped
     try std.testing.expect(entries.items.len == 2);
     try std.testing.expectEqualStrings("valid entry", entries.items[0].content);
     try std.testing.expectEqualStrings("valid question", entries.items[1].content);
@@ -583,24 +724,21 @@ test "history - multiple sessions persist" {
     const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
 
-    // Session 1: append 2 entries
     {
         var logger = try HistoryLogger.init(std.testing.allocator, root);
         defer logger.deinit();
-        try logger.append(.{ .entry_type = "completion", .worker_id = 1, .role_id = "", .content = "session1-a", .git_commit = null, .timestamp = 100 });
-        try logger.append(.{ .entry_type = "question", .worker_id = 2, .role_id = "", .content = "session1-b", .git_commit = null, .timestamp = 200 });
+        try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "", .content = "session1-a", .git_commit = null, .timestamp = 100 });
+        try logger.append(.{ .entry_type = .question, .worker_id = 2, .role_id = "", .content = "session1-b", .git_commit = null, .timestamp = 200 });
     }
 
-    // Session 2: append 1 more entry
     {
         var logger = try HistoryLogger.init(std.testing.allocator, root);
         defer logger.deinit();
-        try logger.append(.{ .entry_type = "completion", .worker_id = 3, .role_id = "", .content = "session2-a", .git_commit = "def456", .timestamp = 300 });
+        try logger.append(.{ .entry_type = .completion, .worker_id = 3, .role_id = "", .content = "session2-a", .git_commit = "def456", .timestamp = 300 });
 
-        // Load all — should have 3 entries from both sessions
         var entries = try logger.load();
         defer {
-            for (entries.items) |e| freeOwnedEntry(std.testing.allocator, e);
+            for (entries.items) |e| e.deinit(std.testing.allocator);
             entries.deinit(std.testing.allocator);
         }
         try std.testing.expect(entries.items.len == 3);
@@ -619,7 +757,6 @@ test "history - clear on missing file is no-op" {
     var logger = try HistoryLogger.init(std.testing.allocator, root);
     defer logger.deinit();
 
-    // Should not error — file doesn't exist
     try logger.clear();
 }
 
@@ -629,6 +766,15 @@ test "history - jsonEscape handles special characters" {
     try std.testing.expect(std.mem.indexOf(u8, escaped, "\\\"world\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, escaped, "\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, escaped, "\\\\") != null);
+}
+
+test "history - jsonUnescape reverses jsonEscape" {
+    const original = "hello \"world\"\nnewline\\backslash\ttab";
+    const escaped = try jsonEscape(std.testing.allocator, original);
+    defer std.testing.allocator.free(escaped);
+    const unescaped = try jsonUnescape(std.testing.allocator, escaped);
+    defer std.testing.allocator.free(unescaped);
+    try std.testing.expectEqualStrings(original, unescaped);
 }
 
 test "history - extractJsonUint64 parses large timestamp" {
@@ -643,7 +789,7 @@ test "history - extractJsonUint64 returns null for missing key" {
 
 test "history - serializeEntry round-trip" {
     const entry = HistoryEntry{
-        .entry_type = "completion",
+        .entry_type = .completion,
         .worker_id = 5,
         .role_id = "test-role",
         .content = "task done",
@@ -654,12 +800,19 @@ test "history - serializeEntry round-trip" {
     defer std.testing.allocator.free(json);
 
     const parsed = try parseEntry(std.testing.allocator, json);
-    defer freeOwnedEntry(std.testing.allocator, parsed);
+    defer parsed.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("completion", parsed.entry_type);
+    try std.testing.expect(parsed.entry_type == .completion);
     try std.testing.expect(parsed.worker_id == 5);
     try std.testing.expectEqualStrings("test-role", parsed.role_id);
     try std.testing.expectEqualStrings("task done", parsed.content);
     try std.testing.expectEqualStrings("abc123", parsed.git_commit.?);
     try std.testing.expect(parsed.timestamp == 999);
+}
+
+test "history - invalid entry_type rejected on parse" {
+    const bad_json =
+        \\{"type":"banana","worker_id":1,"role_id":"","content":"x","git_commit":null,"timestamp":1}
+    ;
+    try std.testing.expectError(error.InvalidJson, parseEntry(std.testing.allocator, bad_json));
 }

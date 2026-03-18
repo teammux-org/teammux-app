@@ -185,12 +185,15 @@ pub const Engine = struct {
             return 8;
         };
 
-        // Append to completion history JSONL (TD16)
+        // History write for command-file path (workers writing /teammux-complete files).
+        // The C API path (tm_worker_complete/tm_worker_question) has its own history write.
         if (msg_enum == .completion or msg_enum == .question) {
             if (self.history_logger) |*logger| {
                 const content_key: []const u8 = if (msg_enum == .completion) "summary" else "question";
-                const content = commands.extractJsonString(payload_span, content_key) orelse "";
-                // Capture git commit from worker's worktree (completion only)
+                const content = commands.extractJsonString(payload_span, content_key) orelse blk: {
+                    std.log.warn("[teammux] history: missing '{s}' key in payload, recording empty content", .{content_key});
+                    break :blk "";
+                };
                 const git_commit = if (msg_enum == .completion) blk: {
                     if (self.roster.getWorker(from)) |w| {
                         break :blk history_mod.captureGitCommit(self.allocator, w.worktree_path);
@@ -199,14 +202,15 @@ pub const Engine = struct {
                 } else null;
                 defer if (git_commit) |gc| self.allocator.free(gc);
                 logger.append(.{
-                    .entry_type = if (msg_enum == .completion) "completion" else "question",
+                    .entry_type = if (msg_enum == .completion) .completion else .question,
                     .worker_id = from,
                     .role_id = "",
                     .content = content,
                     .git_commit = git_commit,
                     .timestamp = @intCast(std.time.timestamp()),
                 }) catch |err| {
-                    std.log.warn("[teammux] history append failed in busSendBridge: {}", .{err});
+                    std.log.err("[teammux] history append failed in busSendBridge: {}", .{err});
+                    self.setError("history persistence failed — event delivered to bus but not written to JSONL log") catch {};
                 };
             }
         }
@@ -301,6 +305,8 @@ comptime {
     if (@sizeOf(CQuestion) != 32) @compileError("CQuestion size mismatch with tm_question_t");
     // CDispatchEvent: u32(4) + pad(4) + ptr(8) + u64(8) + bool(1) + u8(1) + pad(6) = 32 bytes on arm64
     if (@sizeOf(CDispatchEvent) != 32) @compileError("CDispatchEvent size mismatch with tm_dispatch_event_t");
+    // CHistoryEntry: ptr(8) + u32(4) + pad(4) + 3 ptrs(24) + u64(8) = 48 bytes on arm64
+    if (@sizeOf(CHistoryEntry) != 48) @compileError("CHistoryEntry size mismatch with tm_history_entry_t");
 }
 
 var last_create_error: [*:0]const u8 = "no error";
@@ -1068,16 +1074,6 @@ export fn tm_peer_delegate(engine: ?*Engine, from_id: u32, target_id: u32, task:
 
 // ─── Completion + Question signaling ─────────────────────
 
-const CHistoryEntry = extern struct {
-    entry_type: ?[*:0]const u8,
-    worker_id: u32,
-    _pad0: u32 = 0,
-    role_id: ?[*:0]const u8,
-    content: ?[*:0]const u8,
-    git_commit: ?[*:0]const u8,
-    timestamp: u64,
-};
-
 const CCompletion = extern struct {
     worker_id: u32,
     _pad0: u32 = 0,
@@ -1096,7 +1092,7 @@ const CQuestion = extern struct {
 };
 
 /// Signal worker completion. Creates TM_MSG_COMPLETION message, routes through
-/// bus to Team Lead (worker 0).
+/// bus to Team Lead (worker 0), and persists to JSONL history log (TD16).
 export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]const u8, details: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
     const sum_str = std.mem.span(summary orelse {
@@ -1135,7 +1131,8 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
         return 8;
     };
 
-    // Persist to completion history JSONL (TD16)
+    // History write for C API path (Swift calling tm_worker_complete).
+    // The command-file path (busSendBridge) has its own history write.
     if (e.history_logger) |*logger| {
         const git_commit = if (e.roster.getWorker(worker_id)) |w|
             history_mod.captureGitCommit(e.allocator, w.worktree_path)
@@ -1143,14 +1140,15 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
             null;
         defer if (git_commit) |gc| e.allocator.free(gc);
         logger.append(.{
-            .entry_type = "completion",
+            .entry_type = .completion,
             .worker_id = worker_id,
             .role_id = "",
             .content = sum_str,
             .git_commit = git_commit,
             .timestamp = @intCast(std.time.timestamp()),
         }) catch |err| {
-            std.log.warn("[teammux] history append failed in tm_worker_complete: {}", .{err});
+            std.log.err("[teammux] history append failed in tm_worker_complete: {}", .{err});
+            e.setError("tm_worker_complete: history persistence failed — event delivered to bus but not written to JSONL log") catch {};
         };
     }
 
@@ -1158,7 +1156,7 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
 }
 
 /// Signal worker question. Creates TM_MSG_QUESTION message, routes through
-/// bus to Team Lead (worker 0).
+/// bus to Team Lead (worker 0), and persists to JSONL history log (TD16).
 export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]const u8, ctx: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
     const q_str = std.mem.span(question orelse {
@@ -1196,17 +1194,19 @@ export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]c
         return 8;
     };
 
-    // Persist to completion history JSONL (TD16)
+    // History write for C API path (Swift calling tm_worker_question).
+    // The command-file path (busSendBridge) has its own history write.
     if (e.history_logger) |*logger| {
         logger.append(.{
-            .entry_type = "question",
+            .entry_type = .question,
             .worker_id = worker_id,
             .role_id = "",
             .content = q_str,
             .git_commit = null,
             .timestamp = @intCast(std.time.timestamp()),
         }) catch |err| {
-            std.log.warn("[teammux] history append failed in tm_worker_question: {}", .{err});
+            std.log.err("[teammux] history append failed in tm_worker_question: {}", .{err});
+            e.setError("tm_worker_question: history persistence failed — event delivered to bus but not written to JSONL log") catch {};
         };
     }
 
@@ -1234,6 +1234,16 @@ export fn tm_question_free(question: ?*CQuestion) void {
 
 // ─── Completion history persistence (TD16) ───────────────
 
+const CHistoryEntry = extern struct {
+    entry_type: ?[*:0]const u8,
+    worker_id: u32,
+    _pad0: u32 = 0,
+    role_id: ?[*:0]const u8,
+    content: ?[*:0]const u8,
+    git_commit: ?[*:0]const u8,
+    timestamp: u64,
+};
+
 /// Load all history entries from the JSONL file.
 /// Returns heap-allocated array of tm_history_entry_t pointers.
 /// Caller must call tm_history_free(). Returns NULL if no entries or error.
@@ -1248,7 +1258,7 @@ export fn tm_history_load(engine: ?*Engine, count: ?*u32) ?[*]?*CHistoryEntry {
         return null;
     };
     defer {
-        for (entries.items) |entry| history_mod.freeOwnedEntry(e.allocator, entry);
+        for (entries.items) |entry| entry.deinit(e.allocator);
         entries.deinit(e.allocator);
     }
 
@@ -1261,17 +1271,17 @@ export fn tm_history_load(engine: ?*Engine, count: ?*u32) ?[*]?*CHistoryEntry {
 
     for (entries.items, 0..) |entry, i| {
         const c_entry = alloc.create(CHistoryEntry) catch {
-            // Free already allocated entries
             for (0..i) |j| freeCHistoryEntry(ptrs[j]);
             alloc.free(ptrs);
             e.setError("tm_history_load: allocation failed") catch {};
             return null;
         };
         c_entry.* = .{
-            .entry_type = allocCStr(alloc, entry.entry_type) catch {
+            .entry_type = allocCStr(alloc, entry.entry_type.toString()) catch {
                 alloc.destroy(c_entry);
                 for (0..i) |j| freeCHistoryEntry(ptrs[j]);
                 alloc.free(ptrs);
+                e.setError("tm_history_load: allocation failed") catch {};
                 return null;
             },
             .worker_id = entry.worker_id,
@@ -1280,6 +1290,7 @@ export fn tm_history_load(engine: ?*Engine, count: ?*u32) ?[*]?*CHistoryEntry {
                 alloc.destroy(c_entry);
                 for (0..i) |j| freeCHistoryEntry(ptrs[j]);
                 alloc.free(ptrs);
+                e.setError("tm_history_load: allocation failed") catch {};
                 return null;
             },
             .content = allocCStr(alloc, entry.content) catch {
@@ -1288,6 +1299,7 @@ export fn tm_history_load(engine: ?*Engine, count: ?*u32) ?[*]?*CHistoryEntry {
                 alloc.destroy(c_entry);
                 for (0..i) |j| freeCHistoryEntry(ptrs[j]);
                 alloc.free(ptrs);
+                e.setError("tm_history_load: allocation failed") catch {};
                 return null;
             },
             .git_commit = if (entry.git_commit) |gc| allocCStr(alloc, gc) catch {
@@ -1297,6 +1309,7 @@ export fn tm_history_load(engine: ?*Engine, count: ?*u32) ?[*]?*CHistoryEntry {
                 alloc.destroy(c_entry);
                 for (0..i) |j| freeCHistoryEntry(ptrs[j]);
                 alloc.free(ptrs);
+                e.setError("tm_history_load: allocation failed") catch {};
                 return null;
             } else null,
             .timestamp = entry.timestamp,
