@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 // MARK: - DispatchView
 
@@ -7,7 +8,7 @@ import SwiftUI
 /// Top section shows a row per active worker with a text field and send button.
 /// Bottom section shows the dispatch history as an audit trail.
 ///
-/// Three states:
+/// Three visual states (the latter two share the worker section):
 /// - No workers: empty state prompt
 /// - Workers, no history: worker rows with "No dispatches yet"
 /// - Workers + history: full view
@@ -22,7 +23,14 @@ struct DispatchView: View {
             if engine.roster.isEmpty {
                 emptyState
             } else {
-                workerAndHistoryContent
+                VStack(spacing: 0) {
+                    workerSection
+
+                    Divider()
+                        .padding(.vertical, 4)
+
+                    historySection
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -60,21 +68,6 @@ struct DispatchView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
-    }
-
-    // MARK: - Worker + history content
-
-    private var workerAndHistoryContent: some View {
-        VStack(spacing: 0) {
-            // Worker rows
-            workerSection
-
-            Divider()
-                .padding(.vertical, 4)
-
-            // Dispatch history
-            historySection
-        }
     }
 
     // MARK: - Worker section
@@ -126,10 +119,12 @@ struct DispatchView: View {
 // MARK: - DispatchWorkerRow
 
 /// A single worker row with a text field for the instruction and a send button.
-/// Follows the per-row error pattern from GitWorkerRow.
+/// Shows dispatch errors inline below the row, scoped per-worker.
 struct DispatchWorkerRow: View {
     let worker: WorkerInfo
     @ObservedObject var engine: EngineClient
+
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "DispatchWorkerRow")
 
     @State private var instruction: String = ""
     @State private var dispatchError: String?
@@ -138,7 +133,7 @@ struct DispatchWorkerRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                // Worker identity
+                // Status dot
                 Circle()
                     .fill(worker.status.color)
                     .frame(width: 8, height: 8)
@@ -191,22 +186,28 @@ struct DispatchWorkerRow: View {
         isDispatching = true
         dispatchError = nil
 
-        let success = engine.dispatchTask(workerId: worker.id, instruction: trimmed)
-        if success {
-            instruction = ""
-        } else {
-            dispatchError = engine.lastError ?? "Failed to dispatch task"
+        Task { @MainActor in
+            let success = engine.dispatchTask(workerId: worker.id, instruction: trimmed)
+            if success {
+                instruction = ""
+                Self.logger.info("Dispatched task to worker \(worker.id) (\(worker.name))")
+            } else {
+                let errorMsg = engine.lastError ?? "Failed to dispatch task"
+                dispatchError = errorMsg
+                Self.logger.error("Dispatch failed for worker \(worker.id) (\(worker.name)): \(errorMsg)")
+            }
+            isDispatching = false
         }
-        isDispatching = false
     }
 }
 
 // MARK: - DispatchHistoryRow
 
-/// A single row in the dispatch history showing what was sent, to whom, and when.
+/// A single row in the dispatch history showing what was sent, to whom, when,
+/// the dispatch direction (task vs response), and delivery status.
 struct DispatchHistoryRow: View {
     let event: DispatchEvent
-    @ObservedObject var engine: EngineClient
+    let engine: EngineClient
 
     private var workerName: String {
         engine.roster.first(where: { $0.id == event.targetWorkerId })?.name
@@ -239,10 +240,12 @@ struct DispatchHistoryRow: View {
                 Image(systemName: "checkmark")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.green)
+                    .help("Delivered successfully")
             } else {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 9))
                     .foregroundColor(.orange)
+                    .help("Not delivered — worker may be unavailable")
             }
         }
         .padding(.vertical, 2)
