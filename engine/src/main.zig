@@ -34,6 +34,7 @@ pub const Engine = struct {
     session_id: [8]u8,
     last_error: ?[]const u8,
     last_error_cstr: ?[*:0]u8,
+    last_error_mutex: std.Thread.Mutex,
     last_config_get_cstr: ?[*:0]u8,
     next_sub_id: u32,
     roster_callback: ?*const fn (?*const CRoster, ?*anyopaque) callconv(.c) void,
@@ -69,6 +70,7 @@ pub const Engine = struct {
             .session_id = sid,
             .last_error = null,
             .last_error_cstr = null,
+            .last_error_mutex = .{},
             .last_config_get_cstr = null,
             .next_sub_id = 1,
             .roster_callback = null,
@@ -232,6 +234,8 @@ pub const Engine = struct {
     }
 
     fn setError(self: *Engine, msg: []const u8) !void {
+        self.last_error_mutex.lock();
+        defer self.last_error_mutex.unlock();
         if (self.last_error) |old| {
             self.allocator.free(old);
             self.last_error = null; // Prevent use-after-free if dupe fails
@@ -344,6 +348,8 @@ export fn tm_session_start(engine: ?*Engine) c_int {
 export fn tm_session_stop(engine: ?*Engine) void { if (engine) |e| e.sessionStop(); }
 export fn tm_engine_last_error(engine: ?*Engine) [*:0]const u8 {
     const e = engine orelse return last_create_error;
+    e.last_error_mutex.lock();
+    defer e.last_error_mutex.unlock();
     if (e.last_error_cstr) |old| { e.allocator.free(std.mem.span(old)); e.last_error_cstr = null; }
     if (e.last_error) |err| {
         const z = e.allocator.dupeZ(u8, err) catch return "allocation failed";
