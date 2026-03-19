@@ -63,7 +63,7 @@ pub const Engine = struct {
             .ownership_registry = ownership.FileOwnershipRegistry.init(allocator),
             .merge_coordinator = merge.MergeCoordinator.init(allocator),
             .message_bus = null,
-            .github_client = github.GitHubClient.init(allocator, null),
+            .github_client = try github.GitHubClient.init(allocator, null),
             .commands_watcher = null,
             .role_watchers = hotreload.RoleWatcherMap.init(allocator),
             .session_id = sid,
@@ -135,8 +135,10 @@ pub const Engine = struct {
         };
         if (self.cfg) |cfg| {
             if (cfg.project.github_repo) |repo| {
-                self.github_client.deinit();
-                self.github_client = github.GitHubClient.init(self.allocator, repo);
+                self.github_client.updateRepo(repo) catch |err| {
+                    self.setError("github client repo update failed") catch {};
+                    return err;
+                };
             }
         }
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
