@@ -796,9 +796,9 @@ final class EngineClient: ObservableObject {
         return true
     }
 
-    /// Get the diff for a worker's branch vs main.
-    /// Wraps `tm_github_get_diff()` + `tm_diff_free()`.
-    /// Returns an array of `DiffFile`, empty on failure.
+    /// Get the diff for a worker's PR via GitHub PR files API.
+    /// Looks up the PR number from `workerPRs`, then calls `tm_github_get_diff()`.
+    /// Returns an array of `DiffFile`, empty on failure or if no PR exists.
     func getDiff(for workerId: UInt32) -> [DiffFile] {
         lastError = nil
         guard let engine else {
@@ -807,7 +807,19 @@ final class EngineClient: ObservableObject {
             return []
         }
 
-        guard let diffPtr = tm_github_get_diff(engine, workerId) else {
+        guard let prEvent = workerPRs[workerId] else {
+            lastError = "No PR found for worker \(workerId)"
+            Self.logger.info("getDiff: no PR for worker \(workerId)")
+            return []
+        }
+
+        guard let prNumber = Self.extractPRNumber(from: prEvent.prUrl) else {
+            lastError = "Cannot parse PR number from URL: \(prEvent.prUrl)"
+            Self.logger.error("getDiff: cannot parse PR number from \(prEvent.prUrl)")
+            return []
+        }
+
+        guard let diffPtr = tm_github_get_diff(engine, prNumber) else {
             let msg = lastEngineError() ?? "tm_github_get_diff failed"
             lastError = msg
             Self.logger.error("getDiff failed: \(msg)")
@@ -831,6 +843,15 @@ final class EngineClient: ObservableObject {
 
         tm_diff_free(diffPtr)
         return files
+    }
+
+    /// Extract PR number from a GitHub PR URL (e.g. "https://github.com/owner/repo/pull/42" → 42).
+    static func extractPRNumber(from url: String) -> UInt64? {
+        guard let range = url.range(of: "/pull/", options: .backwards) else { return nil }
+        let after = url[range.upperBound...]
+        let digits = after.prefix(while: { $0.isNumber })
+        guard !digits.isEmpty else { return nil }
+        return UInt64(digits)
     }
 
     // MARK: - Merge Coordinator
