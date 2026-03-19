@@ -471,6 +471,11 @@ pub const GitHubClient = struct {
         }
     }
 
+    // TODO(AA2): self.repo is read by the polling thread
+    // without synchronization. updateRepo must be called
+    // only when polling is stopped, or self.repo must be
+    // protected by a mutex. Fix belongs in AA2 concurrency
+    // pass alongside I2/I3.
     /// Replace the repo string: dupe new value first (preserves old on OOM), then free old and swap.
     pub fn updateRepo(self: *GitHubClient, new_repo: ?[]const u8) !void {
         const new = if (new_repo) |r| try self.allocator.dupe(u8, r) else null;
