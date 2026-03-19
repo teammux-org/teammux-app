@@ -4,10 +4,9 @@ import os
 // MARK: - MessageType
 
 /// Maps to `tm_message_type_t` in teammux.h.
-/// TASK=0, INSTRUCTION=1, CONTEXT=2, STATUS_REQ=3, STATUS_RPT=4,
-/// COMPLETION=5, ERROR=6, BROADCAST=7, QUESTION=8, DISPATCH=10,
-/// RESPONSE=11, PEER_QUESTION=12, DELEGATION=13,
-/// PR_READY=14, PR_STATUS=15
+/// TASK=0, INSTRUCTION=1, CONTEXT=2, COMPLETION=5, ERROR=6,
+/// BROADCAST=7, QUESTION=8, DISPATCH=10, RESPONSE=11,
+/// PEER_QUESTION=12, DELEGATION=13, PR_READY=14, PR_STATUS=15
 enum MessageType: Int, CaseIterable, Sendable {
     case task         = 0
     case instruction  = 1

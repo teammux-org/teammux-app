@@ -188,7 +188,10 @@ struct MessageTypeTests {
 
     @Test func messageTypeFromCValueUnknown() {
         // Unknown values should fall back to .task
-        #expect(MessageType(fromCValue: 8) == .task)
+        // Values 3 and 4 (statusReq/statusRpt) were removed — verify they fall through
+        #expect(MessageType(fromCValue: 3) == .task)
+        #expect(MessageType(fromCValue: 4) == .task)
+        #expect(MessageType(fromCValue: 9) == .task)
         #expect(MessageType(fromCValue: -1) == .task)
         #expect(MessageType(fromCValue: 100) == .task)
         #expect(MessageType(fromCValue: Int32.max) == .task)

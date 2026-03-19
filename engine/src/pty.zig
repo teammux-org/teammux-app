@@ -10,9 +10,8 @@ const std = @import("std");
 // callback to Swift, which then injects text into the appropriate
 // Ghostty SurfaceView using its input API.
 //
-// tm_pty_send() and tm_pty_fd() are retained as C exports for ABI
-// stability but return TM_ERR_UNKNOWN. They are deprecated in favor
-// of the callback-based message delivery through bus.zig.
+// tm_pty_send() and tm_pty_fd() were removed from the C API in the
+// dead-code pruning pass. Ghostty's SurfaceView is the sole PTY owner.
 // ─────────────────────────────────────────────────────────
 
 test "pty - stub module compiles" {
