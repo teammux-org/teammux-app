@@ -195,7 +195,9 @@ tm_subscription_t tm_config_watch(tm_engine_t* engine, tm_config_changed_cb call
 void              tm_config_unwatch(tm_engine_t* engine, tm_subscription_t sub);
 
 // Get a config value by dot-notation key. Returns NULL if not found.
-// Returned pointer is valid until the next tm_config_reload. Caller must not free.
+// Returned pointer is valid only until the next call to tm_config_get,
+// tm_config_reload, or tm_engine_destroy. Caller must not free.
+// Copy the value immediately if it is needed beyond the next tm_config_get call.
 const char* tm_config_get(tm_engine_t* engine, const char* key);
 
 // -----------------------------------------------------------------
