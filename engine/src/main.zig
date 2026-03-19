@@ -502,14 +502,8 @@ export fn tm_roster_unwatch(engine: ?*Engine, sub: u32) void {
     _ = sub; const e = engine orelse return; e.roster_callback = null; e.roster_userdata = null;
 }
 
-// ─── PTY (deprecated — Ghostty owns PTY) ─────────────────
-
-export fn tm_pty_send(_: ?*Engine, _: u32, _: ?[*:0]const u8) c_int {
-    return 10; // TM_ERR_NOT_IMPLEMENTED — PTY owned by Ghostty SurfaceView
-}
-export fn tm_pty_fd(_: ?*Engine, _: u32) c_int {
-    return -1; // PTY owned by Ghostty SurfaceView
-}
+// PTY ownership belongs to Ghostty.
+// Teammux does not directly manage PTY file descriptors.
 
 // ─── Message bus ─────────────────────────────────────────
 
@@ -2392,8 +2386,6 @@ test "engine create with null returns error" {
     try std.testing.expect(engine_ptr == null);
 }
 
-test "tm_pty_send returns TM_ERR_NOT_IMPLEMENTED" { try std.testing.expect(tm_pty_send(null, 0, null) == 10); }
-test "tm_pty_fd returns -1" { try std.testing.expect(tm_pty_fd(null, 0) == -1); }
 test "tm_worker_spawn returns TM_WORKER_INVALID on null engine" { try std.testing.expect(tm_worker_spawn(null, null, 0, null, null) == 0xFFFFFFFF); }
 
 test "tm_merge_approve null engine returns TM_ERR_UNKNOWN" { try std.testing.expect(tm_merge_approve(null, 0, null) == 99); }

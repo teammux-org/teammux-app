@@ -12,8 +12,7 @@ enum MessageType: Int, CaseIterable, Sendable {
     case task         = 0
     case instruction  = 1
     case context      = 2
-    case statusReq    = 3
-    case statusRpt    = 4
+    // 3 and 4 were statusReq/statusRpt — removed (no sender or handler)
     case completion   = 5
     case error        = 6
     case broadcast    = 7
@@ -33,8 +32,6 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .task:         return .blue
         case .instruction:  return .purple
         case .context:      return .secondary
-        case .statusReq:    return .orange
-        case .statusRpt:    return .green
         case .completion:   return .green
         case .error:        return .red
         case .broadcast:    return .yellow
@@ -54,8 +51,6 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .task:         return "Task"
         case .instruction:  return "Instruction"
         case .context:      return "Context"
-        case .statusReq:    return "Status Request"
-        case .statusRpt:    return "Status Report"
         case .completion:   return "Completion"
         case .error:        return "Error"
         case .broadcast:    return "Broadcast"
