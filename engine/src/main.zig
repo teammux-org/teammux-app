@@ -265,6 +265,7 @@ pub const Engine = struct {
         // Clean up Team Lead interceptor from project root
         interceptor.remove(self.allocator, self.project_root) catch |err| {
             std.log.warn("[teammux] Team Lead interceptor cleanup failed: {}", .{err});
+            self.setError("sessionStop: Team Lead interceptor cleanup failed — orphaned .git-wrapper may remain in project root") catch {};
         };
     }
 
@@ -2231,6 +2232,7 @@ export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
         if (path) |p| {
             const z = std.heap.c_allocator.dupeZ(u8, p) catch {
                 std.heap.c_allocator.free(p);
+                e.setError("tm_interceptor_path: OOM allocating Team Lead wrapper path") catch {};
                 return null;
             };
             std.heap.c_allocator.free(p);
@@ -2242,7 +2244,10 @@ export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
         e.setError("tm_interceptor_path: allocation failed") catch {};
         return null;
-    } orelse return null;
+    } orelse {
+        e.setError("tm_interceptor_path: worker not found") catch {};
+        return null;
+    };
     defer wf.deinit(e.allocator);
     const path = interceptor.getInterceptorPath(std.heap.c_allocator, wf.worktree_path) catch {
         e.setError("tm_interceptor_path: filesystem error checking interceptor directory") catch {};
@@ -2251,6 +2256,7 @@ export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     if (path) |p| {
         const z = std.heap.c_allocator.dupeZ(u8, p) catch {
             std.heap.c_allocator.free(p);
+            e.setError("tm_interceptor_path: OOM allocating worker interceptor path") catch {};
             return null;
         };
         std.heap.c_allocator.free(p);
