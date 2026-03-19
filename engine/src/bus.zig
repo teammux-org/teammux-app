@@ -66,6 +66,7 @@ pub const MessageBus = struct {
     project_root: []const u8,
     subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
     subscriber_userdata: ?*anyopaque,
+    commit_cache: ?[]const u8 = null,
     retry_delays_ns: [3]u64 = .{
         1 * std.time.ns_per_s,
         2 * std.time.ns_per_s,
@@ -117,9 +118,38 @@ pub const MessageBus = struct {
         // 1. Assign sequence number atomically
         const seq = self.seq_counter.fetchAdd(1, .monotonic);
 
-        // 2. Capture git commit hash (TD4)
-        const git_commit = self.captureGitCommit();
-        defer if (git_commit) |c| self.allocator.free(c);
+        // 2. Resolve git commit per message type (I14):
+        //    - completion, pr_ready: invalidate cache, fetch fresh (commit matters)
+        //    - delegation, question, broadcast, dispatch, response: skip entirely
+        //    - all others: use cache, populate on miss
+        const git_commit: ?[]const u8 = switch (msg_type) {
+            .delegation, .question, .broadcast, .dispatch, .response, .peer_question => null,
+            .completion, .pr_ready => blk: {
+                // Invalidate cache — these events need the current HEAD
+                if (self.commit_cache) |old| {
+                    self.allocator.free(old);
+                    self.commit_cache = null;
+                }
+                const fresh = self.captureGitCommit();
+                if (fresh) |f| {
+                    self.commit_cache = self.allocator.dupe(u8, f) catch null;
+                }
+                break :blk fresh;
+            },
+            else => blk: {
+                // Cache hit — reuse existing commit hash
+                if (self.commit_cache) |cached| break :blk cached;
+                // Cache miss — fetch and store (cache takes direct ownership)
+                const fresh = self.captureGitCommit();
+                self.commit_cache = fresh;
+                break :blk fresh;
+            },
+        };
+        // Only free the fresh allocation for completion/pr_ready (cache owns its own copy)
+        const owns_git_commit = (msg_type == .completion or msg_type == .pr_ready);
+        defer if (owns_git_commit) {
+            if (git_commit) |c| self.allocator.free(c);
+        };
 
         // 3. Build message
         const msg = Message{
@@ -249,6 +279,10 @@ pub const MessageBus = struct {
     }
 
     pub fn deinit(self: *MessageBus) void {
+        if (self.commit_cache) |cached| {
+            self.allocator.free(cached);
+            self.commit_cache = null;
+        }
         if (self.log_file) |file| {
             file.close();
             self.log_file = null;
