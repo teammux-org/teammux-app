@@ -2326,26 +2326,53 @@ final class EngineClient: ObservableObject {
         let role = workerRoles[completion.workerId]
         let instruction = suggestFollowUp(completion: completion, role: role)
 
+        let now = Date()
         let dispatch = AutonomousDispatch(
             workerId: completion.workerId,
             instruction: instruction,
             triggerSummary: completion.summary,
-            timestamp: Date()
+            timestamp: now
         )
 
         // Save lastError so the autonomous dispatch path does not clobber
-        // error state from a prior manual operation (dispatchTask clears it).
+        // error state from a prior manual operation.
         let savedError = lastError
 
-        let success = dispatchTask(workerId: completion.workerId, instruction: instruction)
+        // Call tm_dispatch_task directly — bypass dispatchTask() to avoid
+        // the refreshDispatchHistory() bridge round-trip (I16).
+        guard let engine else {
+            Self.logger.error("triggerAutonomousDispatch: engine not created")
+            lastError = savedError
+            return
+        }
+
+        let result = instruction.withCString { cInstruction in
+            tm_dispatch_task(engine, completion.workerId, cInstruction)
+        }
+
+        let success = result == TM_OK
         if success {
             if let existing = autonomousDispatches[completion.workerId] {
                 Self.logger.warning("triggerAutonomousDispatch: overwriting prior auto-dispatch for worker \(completion.workerId), previous: \(existing.instruction)")
             }
             autonomousDispatches[completion.workerId] = dispatch
+
+            // Construct DispatchEvent locally instead of bridge reload (I16).
+            // delivered is optimistic — the coordinator may have recorded
+            // delivered=false if bus retry exhausted (I7). The Dispatch tab
+            // calls refreshDispatchHistory() on appear for reconciliation.
+            let event = DispatchEvent(
+                targetWorkerId: completion.workerId,
+                instruction: instruction,
+                timestamp: now,
+                delivered: true,
+                kind: .task
+            )
+            dispatchHistory.append(event)
+
             Self.logger.info("triggerAutonomousDispatch: auto-dispatched to worker \(completion.workerId): \(instruction)")
         } else {
-            let engineError = lastError ?? "unknown engine error"
+            let engineError = lastEngineError() ?? "unknown engine error"
             Self.logger.error("triggerAutonomousDispatch: dispatch failed for worker \(completion.workerId), instruction: \(instruction), error: \(engineError)")
         }
 

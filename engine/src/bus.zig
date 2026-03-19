@@ -57,12 +57,14 @@ pub const Message = struct {
 pub const MessageBus = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
+    cache_mutex: std.Thread.Mutex,
     seq_counter: std.atomic.Value(u64),
     log_file: ?std.fs.File,
     log_path: []const u8,
     project_root: []const u8,
     subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
     subscriber_userdata: ?*anyopaque,
+    commit_cache: ?[]const u8 = null,
     retry_delays_ns: [3]u64 = .{
         1 * std.time.ns_per_s,
         2 * std.time.ns_per_s,
@@ -90,6 +92,7 @@ pub const MessageBus = struct {
         return .{
             .allocator = allocator,
             .mutex = .{},
+            .cache_mutex = .{},
             .seq_counter = std.atomic.Value(u64).init(0),
             .log_file = file,
             .log_path = log_path,
@@ -114,8 +117,62 @@ pub const MessageBus = struct {
         // 1. Assign sequence number atomically
         const seq = self.seq_counter.fetchAdd(1, .monotonic);
 
-        // 2. Capture git commit hash (TD4)
-        const git_commit = self.captureGitCommit();
+        // 2. Resolve git commit per message type (I14):
+        //    - completion, pr_ready: invalidate cache, fetch fresh (commit matters)
+        //    - delegation, question, broadcast, dispatch, response, peer_question: skip entirely
+        //    - all others: use duped cache value, populate on miss
+        //    All branches return an owned allocation (or null) — freed by defer.
+        //    cache_mutex protects commit_cache reads/writes; captureGitCommit()
+        //    runs outside the lock to avoid blocking senders during git spawn.
+        const git_commit: ?[]const u8 = switch (msg_type) {
+            .delegation, .question, .broadcast, .dispatch, .response, .peer_question => null,
+            .completion, .pr_ready => blk: {
+                // Invalidate cache — these events need the current HEAD
+                self.cache_mutex.lock();
+                if (self.commit_cache) |old| {
+                    self.allocator.free(old);
+                    self.commit_cache = null;
+                }
+                self.cache_mutex.unlock();
+                const fresh = self.captureGitCommit();
+                if (fresh) |f| {
+                    self.cache_mutex.lock();
+                    if (self.commit_cache) |stale| self.allocator.free(stale);
+                    self.commit_cache = self.allocator.dupe(u8, f) catch |err| val: {
+                        std.log.warn("[teammux] commit cache dupe failed: {s}", .{@errorName(err)});
+                        break :val null;
+                    };
+                    self.cache_mutex.unlock();
+                }
+                break :blk fresh;
+            },
+            else => blk: {
+                // Cache hit — return a duped copy (caller owns, cache owns separately)
+                self.cache_mutex.lock();
+                if (self.commit_cache) |cached| {
+                    const copy = self.allocator.dupe(u8, cached) catch |err| {
+                        std.log.warn("[teammux] commit cache copy failed: {s}", .{@errorName(err)});
+                        self.cache_mutex.unlock();
+                        break :blk null;
+                    };
+                    self.cache_mutex.unlock();
+                    break :blk copy;
+                }
+                self.cache_mutex.unlock();
+                // Cache miss — fetch, store dupe in cache, return fresh (caller owns)
+                const fresh = self.captureGitCommit();
+                if (fresh) |f| {
+                    self.cache_mutex.lock();
+                    if (self.commit_cache) |stale| self.allocator.free(stale);
+                    self.commit_cache = self.allocator.dupe(u8, f) catch |err| val: {
+                        std.log.warn("[teammux] commit cache store failed: {s}", .{@errorName(err)});
+                        break :val null;
+                    };
+                    self.cache_mutex.unlock();
+                }
+                break :blk fresh;
+            },
+        };
         defer if (git_commit) |c| self.allocator.free(c);
 
         // 3. Build message
@@ -246,6 +303,12 @@ pub const MessageBus = struct {
     }
 
     pub fn deinit(self: *MessageBus) void {
+        self.cache_mutex.lock();
+        if (self.commit_cache) |cached| {
+            self.allocator.free(cached);
+            self.commit_cache = null;
+        }
+        self.cache_mutex.unlock();
         if (self.log_file) |file| {
             file.close();
             self.log_file = null;
