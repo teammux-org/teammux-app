@@ -79,7 +79,8 @@ struct TeamLeadTerminalView: View {
     private var terminalSurface: some View {
         TeamLeadSurfaceRepresentable(
             ghosttyApp: ghosttyApp,
-            projectRoot: engine.projectRoot
+            projectRoot: engine.projectRoot,
+            interceptorPath: engine.teamLeadInterceptorPath()
         )
     }
 
@@ -100,12 +101,14 @@ struct TeamLeadTerminalView: View {
 // MARK: - TeamLeadSurfaceRepresentable
 
 /// NSViewRepresentable that creates a Ghostty.SurfaceView for the Team Lead.
-/// Configured to run `claude` in the project root directory.
+/// Configured to run `claude` in the project root directory with git interceptor
+/// PATH injection (C4: Team Lead structurally prevented from writing code).
 struct TeamLeadSurfaceRepresentable: NSViewRepresentable {
     private static let logger = Logger(subsystem: "com.teammux.app", category: "TeamLeadSurfaceRepresentable")
 
     let ghosttyApp: Ghostty.App
     let projectRoot: String?
+    let interceptorPath: String?
 
     func makeNSView(context: Context) -> NSView {
         guard let app = ghosttyApp.app else {
@@ -118,6 +121,16 @@ struct TeamLeadSurfaceRepresentable: NSViewRepresentable {
 
         if let root = projectRoot {
             config.workingDirectory = root
+        }
+
+        // C4: Inject deny-all git wrapper into PATH so Team Lead cannot write code
+        if let interceptorDir = interceptorPath {
+            let existingPath = config.environmentVariables["PATH"]
+                ?? ProcessInfo.processInfo.environment["PATH"]
+                ?? "/usr/bin:/usr/local/bin"
+            config.environmentVariables["PATH"] = "\(interceptorDir):\(existingPath)"
+        } else {
+            Self.logger.warning("No interceptor path for Team Lead — git interception not enforced")
         }
 
         let surfaceView = Ghostty.SurfaceView(app, baseConfig: config)
