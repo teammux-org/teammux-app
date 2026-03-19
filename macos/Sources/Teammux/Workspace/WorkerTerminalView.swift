@@ -16,13 +16,13 @@ struct WorkerTerminalView: View {
     var body: some View {
         WorkerTerminalSurface(worker: worker, engine: engine)
             .overlay(alignment: .top) {
-                if engine.hotReloadedWorkers.contains(worker.id) {
+                if engine.hotReloadedWorkers[worker.id] != nil {
                     hotReloadBanner
                         .transition(.move(edge: .top).combined(with: .opacity))
                         .padding(.top, 8)
                 }
             }
-            .animation(.easeInOut(duration: 0.3), value: engine.hotReloadedWorkers.contains(worker.id))
+            .animation(.easeInOut(duration: 0.3), value: engine.hotReloadedWorkers[worker.id])
     }
 
     // MARK: - Hot-reload banner
