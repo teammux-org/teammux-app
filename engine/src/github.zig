@@ -471,7 +471,7 @@ pub const GitHubClient = struct {
         }
     }
 
-    /// Atomically replace the repo string: dupe new value, free old, swap.
+    /// Replace the repo string: dupe new value first (preserves old on OOM), then free old and swap.
     pub fn updateRepo(self: *GitHubClient, new_repo: ?[]const u8) !void {
         const new = if (new_repo) |r| try self.allocator.dupe(u8, r) else null;
         if (self.repo) |old| self.allocator.free(old);

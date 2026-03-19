@@ -167,13 +167,12 @@ pub const Engine = struct {
         };
         errdefer hist_logger.deinit();
 
-        // Update github client repo from loaded config (before commit so errdefers still active)
-        if (cfg.project.github_repo) |repo| {
-            self.github_client.updateRepo(repo) catch |err| {
-                self.setError("github client repo update failed") catch {};
-                return err;
-            };
-        }
+        // Update github client repo from loaded config (before commit so errdefers still active).
+        // Called unconditionally: clears stale repo if new config removed github_repo.
+        self.github_client.updateRepo(cfg.project.github_repo) catch |err| {
+            self.setError("github client repo update failed") catch {};
+            return err;
+        };
 
         // All subsystems initialized — commit to self (no more errors possible)
         self.cfg = cfg;
@@ -376,14 +375,16 @@ export fn tm_config_reload(engine: ?*Engine) c_int {
     const p2 = std.fmt.allocPrint(e.allocator, "{s}/.teammux/config.local.toml", .{e.project_root}) catch return 7;
     defer e.allocator.free(p2);
     // Load into local first — on failure, old config remains intact
-    const new_cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
-    // New config loaded successfully — swap
+    var new_cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
+    // Update GitHubClient repo before swapping config — on failure, discard new config
+    e.github_client.updateRepo(new_cfg.project.github_repo) catch {
+        e.setError("config reload: github repo update failed") catch {};
+        new_cfg.deinit(e.allocator);
+        return 7;
+    };
+    // All updates succeeded — swap config
     if (e.cfg) |*old| old.deinit(e.allocator);
     e.cfg = new_cfg;
-    // Update GitHubClient repo if config has one
-    if (new_cfg.project.github_repo) |repo| {
-        e.github_client.updateRepo(repo) catch { e.setError("config reload: github repo update failed") catch {}; };
-    }
     return 0;
 }
 export fn tm_config_watch(engine: ?*Engine, callback: ?*const fn (?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
