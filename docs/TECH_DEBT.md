@@ -46,12 +46,12 @@
 |------|--------------------------|------------------------------------------------------------------|--------|----------|--------|
 | TD21 | worktree_lifecycle.zig   | Dangling worktrees if engine crashes mid-spawn                   | v0.2   | NO       | OPEN   |
 | TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | PARTIAL |
-| TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown              | v0.1.5 | NO       | OPEN   |
+| TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown              | v0.1.5 | NO       | RESOLVED |
 | TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.2   | NO       | OPEN   |
 | TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | AA3    | NO       | RESOLVED |
-| TD26 | TeamMessage / CoordTypes | PRState and PRStatus model same concept with divergent colors    | v0.1.5 | NO       | OPEN   |
-| TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange      | v0.1.5 | NO       | OPEN   |
-| TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff   | v0.1.5 | NO       | OPEN   |
+| TD26 | TeamMessage / CoordTypes | PRState and PRStatus model same concept with divergent colors    | v0.1.5 | NO       | RESOLVED |
+| TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange      | v0.1.5 | NO       | RESOLVED |
+| TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff   | v0.1.5 | NO       | RESOLVED |
 ## Audit-address sprint — New debt introduced
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
@@ -79,6 +79,14 @@
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
 | TD40 | github.zig               | getDiff limited to 100 files (no pagination), 1 MiB buffer cap in runGhCommand     | v0.2   | NO       | OPEN   |
 | TD41 | DiffView.swift           | loadDiff calls engine.getDiff synchronously on MainActor, blocking UI during fetch  | v0.2   | NO       | OPEN   |
+
+## v0.1.5 S6 — New debt from PR review
+
+| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
+| TD42 | ContextView.swift        | LCS changedLineIndices has no unit tests — pure static function needs @testable    | v0.1.5 | NO       | OPEN   |
+| TD43 | hotreload.zig            | reload_count value never asserted in Zig tests — callbacks discard the u64         | v0.1.5 | NO       | OPEN   |
+| TD44 | ContextView.swift        | LCS DP table uses O(m*n) memory — two-row optimization for large CLAUDE.md files   | v0.2   | NO       | OPEN   |
 
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
@@ -108,6 +116,9 @@
 - TD39: merge.zig test "approve returns cleanup_incomplete when worktree already removed" (line ~810) asserts `result == .cleanup_incomplete or result == .success`. The pre-removed worktree may or may not cause branch delete to also fail, making the test non-deterministic. It does not reliably exercise the cleanup_incomplete return path. Fix: also pre-delete the branch before approve to guarantee cleanup failure, or split into two deterministic tests.
 - TD40: getDiff calls `gh api repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100` without `--paginate`. PRs with >100 files silently return only the first 100. GitHub caps at 3000 files per PR. Adding `--paginate` requires handling concatenated JSON arrays (gh outputs one array per page) — either use `--paginate --slurp` and flatten the nested array, or loop with `page=N` manually. Also, `runGhCommand` caps stdout at 1 MiB (`readToEndAlloc(allocator, 1024 * 1024)`) which may be insufficient for very large PRs with full patch content. Fix: add `--paginate` support and increase or remove the buffer cap.
 - TD41: DiffView.loadDiff wraps `engine.getDiff(for:)` in `Task { @MainActor in }`. Since getDiff calls through the C API into `runGhCommand` which spawns and waits for a `gh` subprocess, the main thread is blocked for 1-5 seconds during the network call. The loading spinner may not render because SwiftUI cannot process the render pass while blocked. Fix: move the engine call to `Task.detached` or `Task { }` (without @MainActor) and dispatch results back to MainActor on completion.
+- TD42: changedLineIndices(old:new:) is a private static LCS function in ContextView.swift with multiple code paths (empty-old, empty-new, insertion, deletion, mixed, identical, complete replacement) and a backtracking loop with tie-breaking. Zero unit tests exist. Make internal static via @testable import and add at least 5 cases: identical content, single-edit, insertion-in-middle (the TD28 motivating case), deletion, both-empty.
+- TD43: All 10 Zig test callbacks in hotreload.zig and both in main.zig accept the u64 reload_seq parameter but discard it (`_: u64`). No test verifies that reload_count starts at 0, increments monotonically, or increments on parse failure. The existing "watcher detects NOTE_WRITE" test could capture and assert the value.
+- TD44: LCS DP table allocates Array(repeating: Array(repeating: 0, count: n+1), count: m+1) — O(m*n) memory. For typical CLAUDE.md files (< 200 lines) this is negligible. For 1000+ line files the allocation pressure could cause brief UI stutter on the main thread. Standard two-row optimization reduces space to O(n) but requires modified backtrack. Low priority unless CLAUDE.md files grow large.
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.
