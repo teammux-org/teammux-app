@@ -64,10 +64,10 @@ pub const GitHubClient = struct {
     bus_send_fn: ?BusSendFn,
     bus_send_userdata: ?*anyopaque,
 
-    pub fn init(allocator: std.mem.Allocator, repo: ?[]const u8) GitHubClient {
+    pub fn init(allocator: std.mem.Allocator, repo: ?[]const u8) !GitHubClient {
         return .{
             .allocator = allocator,
-            .repo = repo,
+            .repo = if (repo) |r| try allocator.dupe(u8, r) else null,
             .token = null,
             .webhook_process = null,
             .authed = false,
@@ -457,6 +457,10 @@ pub const GitHubClient = struct {
 
     pub fn deinit(self: *GitHubClient) void {
         self.stopWebhooks();
+        if (self.repo) |r| {
+            self.allocator.free(r);
+            self.repo = null;
+        }
         if (self.token) |t| {
             self.allocator.free(t);
             self.token = null;
@@ -465,6 +469,18 @@ pub const GitHubClient = struct {
             self.allocator.free(id);
             self.last_event_id = null;
         }
+    }
+
+    // TODO(AA2): self.repo is read by the polling thread
+    // without synchronization. updateRepo must be called
+    // only when polling is stopped, or self.repo must be
+    // protected by a mutex. Fix belongs in AA2 concurrency
+    // pass alongside I2/I3.
+    /// Replace the repo string: dupe new value first (preserves old on OOM), then free old and swap.
+    pub fn updateRepo(self: *GitHubClient, new_repo: ?[]const u8) !void {
+        const new = if (new_repo) |r| try self.allocator.dupe(u8, r) else null;
+        if (self.repo) |old| self.allocator.free(old);
+        self.repo = new;
     }
 
     pub const NoRepo = error{NoRepo};
@@ -741,7 +757,7 @@ test "github - auth handles missing token" {
 }
 
 test "github - client init and auth with config token" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     // Auth with config token
@@ -751,7 +767,7 @@ test "github - client init and auth with config token" {
 }
 
 test "github - client unauthenticated without token" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     // Should fail with no gh CLI and no config token
@@ -792,7 +808,7 @@ test "github - gh CLI availability check" {
 fn testEventCallback(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
 
 test "github - webhook start stores callback and stop cleans up" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     // startWebhooks stores callback regardless of webhook outcome
@@ -806,7 +822,7 @@ test "github - webhook start stores callback and stop cleans up" {
 }
 
 test "github - polling thread starts and stops cleanly" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     client.startPollingFallback();
@@ -837,7 +853,7 @@ fn testPollCallback(event_type: ?[*:0]const u8, _: ?[*:0]const u8, userdata: ?*a
 }
 
 test "github - processEvents fires callback for push on teammux branch" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -854,7 +870,7 @@ test "github - processEvents fires callback for push on teammux branch" {
 }
 
 test "github - processEvents fires callback for PR on teammux branch" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -871,7 +887,7 @@ test "github - processEvents fires callback for PR on teammux branch" {
 }
 
 test "github - processEvents ignores non-teammux branches" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -887,7 +903,7 @@ test "github - processEvents ignores non-teammux branches" {
 }
 
 test "github - processEvents deduplicates by event ID" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -920,7 +936,7 @@ test "github - mapEventType maps correctly" {
 }
 
 test "github - processEvents handles empty array" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -932,7 +948,7 @@ test "github - processEvents handles empty array" {
 }
 
 test "github - processEvents handles non-array JSON" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -944,7 +960,7 @@ test "github - processEvents handles non-array JSON" {
 }
 
 test "github - processEvents skips events with missing fields" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -971,7 +987,7 @@ test "github - processEvents skips events with missing fields" {
 }
 
 test "github - processEvents handles multi-event batch with dedup" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var test_data = TestCallbackData{};
@@ -1067,7 +1083,7 @@ fn testBusSend(to: u32, from: u32, msg_type: c_int, payload: ?[*:0]const u8, use
 }
 
 test "github - processEvents routes PR status for teammux branch via bus_send_fn" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var bus_data = BusTestData{};
@@ -1099,7 +1115,7 @@ test "github - processEvents routes PR status for teammux branch via bus_send_fn
 }
 
 test "github - processEvents detects merged PR status" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var bus_data = BusTestData{};
@@ -1123,7 +1139,7 @@ test "github - processEvents detects merged PR status" {
 }
 
 test "github - processEvents detects closed (not merged) PR status" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var bus_data = BusTestData{};
@@ -1147,7 +1163,7 @@ test "github - processEvents detects closed (not merged) PR status" {
 }
 
 test "github - processEvents does not route PR status for non-teammux branch" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var bus_data = BusTestData{};
@@ -1170,7 +1186,7 @@ test "github - processEvents does not route PR status for non-teammux branch" {
 }
 
 test "github - processEvents maps reopened action to open status" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var bus_data = BusTestData{};
@@ -1194,7 +1210,7 @@ test "github - processEvents maps reopened action to open status" {
 }
 
 test "github - processEvents defaults to closed when merged field missing" {
-    var client = GitHubClient.init(std.testing.allocator, "owner/repo");
+    var client = try GitHubClient.init(std.testing.allocator, "owner/repo");
     defer client.deinit();
 
     var bus_data = BusTestData{};

@@ -64,7 +64,7 @@ pub const Engine = struct {
             .ownership_registry = ownership.FileOwnershipRegistry.init(allocator),
             .merge_coordinator = merge.MergeCoordinator.init(allocator),
             .message_bus = null,
-            .github_client = github.GitHubClient.init(allocator, null),
+            .github_client = try github.GitHubClient.init(allocator, null),
             .commands_watcher = null,
             .role_watchers = hotreload.RoleWatcherMap.init(allocator),
             .session_id = sid,
@@ -127,42 +127,61 @@ pub const Engine = struct {
     }
 
     pub fn sessionStart(self: *Engine) !void {
+        // Stage all subsystem inits in locals with errdefer rollback.
+        // Only assign to self.* after the full startup path succeeds.
+
         const config_path = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/config.toml", .{self.project_root});
         defer self.allocator.free(config_path);
         const override_path = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/config.local.toml", .{self.project_root});
         defer self.allocator.free(override_path);
-        self.cfg = config.loadWithOverrides(self.allocator, config_path, override_path) catch |err| {
+
+        var cfg = config.loadWithOverrides(self.allocator, config_path, override_path) catch |err| {
             self.setError("config load failed") catch {};
             return err;
         };
-        if (self.cfg) |cfg| {
-            if (cfg.project.github_repo) |repo| {
-                self.github_client.deinit();
-                self.github_client = github.GitHubClient.init(self.allocator, repo);
-            }
-        }
+        errdefer cfg.deinit(self.allocator);
+
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
-        self.message_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id, self.project_root) catch |err| {
+
+        var msg_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id, self.project_root) catch |err| {
             self.setError("message bus init failed") catch {};
             return err;
         };
+        errdefer msg_bus.deinit();
+
         const cmd_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/commands", .{self.project_root});
         defer self.allocator.free(cmd_dir);
-        self.commands_watcher = commands.CommandWatcher.init(self.allocator, cmd_dir) catch |err| {
+
+        var cmd_watcher = commands.CommandWatcher.init(self.allocator, cmd_dir) catch |err| {
             self.setError("commands watcher init failed") catch {};
             return err;
         };
+        errdefer cmd_watcher.deinit();
+
         // Wire bus routing for /teammux-complete and /teammux-question
-        if (self.commands_watcher) |*w| {
-            w.bus_send_fn = busSendBridge;
-            w.bus_send_userdata = self;
-        }
-        // Initialize history logger for completion/question persistence (TD16)
-        self.history_logger = history_mod.HistoryLogger.init(self.allocator, self.project_root) catch |err| {
+        cmd_watcher.bus_send_fn = busSendBridge;
+        cmd_watcher.bus_send_userdata = self;
+
+        var hist_logger = history_mod.HistoryLogger.init(self.allocator, self.project_root) catch |err| {
             self.setError("history logger init failed") catch {};
             return err;
         };
+        errdefer hist_logger.deinit();
+
+        // Update github client repo from loaded config (before commit so errdefers still active).
+        // Called unconditionally: clears stale repo if new config removed github_repo.
+        self.github_client.updateRepo(cfg.project.github_repo) catch |err| {
+            self.setError("github client repo update failed") catch {};
+            return err;
+        };
+
+        // All subsystems initialized — commit to self (no more errors possible)
+        self.cfg = cfg;
+        self.message_bus = msg_bus;
+        self.commands_watcher = cmd_watcher;
+        self.history_logger = hist_logger;
+
         // Wire bus routing for PR status events from GitHub polling
         self.github_client.bus_send_fn = busSendBridge;
         self.github_client.bus_send_userdata = self;
@@ -372,8 +391,17 @@ export fn tm_config_reload(engine: ?*Engine) c_int {
     defer e.allocator.free(p1);
     const p2 = std.fmt.allocPrint(e.allocator, "{s}/.teammux/config.local.toml", .{e.project_root}) catch return 7;
     defer e.allocator.free(p2);
+    // Load into local first — on failure, old config remains intact
+    var new_cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
+    // Update GitHubClient repo before swapping config — on failure, discard new config
+    e.github_client.updateRepo(new_cfg.project.github_repo) catch {
+        e.setError("config reload: github repo update failed") catch {};
+        new_cfg.deinit(e.allocator);
+        return 7;
+    };
+    // All updates succeeded — swap config
     if (e.cfg) |*old| old.deinit(e.allocator);
-    e.cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
+    e.cfg = new_cfg;
     return 0;
 }
 export fn tm_config_watch(engine: ?*Engine, callback: ?*const fn (?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
