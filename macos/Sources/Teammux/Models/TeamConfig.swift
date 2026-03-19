@@ -101,7 +101,7 @@ struct TeamConfig: Equatable {
     }
 
     /// Serialise the config to TOML matching the spec format in
-    /// `TEAMMUX_V01_SPEC.md` Section 5.
+    /// `docs/sprints/v0.1.0/TEAMMUX_V01_SPEC.md` Section 5.
     func toTOML(projectName: String) -> String {
         var lines: [String] = []
 

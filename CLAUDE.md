@@ -36,10 +36,11 @@ macOS 15 Sequoia, Apple Silicon only — com.teammux.app
 - no stream merges without main thread approval
 
 ## Key documents
-- engine/include/teammux.h  — C API source of truth
-- roles/                    — bundled role library (local only, no external fetching)
-- TECH_DEBT.md              — open and resolved debt items
-- V014_SPRINT.md            — current sprint spec
+- engine/include/teammux.h          — C API source of truth
+- roles/                            — bundled role library (local only, no external fetching)
+- docs/TECH_DEBT.md                 — open and resolved debt items
+- docs/sprints/v0.1.4/V014_SPRINT.md — current sprint spec
+- docs/sprints/                     — all sprint and stream docs by version
 
 ## Version history
 - v0.1.0 — Ghostty fork, Zig engine, Swift UI, git worktrees, message bus
