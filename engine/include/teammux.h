@@ -36,6 +36,7 @@ typedef enum {
     TM_ERR_INVALID_WORKER   = 12,
     TM_ERR_ROLE             = 13,
     TM_ERR_OWNERSHIP        = 14,
+    TM_ERR_CLEANUP_INCOMPLETE = 15,
     TM_ERR_UNKNOWN          = 99,
 } tm_result_t;
 

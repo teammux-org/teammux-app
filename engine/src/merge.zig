@@ -26,6 +26,7 @@ pub const Conflict = struct {
 pub const ApproveResult = enum {
     success,
     conflict,
+    cleanup_incomplete,
 };
 
 pub const GitOutput = struct {
@@ -133,17 +134,16 @@ pub const MergeCoordinator = struct {
             try self.statuses.put(worker_id, .success);
             self.active_merge = null;
 
-            // Remove worktree (best effort)
-            runGitIgnoreResult(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path });
-
-            // Delete branch (best effort — it's merged)
-            runGitIgnoreResult(self.allocator, project_root, &.{ "branch", "-D", branch_name });
+            // Remove worktree and branch with failure tracking
+            const wt_removed = runGitLogged(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "merge cleanup: worktree remove");
+            const br_deleted = runGitLogged(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "merge cleanup: branch delete");
 
             // Update worker status to complete (keep roster entry for C1 history display)
             if (roster.getWorker(worker_id)) |w| {
                 w.status = .complete;
             }
 
+            if (!wt_removed or !br_deleted) return .cleanup_incomplete;
             return .success;
         } else {
             // Non-zero exit — check for conflicts
@@ -209,12 +209,13 @@ pub const MergeCoordinator = struct {
     }
 
     /// Reject a worker's merge: abort any in-progress merge, remove worktree, delete branch.
+    /// Returns true if cleanup was complete, false if worktree/branch removal failed.
     pub fn reject(
         self: *MergeCoordinator,
         roster: *worktree.Roster,
         project_root: []const u8,
         worker_id: worktree.WorkerId,
-    ) !void {
+    ) !bool {
         // Look up worker and copy what we need before dismiss frees memory
         const worker = roster.getWorker(worker_id) orelse return error.WorkerNotFound;
         const branch_name = try self.allocator.dupe(u8, worker.branch_name);
@@ -240,11 +241,9 @@ pub const MergeCoordinator = struct {
             }
         }
 
-        // Remove worktree
-        runGitIgnoreResult(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path });
-
-        // Delete branch
-        runGitIgnoreResult(self.allocator, project_root, &.{ "branch", "-D", branch_name });
+        // Remove worktree and branch with failure tracking
+        const wt_removed = runGitLogged(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "reject cleanup: worktree remove");
+        const br_deleted = runGitLogged(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "reject cleanup: branch delete");
 
         // Remove from roster (worktree remove will fail silently — already done)
         roster.dismiss(project_root, worker_id) catch |err| switch (err) {
@@ -258,6 +257,8 @@ pub const MergeCoordinator = struct {
         if (self.conflicts.fetchRemove(worker_id)) |old| {
             freeConflicts(self.allocator, old.value);
         }
+
+        return wt_removed and br_deleted;
     }
 
     /// Get current merge status for a worker.
@@ -426,6 +427,20 @@ pub fn runGitCapture(allocator: std.mem.Allocator, cwd: []const u8, args: []cons
         .exit_code = exit_code,
         .stdout = stdout_data,
     };
+}
+
+/// Run git command for cleanup, logging warnings on failure. Returns true if command succeeded.
+fn runGitLogged(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8, operation: []const u8) bool {
+    const result = runGitCapture(allocator, cwd, args) catch |err| {
+        std.log.warn("[teammux] {s} spawn failed: {}", .{ operation, err });
+        return false;
+    };
+    defer result.deinit(allocator);
+    if (result.exit_code != 0) {
+        std.log.warn("[teammux] {s} exited with code {d}", .{ operation, result.exit_code });
+        return false;
+    }
+    return true;
 }
 
 /// Run git command, ignoring all output and exit code. Best-effort cleanup operations.
@@ -612,7 +627,7 @@ test "merge - reject removes worktree and branch (integration)" {
     var mc = MergeCoordinator.init(std.testing.allocator);
     defer mc.deinit();
 
-    try mc.reject(&roster, repo.path, id);
+    _ = try mc.reject(&roster, repo.path, id);
 
     try std.testing.expect(roster.getWorker(id) == null);
     try std.testing.expect(mc.getStatus(id) == .rejected);
@@ -751,7 +766,7 @@ test "merge - reject after conflicted merge (integration)" {
     try std.testing.expect(approve_result == .conflict);
     try std.testing.expect(mc.active_merge != null);
 
-    try mc.reject(&roster, repo.path, id);
+    _ = try mc.reject(&roster, repo.path, id);
     try std.testing.expect(mc.getStatus(id) == .rejected);
     try std.testing.expect(mc.active_merge == null);
     try std.testing.expect(mc.getConflicts(id) == null);
@@ -865,5 +880,5 @@ test "merge - concurrent merge prevention" {
     }
 
     // Clean up
-    try mc.reject(&roster, repo.path, id1);
+    _ = try mc.reject(&roster, repo.path, id1);
 }
