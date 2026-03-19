@@ -188,9 +188,11 @@ pub const Engine = struct {
 
         // Install Team Lead deny-all interceptor before any PTY surfaces are created.
         // Worker 0 is structurally prevented from writing code (C4).
+        // This is a hard failure — session must not start without enforcement.
         const tl_result = tm_interceptor_install(self, 0);
         if (tl_result != 0) {
-            std.log.warn("[teammux] Team Lead interceptor install failed (result {d}) — continuing without enforcement", .{tl_result});
+            self.setError("Team Lead interceptor install failed — session cannot start without git write enforcement") catch {};
+            return error.InterceptorInstallFailed;
         }
     }
 
@@ -459,7 +461,8 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
 
     // 3. Get path/branch from lifecycle registry
     const entry = e.wt_registry.get(id) orelse {
-        e.setError("worktree created but not found in registry") catch {};
+        e.setError("worktree created but not found in registry — internal error") catch {};
+        worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
         return 0xFFFFFFFF;
     };
 
@@ -470,10 +473,13 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
         return 0xFFFFFFFF;
     };
 
-    // 5. Write context file into worktree
+    // 5. Write context file into worktree — hard failure rolls back spawn
     worktree.writeContextFile(e.allocator, entry.path, at, td, null, entry.branch) catch |err| {
-        std.log.warn("[teammux] context file write failed for worker {d}: {s}", .{ id, @errorName(err) });
-        e.setError("worker spawned but context file write failed") catch {};
+        std.log.err("[teammux] context file write failed for worker {d}: {s} — rolling back spawn", .{ id, @errorName(err) });
+        e.setError("worker spawn failed: could not write context file") catch {};
+        e.roster.dismiss(id) catch {};
+        worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        return 0xFFFFFFFF;
     };
 
     return id;
@@ -760,15 +766,17 @@ fn handleAssignCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         return;
     });
 
-    // Block command-file dispatch for Team Lead — use tm_dispatch_task via UI
+    // Block command-file dispatch for Team Lead — use tm_dispatch_task via UI.
+    // Missing worker_id defaults to 0 (Team Lead) to prevent bypass.
     const from_id_str = extractJsonStringValue(args, "worker_id") orelse
         extractJsonNumber(args, "worker_id");
-    if (from_id_str) |fid| {
-        const from_id = std.fmt.parseInt(u32, fid, 10) catch 0xFFFFFFFF;
-        if (from_id == 0) {
-            std.log.warn("[teammux] /teammux-assign: Team Lead (worker 0) cannot use command-file dispatch — use tm_dispatch_task from the Teammux UI", .{});
-            return;
-        }
+    const from_id: u32 = if (from_id_str) |fid|
+        std.fmt.parseInt(u32, fid, 10) catch 0
+    else
+        0; // Missing worker_id treated as Team Lead
+    if (from_id == 0) {
+        std.log.warn("[teammux] /teammux-assign: Team Lead (worker 0) cannot use command-file dispatch — use tm_dispatch_task from the Teammux UI", .{});
+        return;
     }
 
     // Parse target_worker_id (integer or string) from JSON
@@ -2089,6 +2097,12 @@ export fn tm_ownership_update(
     deny_count: u32,
 ) c_int {
     const e = engine orelse return 99;
+
+    // Team Lead (worker 0) cannot receive write grants
+    if (worker_id == 0 and write_count > 0) {
+        e.setError("tm_ownership_update: write grants not allowed for Team Lead (worker 0)") catch {};
+        return 14; // TM_ERR_OWNERSHIP
+    }
 
     // Convert C string arrays to Zig slices
     const write_slices = e.allocator.alloc([]const u8, write_count) catch {
@@ -4290,7 +4304,7 @@ test "command routing wrapper routes /teammux-assign to coordinator" {
     // Add a worker to the roster
     try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
 
-    const args_json = "{\"target_worker_id\": 5, \"instruction\": \"refactor auth\"}";
+    const args_json = "{\"worker_id\": 1, \"target_worker_id\": 5, \"instruction\": \"refactor auth\"}";
     const args_z = try alloc.dupeZ(u8, args_json);
     defer alloc.free(args_z);
     const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
@@ -5963,6 +5977,58 @@ test "C4 - /teammux-assign blocked for worker 0" {
     // No dispatch should have been recorded
     const history = e.coordinator.getHistory();
     try std.testing.expect(history.len == 0);
+}
+
+test "C4 - /teammux-assign blocked when worker_id field missing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
+    defer alloc.free(log_dir);
+    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "c4bypass", root);
+
+    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
+
+    // Missing worker_id field should default to Team Lead (worker 0) and be blocked
+    const args_json = "{\"target_worker_id\": 5, \"instruction\": \"bypass attempt\"}";
+    const args_z = try alloc.dupeZ(u8, args_json);
+    defer alloc.free(args_z);
+    const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
+    defer alloc.free(cmd_z);
+
+    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+
+    // Must NOT have dispatched — missing worker_id defaults to Team Lead
+    const history = e.coordinator.getHistory();
+    try std.testing.expect(history.len == 0);
+}
+
+test "C4 - tm_ownership_update rejects write grants for worker 0" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const pat = try alloc.dupeZ(u8, "src/**");
+    defer alloc.free(pat);
+    var write_pats = [_]?[*:0]const u8{pat.ptr};
+    var deny_pats = [_]?[*:0]const u8{pat.ptr};
+
+    // Write grants for worker 0 via update must fail
+    try std.testing.expect(tm_ownership_update(e, 0, &write_pats, 1, null, 0) == 14);
+
+    // Deny-only update for worker 0 should succeed
+    try std.testing.expect(tm_ownership_update(e, 0, null, 0, &deny_pats, 1) == 0);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; _ = worktree_lifecycle; _ = history_mod; }
