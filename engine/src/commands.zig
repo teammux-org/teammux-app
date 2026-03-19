@@ -31,7 +31,7 @@ pub const CommandWatcher = struct {
     pub fn init(allocator: std.mem.Allocator, commands_dir: []const u8) !CommandWatcher {
         return .{
             .allocator = allocator,
-            .commands_dir = commands_dir,
+            .commands_dir = try allocator.dupe(u8, commands_dir),
             .kq = -1,
             .dir_fd = -1,
             .callback = null,
@@ -87,6 +87,7 @@ pub const CommandWatcher = struct {
             std.posix.close(@intCast(self.dir_fd));
             self.dir_fd = -1;
         }
+        self.allocator.free(self.commands_dir);
     }
 
     fn watchLoop(self: *CommandWatcher) void {
