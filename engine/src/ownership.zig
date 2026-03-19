@@ -110,16 +110,43 @@ pub const FileOwnershipRegistry = struct {
         return false;
     }
 
-    /// Get rules for a worker. Returns null if no rules registered.
-    /// Returned slice is owned by the registry — do not free.
-    /// WARNING: The returned slice is invalidated by concurrent register()
-    /// or release() calls on the same worker_id. Callers must copy the data
-    /// out before releasing the lock on their side.
-    pub fn getRules(self: *FileOwnershipRegistry, worker_id: WorkerId) ?[]const PathRule {
+    /// Thread-safe copy of rules for a worker. Returns null if no rules
+    /// registered. Returned slice and all pattern strings are owned by the
+    /// caller — free with freeRulesCopy().
+    pub fn copyRules(self: *FileOwnershipRegistry, worker_id: WorkerId, alloc: std.mem.Allocator) !?[]PathRule {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        return self.rules.get(worker_id);
+        const src = self.rules.get(worker_id) orelse return null;
+        if (src.len == 0) {
+            // Return a zero-length owned slice so callers can distinguish
+            // "has rules but empty" from "no rules at all" (null).
+            const empty = try alloc.alloc(PathRule, 0);
+            return empty;
+        }
+
+        const copy = try alloc.alloc(PathRule, src.len);
+        var duped: usize = 0;
+        errdefer {
+            for (copy[0..duped]) |rule| alloc.free(rule.pattern);
+            alloc.free(copy);
+        }
+
+        for (src) |rule| {
+            copy[duped] = .{
+                .pattern = try alloc.dupe(u8, rule.pattern),
+                .allow_write = rule.allow_write,
+            };
+            duped += 1;
+        }
+
+        return copy;
+    }
+
+    /// Free a rules slice returned by copyRules().
+    pub fn freeRulesCopy(alloc: std.mem.Allocator, rules_copy: []PathRule) void {
+        for (rules_copy) |rule| alloc.free(rule.pattern);
+        alloc.free(rules_copy);
     }
 
     /// Replace all ownership rules for a worker under lock. Allocates new
@@ -465,14 +492,15 @@ test "registry - register multiple patterns for same worker" {
     try std.testing.expect(!reg.check(1, "src/backend/server.ts"));
 }
 
-test "registry - getRules returns registered rules" {
+test "registry - copyRules returns registered rules" {
     var reg = FileOwnershipRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
     try reg.register(1, "src/**", true);
     try reg.register(1, "infra/**", false);
 
-    const rules = reg.getRules(1) orelse return error.TestUnexpectedResult;
+    const rules = try reg.copyRules(1, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    defer FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules);
     try std.testing.expect(rules.len == 2);
     try std.testing.expectEqualStrings("src/**", rules[0].pattern);
     try std.testing.expect(rules[0].allow_write == true);
@@ -480,11 +508,11 @@ test "registry - getRules returns registered rules" {
     try std.testing.expect(rules[1].allow_write == false);
 }
 
-test "registry - getRules returns null when no rules" {
+test "registry - copyRules returns null when no rules" {
     var reg = FileOwnershipRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    try std.testing.expect(reg.getRules(99) == null);
+    try std.testing.expect(try reg.copyRules(99, std.testing.allocator) == null);
 }
 
 test "registry - realistic frontend engineer role" {
@@ -583,15 +611,19 @@ test "updateWorkerRules - old patterns removed" {
     try reg.register(1, "src/**", true);
     try reg.register(1, "infra/**", false);
 
-    const rules_before = reg.getRules(1) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(rules_before.len == 2);
+    {
+        const rules_before = try reg.copyRules(1, std.testing.allocator) orelse return error.TestUnexpectedResult;
+        defer FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules_before);
+        try std.testing.expect(rules_before.len == 2);
+    }
 
     // Update with completely different patterns
     const new_write = [_][]const u8{"tests/**"};
     const new_deny = [_][]const u8{"docs/**"};
     try reg.updateWorkerRules(1, &new_write, &new_deny);
 
-    const rules_after = reg.getRules(1) orelse return error.TestUnexpectedResult;
+    const rules_after = try reg.copyRules(1, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    defer FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules_after);
     try std.testing.expect(rules_after.len == 2);
     try std.testing.expectEqualStrings("tests/**", rules_after[0].pattern);
     try std.testing.expect(rules_after[0].allow_write == true);
@@ -607,13 +639,14 @@ test "updateWorkerRules - creates rules for new worker" {
     var reg = FileOwnershipRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    try std.testing.expect(reg.getRules(42) == null);
+    try std.testing.expect(try reg.copyRules(42, std.testing.allocator) == null);
 
     const write = [_][]const u8{"src/**"};
     const deny = [_][]const u8{"vendor/**"};
     try reg.updateWorkerRules(42, &write, &deny);
 
-    const rules = reg.getRules(42) orelse return error.TestUnexpectedResult;
+    const rules = try reg.copyRules(42, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    defer FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules);
     try std.testing.expect(rules.len == 2);
     try std.testing.expect(reg.check(42, "src/main.zig"));
     try std.testing.expect(!reg.check(42, "vendor/lib.zig"));
@@ -631,7 +664,8 @@ test "updateWorkerRules - empty patterns denies all writes" {
     const empty = [_][]const u8{};
     try reg.updateWorkerRules(1, &empty, &empty);
 
-    const rules = reg.getRules(1) orelse return error.TestUnexpectedResult;
+    const rules = try reg.copyRules(1, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    defer FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules);
     try std.testing.expect(rules.len == 0);
     // Empty rule set means implicit deny for all paths
     try std.testing.expect(!reg.check(1, "src/anything.ts"));

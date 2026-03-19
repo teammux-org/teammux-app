@@ -34,6 +34,7 @@ pub const Engine = struct {
     session_id: [8]u8,
     last_error: ?[]const u8,
     last_error_cstr: ?[*:0]u8,
+    last_error_mutex: std.Thread.Mutex,
     last_config_get_cstr: ?[*:0]u8,
     next_sub_id: u32,
     roster_callback: ?*const fn (?*const CRoster, ?*anyopaque) callconv(.c) void,
@@ -69,6 +70,7 @@ pub const Engine = struct {
             .session_id = sid,
             .last_error = null,
             .last_error_cstr = null,
+            .last_error_mutex = .{},
             .last_config_get_cstr = null,
             .next_sub_id = 1,
             .roster_callback = null,
@@ -199,8 +201,13 @@ pub const Engine = struct {
                     break :blk "";
                 };
                 const git_commit = if (msg_enum == .completion) blk: {
-                    if (self.roster.getWorker(from)) |w| {
-                        break :blk history_mod.captureGitCommit(self.allocator, w.worktree_path);
+                    const wf = self.roster.copyWorkerFields(from, self.allocator) catch |err| {
+                        std.log.warn("[teammux] history: git commit capture skipped for worker {d}: {}", .{ from, err });
+                        break :blk null;
+                    };
+                    if (wf) |fields| {
+                        defer fields.deinit(self.allocator);
+                        break :blk history_mod.captureGitCommit(self.allocator, fields.worktree_path);
                     }
                     break :blk null;
                 } else null;
@@ -229,7 +236,11 @@ pub const Engine = struct {
         self.github_client.stopWebhooks();
     }
 
+    /// Set the last error message. Acquires last_error_mutex internally.
+    /// NEVER call from code that already holds last_error_mutex (non-recursive).
     fn setError(self: *Engine, msg: []const u8) !void {
+        self.last_error_mutex.lock();
+        defer self.last_error_mutex.unlock();
         if (self.last_error) |old| {
             self.allocator.free(old);
             self.last_error = null; // Prevent use-after-free if dupe fails
@@ -342,6 +353,8 @@ export fn tm_session_start(engine: ?*Engine) c_int {
 export fn tm_session_stop(engine: ?*Engine) void { if (engine) |e| e.sessionStop(); }
 export fn tm_engine_last_error(engine: ?*Engine) [*:0]const u8 {
     const e = engine orelse return last_create_error;
+    e.last_error_mutex.lock();
+    defer e.last_error_mutex.unlock();
     if (e.last_error_cstr) |old| { e.allocator.free(std.mem.span(old)); e.last_error_cstr = null; }
     if (e.last_error) |err| {
         const z = e.allocator.dupeZ(u8, err) catch return "allocation failed";
@@ -408,8 +421,12 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
         kv.value.destroy();
     }
     // Remove interceptor wrapper before worktree is deleted
-    if (e.roster.getWorker(worker_id)) |w| {
-        interceptor.remove(e.allocator, w.worktree_path) catch |err| {
+    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
+        std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
+        break :blk null;
+    }) |wf| {
+        defer wf.deinit(e.allocator);
+        interceptor.remove(e.allocator, wf.worktree_path) catch |err| {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
         };
     }
@@ -491,9 +508,13 @@ export fn tm_roster_free(roster: ?*CRoster) void {
 }
 export fn tm_worker_get(engine: ?*Engine, worker_id: u32) ?*CWorkerInfo {
     const e = engine orelse return null;
-    const w = e.roster.getWorker(worker_id) orelse return null;
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("tm_worker_get: allocation failed") catch {};
+        return null;
+    } orelse return null;
+    defer wf.deinit(e.allocator);
     const info = e.allocator.create(CWorkerInfo) catch return null;
-    info.* = fillCWorkerInfo(e.allocator, w) catch { e.allocator.destroy(info); return null; };
+    info.* = fillCWorkerInfoFromFields(e.allocator, wf) catch { e.allocator.destroy(info); return null; };
     return info;
 }
 export fn tm_worker_info_free(info: ?*CWorkerInfo) void {
@@ -553,10 +574,14 @@ export fn tm_github_auth(engine: ?*Engine) c_int {
 export fn tm_github_is_authed(engine: ?*Engine) bool { return if (engine) |e| e.github_client.isAuthed() else false; }
 export fn tm_github_create_pr(engine: ?*Engine, worker_id: u32, title: ?[*:0]const u8, body: ?[*:0]const u8) ?*CPr {
     const e = engine orelse return null;
-    const w = e.roster.getWorker(worker_id) orelse {
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("PR creation failed: allocation error") catch {};
+        return null;
+    } orelse {
         e.setError("PR creation failed: worker not found") catch {};
         return null;
     };
+    defer wf.deinit(e.allocator);
     const alloc = e.allocator;
     const title_slice = std.mem.span(title orelse {
         e.setError("PR creation failed: title is NULL") catch {};
@@ -566,7 +591,7 @@ export fn tm_github_create_pr(engine: ?*Engine, worker_id: u32, title: ?[*:0]con
         e.setError("PR creation failed: body is NULL") catch {};
         return null;
     });
-    const branch_name = w.branch_name;
+    const branch_name = wf.branch_name;
     const pr = e.github_client.createPr(alloc, branch_name, title_slice, body_slice) catch {
         e.setError("PR creation failed: gh CLI error") catch {};
         routePrError(e, worker_id, "gh pr create failed");
@@ -605,11 +630,15 @@ export fn tm_github_merge_pr(engine: ?*Engine, pr_number: u64, strategy: c_int) 
 }
 export fn tm_github_get_diff(engine: ?*Engine, worker_id: u32) ?*CDiff {
     const e = engine orelse return null;
-    const w = e.roster.getWorker(worker_id) orelse {
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("diff failed: allocation error") catch {};
+        return null;
+    } orelse {
         e.setError("diff failed: worker not found") catch {};
         return null;
     };
-    _ = e.github_client.getDiff(e.allocator, w.branch_name) catch {
+    defer wf.deinit(e.allocator);
+    _ = e.github_client.getDiff(e.allocator, wf.branch_name) catch {
         // getDiff returns NotImplemented in v0.1 — this is expected
         e.setError("diff view not yet available (v0.2)") catch {};
         return null;
@@ -735,12 +764,12 @@ fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         return;
     }
 
-    if (engine.roster.getWorker(from_id) == null) {
+    if (!engine.roster.hasWorker(from_id)) {
         std.log.warn("[teammux] /teammux-ask: sender worker {d} not found in roster", .{from_id});
         return;
     }
 
-    if (engine.roster.getWorker(target_id) == null) {
+    if (!engine.roster.hasWorker(target_id)) {
         std.log.warn("[teammux] /teammux-ask: target worker {d} not found in roster", .{target_id});
         return;
     }
@@ -801,12 +830,12 @@ fn handleDelegationCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         return;
     }
 
-    if (engine.roster.getWorker(from_id) == null) {
+    if (!engine.roster.hasWorker(from_id)) {
         std.log.warn("[teammux] /teammux-delegate: sender worker {d} not found in roster", .{from_id});
         return;
     }
 
-    if (engine.roster.getWorker(target_id) == null) {
+    if (!engine.roster.hasWorker(target_id)) {
         std.log.warn("[teammux] /teammux-delegate: target worker {d} not found in roster", .{target_id});
         return;
     }
@@ -1103,11 +1132,11 @@ export fn tm_peer_question(engine: ?*Engine, from_id: u32, target_id: u32, messa
         e.setError("tm_peer_question: cannot ask yourself") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     }
-    if (e.roster.getWorker(from_id) == null) {
+    if (!e.roster.hasWorker(from_id)) {
         e.setError("tm_peer_question: sender worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     }
-    if (e.roster.getWorker(target_id) == null) {
+    if (!e.roster.hasWorker(target_id)) {
         e.setError("tm_peer_question: target worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     }
@@ -1156,11 +1185,11 @@ export fn tm_peer_delegate(engine: ?*Engine, from_id: u32, target_id: u32, task:
         e.setError("tm_peer_delegate: cannot delegate to yourself") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     }
-    if (e.roster.getWorker(from_id) == null) {
+    if (!e.roster.hasWorker(from_id)) {
         e.setError("tm_peer_delegate: sender worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     }
-    if (e.roster.getWorker(target_id) == null) {
+    if (!e.roster.hasWorker(target_id)) {
         e.setError("tm_peer_delegate: target worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     }
@@ -1256,10 +1285,17 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
     // History write for C API path (Swift calling tm_worker_complete).
     // The command-file path (busSendBridge) has its own history write.
     if (e.history_logger) |*logger| {
-        const git_commit = if (e.roster.getWorker(worker_id)) |w|
-            history_mod.captureGitCommit(e.allocator, w.worktree_path)
-        else
-            null;
+        const git_commit = blk: {
+            const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| {
+                std.log.warn("[teammux] history: git commit capture skipped for worker {d}: {}", .{ worker_id, err });
+                break :blk null;
+            };
+            if (wf) |fields| {
+                defer fields.deinit(e.allocator);
+                break :blk history_mod.captureGitCommit(e.allocator, fields.worktree_path);
+            }
+            break :blk null;
+        };
         defer if (git_commit) |gc| e.allocator.free(gc);
         logger.append(.{
             .entry_type = .completion,
@@ -1515,8 +1551,12 @@ export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
         kv.value.destroy();
     }
     // Remove interceptor wrapper before worktree is deleted
-    if (e.roster.getWorker(worker_id)) |w| {
-        interceptor.remove(e.allocator, w.worktree_path) catch |err| {
+    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
+        std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
+        break :blk null;
+    }) |wf| {
+        defer wf.deinit(e.allocator);
+        interceptor.remove(e.allocator, wf.worktree_path) catch |err| {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
         };
     }
@@ -1899,8 +1939,15 @@ export fn tm_ownership_get(engine: ?*Engine, worker_id: u32, count: ?*u32) ?[*]?
     const e = engine orelse return null;
     const alloc = e.allocator;
 
-    const rules = e.ownership_registry.getRules(worker_id) orelse return null;
-    if (rules.len == 0) return null;
+    // Thread-safe: copyRules duplicates all data under the registry lock
+    const rules = e.ownership_registry.copyRules(worker_id, alloc) catch {
+        e.setError("tm_ownership_get: allocation failed") catch {};
+        return null;
+    } orelse return null;
+    defer ownership.FileOwnershipRegistry.freeRulesCopy(alloc, rules);
+    if (rules.len == 0) {
+        return null;
+    }
 
     // Note: this is a C-ABI export returning ?[*] — errdefer does not apply.
     // All cleanup must be done manually in each catch block.
@@ -2013,13 +2060,21 @@ export fn tm_ownership_update(
 
 export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
-    const w = e.roster.getWorker(worker_id) orelse {
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("tm_interceptor_install: allocation failed") catch {};
+        return 5; // TM_ERR_WORKTREE
+    } orelse {
         e.setError("tm_interceptor_install: worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     };
+    defer wf.deinit(e.allocator);
 
-    // Get deny and write patterns from ownership registry
-    const rules = e.ownership_registry.getRules(worker_id);
+    // Get deny and write patterns from ownership registry (thread-safe copy)
+    const rules = e.ownership_registry.copyRules(worker_id, e.allocator) catch {
+        e.setError("tm_interceptor_install: allocation failed") catch {};
+        return 5; // TM_ERR_WORKTREE
+    };
+    defer if (rules) |r| ownership.FileOwnershipRegistry.freeRulesCopy(e.allocator, r);
 
     // Count deny vs write patterns
     var deny_count: usize = 0;
@@ -2030,10 +2085,7 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
         }
     }
 
-    // Build pattern arrays — copy pattern pointers from registry.
-    // NOTE: These are pointers into registry-owned memory. Safe because
-    // all C API calls are dispatched from the main thread; no concurrent
-    // register/release can occur during this function.
+    // Build pattern arrays from copied rules (caller-owned, safe from concurrent mutation)
     const deny_pats = e.allocator.alloc([]const u8, deny_count) catch {
         e.setError("tm_interceptor_install: allocation failed") catch {};
         return 5; // TM_ERR_WORKTREE
@@ -2059,7 +2111,7 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
         }
     }
 
-    interceptor.install(e.allocator, w.worktree_path, worker_id, w.name, deny_pats, write_pats) catch |err| {
+    interceptor.install(e.allocator, wf.worktree_path, worker_id, wf.name, deny_pats, write_pats) catch |err| {
         e.setError(switch (err) {
             error.GitNotFound => "tm_interceptor_install: git binary not found on PATH",
             error.UnsafePattern => "tm_interceptor_install: pattern contains shell metacharacters",
@@ -2073,11 +2125,15 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
 // NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
-    const w = e.roster.getWorker(worker_id) orelse {
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("tm_interceptor_remove: allocation failed") catch {};
+        return 5; // TM_ERR_WORKTREE
+    } orelse {
         e.setError("tm_interceptor_remove: worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     };
-    interceptor.remove(e.allocator, w.worktree_path) catch {
+    defer wf.deinit(e.allocator);
+    interceptor.remove(e.allocator, wf.worktree_path) catch {
         e.setError("tm_interceptor_remove: failed to remove wrapper") catch {};
         return 5; // TM_ERR_WORKTREE
     };
@@ -2086,8 +2142,12 @@ export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
 
 export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     const e = engine orelse return null;
-    const w = e.roster.getWorker(worker_id) orelse return null;
-    const path = interceptor.getInterceptorPath(std.heap.c_allocator, w.worktree_path) catch {
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("tm_interceptor_path: allocation failed") catch {};
+        return null;
+    } orelse return null;
+    defer wf.deinit(e.allocator);
+    const path = interceptor.getInterceptorPath(std.heap.c_allocator, wf.worktree_path) catch {
         e.setError("tm_interceptor_path: filesystem error checking interceptor directory") catch {};
         return null;
     };
@@ -2116,10 +2176,14 @@ export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u
         return 13;
     });
 
-    const w = e.roster.getWorker(worker_id) orelse {
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("tm_role_watch: allocation failed") catch {};
+        return 99;
+    } orelse {
         e.setError("tm_role_watch: worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
     };
+    defer wf.deinit(e.allocator);
 
     const role_path = config.resolveRolePath(e.allocator, rid, e.project_root) catch |err| {
         std.log.warn("[teammux] tm_role_watch: role path resolution failed for '{s}': {}", .{ rid, err });
@@ -2142,11 +2206,11 @@ export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u
         worker_id,
         rid,
         role_path.?,
-        w.task_description,
-        w.branch_name,
+        wf.task_description,
+        wf.branch_name,
         e.project_root,
-        w.worktree_path,
-        w.name,
+        wf.worktree_path,
+        wf.name,
         &e.ownership_registry,
         cb,
         userdata,
@@ -2217,6 +2281,18 @@ fn fillCWorkerInfo(alloc: std.mem.Allocator, w: *const worktree.Worker) !CWorker
     return .{ .id = w.id, .name = name.ptr, .task_description = task.ptr, .branch_name = branch.ptr,
         .worktree_path = wt_path.ptr, .status = @intFromEnum(w.status), .agent_type = @intFromEnum(w.agent_type),
         .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = w.spawned_at };
+}
+
+fn fillCWorkerInfoFromFields(alloc: std.mem.Allocator, wf: worktree.WorkerFields) !CWorkerInfo {
+    const name = try alloc.dupeZ(u8, wf.name); errdefer alloc.free(name);
+    const task = try alloc.dupeZ(u8, wf.task_description); errdefer alloc.free(task);
+    const branch = try alloc.dupeZ(u8, wf.branch_name); errdefer alloc.free(branch);
+    const wt_path = try alloc.dupeZ(u8, wf.worktree_path); errdefer alloc.free(wt_path);
+    const binary = try alloc.dupeZ(u8, wf.agent_binary); errdefer alloc.free(binary);
+    const model_z = try alloc.dupeZ(u8, wf.model);
+    return .{ .id = wf.id, .name = name.ptr, .task_description = task.ptr, .branch_name = branch.ptr,
+        .worktree_path = wt_path.ptr, .status = @intFromEnum(wf.status), .agent_type = @intFromEnum(wf.agent_type),
+        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = wf.spawned_at };
 }
 
 fn freeCWorkerInfo(info: CWorkerInfo) void {
@@ -3182,8 +3258,8 @@ test "tm_worker_dismiss releases ownership" {
     try std.testing.expect(tm_ownership_check(engine_ptr, worker_id, check_path.ptr, &allowed) == 0);
     try std.testing.expect(allowed == true);
 
-    // Verify rules are gone via getRules
-    try std.testing.expect(e.ownership_registry.getRules(worker_id) == null);
+    // Verify rules are gone via copyRules
+    try std.testing.expect(try e.ownership_registry.copyRules(worker_id, std.testing.allocator) == null);
 }
 
 test "tm_merge_reject releases ownership" {
@@ -3227,13 +3303,17 @@ test "tm_merge_reject releases ownership" {
     try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, pat.ptr, true) == 0);
 
     // Verify rules exist
-    try std.testing.expect(e.ownership_registry.getRules(worker_id) != null);
+    {
+        const rules_copy = try e.ownership_registry.copyRules(worker_id, std.testing.allocator) orelse return error.TestUnexpectedResult;
+        defer ownership.FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules_copy);
+        try std.testing.expect(rules_copy.len > 0);
+    }
 
     // Reject merge — should release ownership
     try std.testing.expect(tm_merge_reject(engine_ptr, worker_id) == 0);
 
     // After reject, ownership released
-    try std.testing.expect(e.ownership_registry.getRules(worker_id) == null);
+    try std.testing.expect(try e.ownership_registry.copyRules(worker_id, std.testing.allocator) == null);
 }
 
 test "tm_result_to_string maps TM_ERR_OWNERSHIP" {

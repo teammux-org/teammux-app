@@ -740,7 +740,8 @@ test "hotreload TD18 - ownership registry updated on role change" {
     try std.testing.expect(callback_fired.load(.acquire));
 
     // Verify registry reflects NEW patterns
-    const rules = registry.getRules(1) orelse return error.TestUnexpectedResult;
+    const rules = try registry.copyRules(1, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    defer ownership.FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules);
     try std.testing.expect(rules.len == 3); // 1 write + 2 deny
 
     // New write pattern works
@@ -893,7 +894,8 @@ test "hotreload TD18 - failed parse does not corrupt registry" {
     try std.testing.expect(callback_fired.load(.acquire));
 
     // Registry must be UNCHANGED — old rules preserved
-    const rules = registry.getRules(1) orelse return error.TestUnexpectedResult;
+    const rules = try registry.copyRules(1, std.testing.allocator) orelse return error.TestUnexpectedResult;
+    defer ownership.FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules);
     try std.testing.expect(rules.len == 2);
     try std.testing.expect(registry.check(1, "src/foo.ts"));
     try std.testing.expect(!registry.check(1, "infra/main.tf"));
