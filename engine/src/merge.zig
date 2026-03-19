@@ -32,9 +32,11 @@ pub const ApproveResult = enum {
 pub const GitOutput = struct {
     exit_code: u32,
     stdout: []u8,
+    stderr: ?[]u8 = null,
 
     pub fn deinit(self: GitOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
+        if (self.stderr) |s| allocator.free(s);
     }
 };
 
@@ -135,9 +137,9 @@ pub const MergeCoordinator = struct {
             try self.statuses.put(worker_id, .success);
             self.active_merge = null;
 
-            // Remove worktree and branch with failure tracking
-            const wt_removed = runGitLogged(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "merge cleanup: worktree remove");
-            const br_deleted = runGitLogged(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "merge cleanup: branch delete");
+            // Remove worktree and branch with failure tracking (capture stderr for diagnostics)
+            const wt_removed = runGitLoggedWithStderr(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "merge cleanup: worktree remove");
+            const br_deleted = runGitLoggedWithStderr(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "merge cleanup: branch delete");
 
             // Update worker status to complete (keep roster entry for C1 history display)
             if (roster.getWorker(worker_id)) |w| {
@@ -242,9 +244,9 @@ pub const MergeCoordinator = struct {
             }
         }
 
-        // Remove worktree and branch with failure tracking
-        const wt_removed = runGitLogged(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "reject cleanup: worktree remove");
-        const br_deleted = runGitLogged(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "reject cleanup: branch delete");
+        // Remove worktree and branch with failure tracking (capture stderr for diagnostics)
+        const wt_removed = runGitLoggedWithStderr(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "reject cleanup: worktree remove");
+        const br_deleted = runGitLoggedWithStderr(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "reject cleanup: branch delete");
 
         // Remove from roster (worktree directory already removed above)
         roster.dismiss(worker_id) catch |err| switch (err) {
@@ -430,14 +432,51 @@ pub fn runGitCapture(allocator: std.mem.Allocator, cwd: []const u8, args: []cons
     };
 }
 
-/// Run git command for cleanup, logging warnings on failure. Returns true if command succeeded.
-fn runGitLogged(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8, operation: []const u8) bool {
-    const result = runGitCapture(allocator, cwd, args) catch |err| {
-        std.log.warn("[teammux] {s} spawn failed: {}", .{ operation, err });
+/// Run git command and capture stderr and exit code. Stdout is discarded.
+/// Only used for cleanup commands where stderr diagnostics are needed.
+fn runGitCaptureWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8) !GitOutput {
+    var argv: std.ArrayList([]const u8) = .{};
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "git");
+    try argv.append(allocator, "-C");
+    try argv.append(allocator, cwd);
+    try argv.appendSlice(allocator, args);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+    const stderr = child.stderr.?;
+    const stderr_data = try stderr.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    errdefer allocator.free(stderr_data);
+    const term = try child.wait();
+
+    const exit_code: u32 = if (term == .Exited) term.Exited else 128;
+
+    return .{
+        .exit_code = exit_code,
+        .stdout = try allocator.dupe(u8, ""),
+        .stderr = stderr_data,
+    };
+}
+
+/// Run git command for cleanup, logging warnings with stderr on failure. Returns true if command succeeded.
+fn runGitLoggedWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8, operation: []const u8) bool {
+    const result = runGitCaptureWithStderr(allocator, cwd, args) catch |err| {
+        std.log.err("[teammux] {s} failed: {}", .{ operation, err });
         return false;
     };
     defer result.deinit(allocator);
     if (result.exit_code != 0) {
+        if (result.stderr) |stderr_raw| {
+            const stderr_msg = std.mem.trim(u8, stderr_raw, &[_]u8{ '\n', '\r', ' ' });
+            if (stderr_msg.len > 0) {
+                std.log.warn("[teammux] {s} exited with code {d}: {s}", .{ operation, result.exit_code, stderr_msg });
+                return false;
+            }
+        }
         std.log.warn("[teammux] {s} exited with code {d}", .{ operation, result.exit_code });
         return false;
     }
