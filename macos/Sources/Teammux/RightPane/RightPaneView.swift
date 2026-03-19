@@ -85,6 +85,7 @@ struct RightPaneView: View {
             }
         }
         .buttonStyle(.plain)
+        .disabled(tab == .diff)
     }
 
     // MARK: - Tab content
@@ -97,7 +98,18 @@ struct RightPaneView: View {
         case .git:
             GitView(engine: engine)
         case .diff:
-            DiffView(engine: engine, selectedWorkerId: $diffSelectedWorkerId)
+            VStack(spacing: 12) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.system(size: 32))
+                    .foregroundColor(.secondary)
+                Text("Coming soon")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+                Text("Diff view is not yet available.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .liveFeed:
             LiveFeedView(engine: engine, activeTab: $activeTab, diffSelectedWorkerId: $diffSelectedWorkerId)
         case .dispatch:
