@@ -32,20 +32,11 @@ pub const ApproveResult = enum {
 pub const GitOutput = struct {
     exit_code: u32,
     stdout: []u8,
+    stderr: ?[]u8 = null,
 
     pub fn deinit(self: GitOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
-    }
-};
-
-pub const GitOutputFull = struct {
-    exit_code: u32,
-    stdout: []u8,
-    stderr: []u8,
-
-    pub fn deinit(self: GitOutputFull, allocator: std.mem.Allocator) void {
-        allocator.free(self.stdout);
-        allocator.free(self.stderr);
+        if (self.stderr) |s| allocator.free(s);
     }
 };
 
@@ -441,22 +432,9 @@ pub fn runGitCapture(allocator: std.mem.Allocator, cwd: []const u8, args: []cons
     };
 }
 
-/// Run git command for cleanup, logging warnings on failure. Returns true if command succeeded.
-fn runGitLogged(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8, operation: []const u8) bool {
-    const result = runGitCapture(allocator, cwd, args) catch |err| {
-        std.log.warn("[teammux] {s} spawn failed: {}", .{ operation, err });
-        return false;
-    };
-    defer result.deinit(allocator);
-    if (result.exit_code != 0) {
-        std.log.warn("[teammux] {s} exited with code {d}", .{ operation, result.exit_code });
-        return false;
-    }
-    return true;
-}
-
-/// Run git command and capture stdout, stderr, and exit code.
-pub fn runGitCaptureWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8) !GitOutputFull {
+/// Run git command and capture stderr and exit code. Stdout is discarded.
+/// Only used for cleanup commands where stderr diagnostics are needed.
+fn runGitCaptureWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8) !GitOutput {
     var argv: std.ArrayList([]const u8) = .{};
     defer argv.deinit(allocator);
     try argv.append(allocator, "git");
@@ -466,13 +444,10 @@ pub fn runGitCaptureWithStderr(allocator: std.mem.Allocator, cwd: []const u8, ar
 
     var child = std.process.Child.init(argv.items, allocator);
     child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Pipe;
 
     try child.spawn();
-    const stdout = child.stdout.?;
-    const stdout_data = try stdout.readToEndAlloc(allocator, 10 * 1024 * 1024);
-    errdefer allocator.free(stdout_data);
     const stderr = child.stderr.?;
     const stderr_data = try stderr.readToEndAlloc(allocator, 10 * 1024 * 1024);
     errdefer allocator.free(stderr_data);
@@ -482,7 +457,7 @@ pub fn runGitCaptureWithStderr(allocator: std.mem.Allocator, cwd: []const u8, ar
 
     return .{
         .exit_code = exit_code,
-        .stdout = stdout_data,
+        .stdout = try allocator.dupe(u8, ""),
         .stderr = stderr_data,
     };
 }
@@ -490,17 +465,19 @@ pub fn runGitCaptureWithStderr(allocator: std.mem.Allocator, cwd: []const u8, ar
 /// Run git command for cleanup, logging warnings with stderr on failure. Returns true if command succeeded.
 fn runGitLoggedWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8, operation: []const u8) bool {
     const result = runGitCaptureWithStderr(allocator, cwd, args) catch |err| {
-        std.log.warn("[teammux] {s} spawn failed: {}", .{ operation, err });
+        std.log.err("[teammux] {s} failed: {}", .{ operation, err });
         return false;
     };
     defer result.deinit(allocator);
     if (result.exit_code != 0) {
-        const stderr_msg = std.mem.trim(u8, result.stderr, &[_]u8{ '\n', '\r', ' ' });
-        if (stderr_msg.len > 0) {
-            std.log.warn("[teammux] {s} exited with code {d}: {s}", .{ operation, result.exit_code, stderr_msg });
-        } else {
-            std.log.warn("[teammux] {s} exited with code {d}", .{ operation, result.exit_code });
+        if (result.stderr) |stderr_raw| {
+            const stderr_msg = std.mem.trim(u8, stderr_raw, &[_]u8{ '\n', '\r', ' ' });
+            if (stderr_msg.len > 0) {
+                std.log.warn("[teammux] {s} exited with code {d}: {s}", .{ operation, result.exit_code, stderr_msg });
+                return false;
+            }
         }
+        std.log.warn("[teammux] {s} exited with code {d}", .{ operation, result.exit_code });
         return false;
     }
     return true;

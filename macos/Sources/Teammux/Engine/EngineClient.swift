@@ -845,7 +845,10 @@ final class EngineClient: ObservableObject {
         }
 
         if result == TM_ERR_CLEANUP_INCOMPLETE {
-            Self.logger.warning("approveMerge: worker \(workerId) merge succeeded but worktree cleanup was incomplete. Manual cleanup may be needed.")
+            let engineMsg = lastEngineError() ?? "worktree cleanup was incomplete"
+            let warning = "Merge succeeded but \(engineMsg). Manual cleanup may be needed."
+            lastError = warning
+            Self.logger.warning("approveMerge: worker \(workerId) \(warning)")
         } else if result != TM_OK {
             let msg = lastEngineError() ?? "tm_merge_approve failed (\(result.rawValue))"
             lastError = msg
@@ -862,7 +865,7 @@ final class EngineClient: ObservableObject {
 
     /// Reject a worker's merge: abort in-progress merge, remove worktree, delete branch.
     /// The worker remains in the roster with a completed/dismissed status.
-    /// Wraps `tm_merge_reject()`. Returns `true` on `TM_OK`.
+    /// Wraps `tm_merge_reject()`. Returns `true` on success (including partial cleanup).
     func rejectMerge(workerId: UInt32) -> Bool {
         lastError = nil
         guard let engine else {
@@ -874,7 +877,10 @@ final class EngineClient: ObservableObject {
         let result = tm_merge_reject(engine, workerId)
 
         if result == TM_ERR_CLEANUP_INCOMPLETE {
-            Self.logger.warning("rejectMerge: worker \(workerId) reject succeeded but worktree cleanup was incomplete. Manual cleanup may be needed.")
+            let engineMsg = lastEngineError() ?? "worktree cleanup was incomplete"
+            let warning = "Reject succeeded but \(engineMsg). Manual cleanup may be needed."
+            lastError = warning
+            Self.logger.warning("rejectMerge: worker \(workerId) \(warning)")
         } else if result != TM_OK {
             let msg = lastEngineError() ?? "tm_merge_reject failed (\(result.rawValue))"
             lastError = msg
