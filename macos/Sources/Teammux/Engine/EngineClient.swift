@@ -808,7 +808,7 @@ final class EngineClient: ObservableObject {
         }
 
         guard let prEvent = workerPRs[workerId] else {
-            lastError = "No PR found for worker \(workerId)"
+            // No PR yet is an expected state, not an error — don't set lastError.
             Self.logger.info("getDiff: no PR for worker \(workerId)")
             return []
         }

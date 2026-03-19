@@ -2,7 +2,8 @@ import SwiftUI
 
 // MARK: - DiffView
 
-/// Right-pane tab showing the diff of a selected worker's branch vs main.
+/// Right-pane tab showing the diff of a selected worker's pull request,
+/// fetched via the GitHub PR files API.
 ///
 /// Has a worker picker dropdown at top, then renders diff files with
 /// line-by-line coloring: additions in green, deletions in red, hunk headers in blue.
@@ -142,7 +143,7 @@ struct DiffView: View {
                 .font(.headline)
                 .foregroundColor(.secondary)
 
-            Text("This worker has no diff against main yet.")
+            Text("No changed files found in this worker's pull request.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)

@@ -830,12 +830,13 @@ fn parseDiffResponse(allocator: std.mem.Allocator, json_data: []const u8) !Diff 
             };
         };
 
-        const add_i32: i32 = @intCast(additions);
-        const del_i32: i32 = @intCast(deletions);
+        const add_i32: i32 = std.math.cast(i32, additions) orelse std.math.maxInt(i32);
+        const del_i32: i32 = std.math.cast(i32, deletions) orelse std.math.maxInt(i32);
 
         const path = try allocator.dupe(u8, filename);
         errdefer allocator.free(path);
         const patch = try allocator.dupe(u8, patch_str);
+        errdefer allocator.free(patch);
 
         try files.append(allocator, .{
             .path = path,
@@ -845,8 +846,8 @@ fn parseDiffResponse(allocator: std.mem.Allocator, json_data: []const u8) !Diff 
             .patch = patch,
         });
 
-        total_add += add_i32;
-        total_del += del_i32;
+        total_add = std.math.add(i32, total_add, add_i32) catch std.math.maxInt(i32);
+        total_del = std.math.add(i32, total_del, del_i32) catch std.math.maxInt(i32);
     }
 
     return .{
@@ -1403,6 +1404,7 @@ test "github - parsePrNumberFromUrl parses valid GitHub PR URLs" {
     try std.testing.expect(parsePrNumberFromUrl("https://github.com/owner/repo/pull/42").? == 42);
     try std.testing.expect(parsePrNumberFromUrl("https://github.com/org/project/pull/1").? == 1);
     try std.testing.expect(parsePrNumberFromUrl("https://github.com/a/b/pull/999").? == 999);
+    try std.testing.expect(parsePrNumberFromUrl("https://github.com/owner/repo/pull/42/files").? == 42);
 }
 
 test "github - parsePrNumberFromUrl returns null for invalid URLs" {
