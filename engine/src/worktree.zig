@@ -28,6 +28,30 @@ pub const Worker = struct {
     spawned_at: u64,
 };
 
+/// Caller-owned copy of worker fields, safe to use after releasing the
+/// roster lock. Free with deinit().
+pub const WorkerFields = struct {
+    id: WorkerId,
+    name: []const u8,
+    task_description: []const u8,
+    branch_name: []const u8,
+    worktree_path: []const u8,
+    status: WorkerStatus,
+    agent_type: config.AgentType,
+    agent_binary: []const u8,
+    model: []const u8,
+    spawned_at: u64,
+
+    pub fn deinit(self: WorkerFields, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.task_description);
+        allocator.free(self.branch_name);
+        allocator.free(self.worktree_path);
+        allocator.free(self.agent_binary);
+        allocator.free(self.model);
+    }
+};
+
 // ─────────────────────────────────────────────────────────
 // Roster
 // ─────────────────────────────────────────────────────────
@@ -142,8 +166,53 @@ pub const Roster = struct {
         self.allocator.free(worker.model);
     }
 
+    /// Returns a raw internal pointer WITHOUT lock protection. Only safe in
+    /// single-threaded contexts (tests). Production code must use
+    /// copyWorkerFields() or hasWorker() instead.
     pub fn getWorker(self: *Roster, worker_id: WorkerId) ?*Worker {
         return self.workers.getPtr(worker_id);
+    }
+
+    /// Thread-safe: check whether a worker exists in the roster.
+    pub fn hasWorker(self: *Roster, worker_id: WorkerId) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.workers.contains(worker_id);
+    }
+
+    /// Thread-safe copy of worker fields. All string fields are owned by
+    /// the caller — free with WorkerFields.deinit(). Returns null if worker
+    /// not found, error on allocation failure.
+    pub fn copyWorkerFields(self: *Roster, worker_id: WorkerId, alloc: std.mem.Allocator) !?WorkerFields {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const w = self.workers.get(worker_id) orelse return null;
+
+        const name = try alloc.dupe(u8, w.name);
+        errdefer alloc.free(name);
+        const task_desc = try alloc.dupe(u8, w.task_description);
+        errdefer alloc.free(task_desc);
+        const branch = try alloc.dupe(u8, w.branch_name);
+        errdefer alloc.free(branch);
+        const wt_path = try alloc.dupe(u8, w.worktree_path);
+        errdefer alloc.free(wt_path);
+        const binary = try alloc.dupe(u8, w.agent_binary);
+        errdefer alloc.free(binary);
+        const model = try alloc.dupe(u8, w.model);
+
+        return .{
+            .id = w.id,
+            .name = name,
+            .task_description = task_desc,
+            .branch_name = branch,
+            .worktree_path = wt_path,
+            .status = w.status,
+            .agent_type = w.agent_type,
+            .agent_binary = binary,
+            .model = model,
+            .spawned_at = w.spawned_at,
+        };
     }
 
     pub fn count(self: *Roster) u32 {
