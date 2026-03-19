@@ -31,7 +31,7 @@ pub const RoleWatcher = struct {
     watch_fd: std.posix.fd_t,
     callback: RoleChangedCb,
     userdata: ?*anyopaque,
-    reload_count: u64,
+    reload_count: u64, // Only accessed from the single watchLoop thread — not atomic.
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
 
@@ -260,6 +260,7 @@ pub const RoleWatcher = struct {
             self.branch_name,
         ) catch |err| {
             std.log.warn("[teammux] hotreload: failed to generate CLAUDE.md for worker {d}: {}", .{ self.worker_id, err });
+            self.callback(self.worker_id, null, self.reload_count, self.userdata);
             return;
         };
         defer self.allocator.free(claude_md);

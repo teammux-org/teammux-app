@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import os
 
 // MARK: - CompletionReport
 
@@ -213,11 +214,13 @@ struct HistoryEntry: Identifiable, Equatable, Sendable {
 /// Unified status of a GitHub pull request.
 /// Used both for bus message workflow (`TM_MSG_PR_STATUS`) and for the
 /// GitHub API bridge (`tm_pr_state_t` in teammux.h).
-/// Colors: open=green, merged=purple, closed=grey.
+/// Colors: open=green, merged=purple, closed=secondary (adapts to appearance).
 enum PRStatus: String, Sendable, Codable {
     case open
     case merged
     case closed
+
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "PRStatus")
 
     /// Initialise from the C enum raw value (`tm_pr_state_t`).
     /// TM_PR_OPEN=0, TM_PR_CLOSED=1, TM_PR_MERGED=2
@@ -230,6 +233,7 @@ enum PRStatus: String, Sendable, Codable {
             #if DEBUG
             assertionFailure("Unknown tm_pr_state_t value: \(value)")
             #endif
+            Self.logger.warning("Unknown tm_pr_state_t value: \(value), defaulting to .closed")
             self = .closed
         }
     }

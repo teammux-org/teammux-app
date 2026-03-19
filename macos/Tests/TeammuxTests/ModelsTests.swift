@@ -772,6 +772,21 @@ struct PRStatusTests {
         #expect(PRStatus.merged.color == .purple)
         #expect(PRStatus.closed.color == .secondary)
     }
+
+    @Test func prStatusFromCValueUnknownDefaultsToClosed() {
+        // Unknown C values default to .closed in release builds.
+        // In DEBUG builds this triggers assertionFailure, so guard with #if.
+        #if !DEBUG
+        #expect(PRStatus(fromCValue: 3) == .closed)
+        #expect(PRStatus(fromCValue: 99) == .closed)
+        #endif
+    }
+
+    @Test func prStatusLabels() {
+        #expect(PRStatus.open.label == "Open")
+        #expect(PRStatus.merged.label == "Merged")
+        #expect(PRStatus.closed.label == "Closed")
+    }
 }
 
 // MARK: - RoleDivision Tests

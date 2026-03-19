@@ -218,12 +218,13 @@ struct ContextView: View {
         }.joined(separator: "\n")
 
         var result: AttributedString
-        if let parsed = try? AttributedString(
-            markdown: processed,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            result = parsed
-        } else {
+        do {
+            result = try AttributedString(
+                markdown: processed,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+            )
+        } catch {
+            Self.logger.warning("buildMarkdownContent: markdown parse failed, falling back to plain text: \(error)")
             result = AttributedString(processed)
         }
 
