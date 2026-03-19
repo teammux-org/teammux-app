@@ -2231,6 +2231,7 @@ export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
         if (path) |p| {
             const z = std.heap.c_allocator.dupeZ(u8, p) catch {
                 std.heap.c_allocator.free(p);
+                e.setError("tm_interceptor_path: OOM allocating Team Lead wrapper path") catch {};
                 return null;
             };
             std.heap.c_allocator.free(p);
