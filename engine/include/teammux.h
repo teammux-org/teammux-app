@@ -36,6 +36,7 @@ typedef enum {
     TM_ERR_INVALID_WORKER   = 12,
     TM_ERR_ROLE             = 13,
     TM_ERR_OWNERSHIP        = 14,
+    TM_ERR_CLEANUP_INCOMPLETE = 15,
     TM_ERR_UNKNOWN          = 99,
 } tm_result_t;
 
@@ -174,8 +175,9 @@ typedef void (*tm_command_cb)(const char* command, const char* args_json, void* 
 // -----------------------------------------------------------------
 
 // Create engine for a project. project_root must be an absolute path to a git repo.
-// On success, writes engine pointer to *out and returns TM_OK.
+// out must not be NULL. On success, writes engine pointer to *out and returns TM_OK.
 // On failure, returns an error code and *out is set to NULL.
+// If out is NULL, returns TM_ERR_UNKNOWN immediately.
 tm_result_t  tm_engine_create(const char* project_root, tm_engine_t** out);
 void         tm_engine_destroy(tm_engine_t* engine);
 tm_result_t  tm_session_start(tm_engine_t* engine);
@@ -195,7 +197,9 @@ tm_subscription_t tm_config_watch(tm_engine_t* engine, tm_config_changed_cb call
 void              tm_config_unwatch(tm_engine_t* engine, tm_subscription_t sub);
 
 // Get a config value by dot-notation key. Returns NULL if not found.
-// Returned pointer is valid until the next tm_config_reload. Caller must not free.
+// Returned pointer is valid only until the next call to tm_config_get,
+// tm_config_reload, or tm_engine_destroy. Caller must not free.
+// Copy the value immediately if it is needed beyond the next tm_config_get call.
 const char* tm_config_get(tm_engine_t* engine, const char* key);
 
 // -----------------------------------------------------------------
@@ -324,13 +328,16 @@ void              tm_github_webhooks_stop(tm_engine_t* engine, tm_subscription_t
 // -----------------------------------------------------------------
 
 // Approve merge of a worker's branch into main. strategy is "merge", "squash", or "rebase".
-// Returns TM_OK on success or conflict (check tm_merge_get_status for outcome).
+// Returns TM_OK on clean success, TM_ERR_CLEANUP_INCOMPLETE if merge succeeded but
+// worktree/branch removal failed. Check tm_merge_get_status for merge outcome.
 // Returns TM_ERR_INVALID_WORKER if worker not found, TM_ERR_WORKTREE if HEAD is not on main.
 tm_result_t tm_merge_approve(tm_engine_t* engine, uint32_t worker_id,
                               const char* strategy);
 
 // Reject a worker's merge: abort any in-progress merge, remove worktree, delete branch.
-// Worker remains in roster with status complete (dismissed).
+// Worker is dismissed from roster. Returns TM_OK on success,
+// TM_ERR_CLEANUP_INCOMPLETE if worktree/branch removal failed.
+// Returns TM_ERR_INVALID_WORKER if worker not found.
 tm_result_t tm_merge_reject(tm_engine_t* engine, uint32_t worker_id);
 
 // Get current merge status for a worker. Returns TM_MERGE_PENDING if no merge attempted.

@@ -318,10 +318,14 @@ var last_create_error: [*:0]const u8 = "no error";
 // ─── Engine lifecycle ────────────────────────────────────
 
 export fn tm_engine_create(project_root: ?[*:0]const u8, out: ?*?*Engine) c_int {
-    if (out) |p| p.* = null;
+    const p = out orelse {
+        last_create_error = "out must not be NULL";
+        return 99;
+    };
+    p.* = null;
     const root = std.mem.span(project_root orelse { last_create_error = "project_root is NULL"; return 99; });
     const engine = Engine.create(std.heap.c_allocator, root) catch { last_create_error = "engine allocation failed"; return 99; };
-    if (out) |p| p.* = engine;
+    p.* = engine;
     return 0;
 }
 export fn tm_engine_destroy(engine: ?*Engine) void { if (engine) |e| e.destroy(); }
@@ -1483,7 +1487,7 @@ fn allocCStr(alloc: std.mem.Allocator, s: []const u8) !?[*:0]const u8 {
 export fn tm_merge_approve(engine: ?*Engine, worker_id: u32, strategy: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
     const strat = std.mem.span(strategy orelse "merge");
-    _ = e.merge_coordinator.approve(&e.roster, e.project_root, worker_id, strat) catch |err| {
+    const result = e.merge_coordinator.approve(&e.roster, e.project_root, worker_id, strat) catch |err| {
         const code: c_int = switch (err) {
             error.WorkerNotFound => 12, // TM_ERR_INVALID_WORKER
             error.NotOnMain => 5, // TM_ERR_WORKTREE
@@ -1498,6 +1502,10 @@ export fn tm_merge_approve(engine: ?*Engine, worker_id: u32, strategy: ?[*:0]con
         }) catch {};
         return code;
     };
+    if (result == .cleanup_incomplete) {
+        e.setError("merge succeeded but cleanup incomplete — manual worktree/branch removal may be needed") catch {};
+        return 15; // TM_ERR_CLEANUP_INCOMPLETE
+    }
     return 0;
 }
 export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
@@ -1512,11 +1520,15 @@ export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
         };
     }
-    e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
+    const cleanup_ok = e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
         e.setError(if (err == error.WorkerNotFound) "merge reject failed: worker not found" else "merge reject failed") catch {};
         return if (err == error.WorkerNotFound) 12 else 5;
     };
     e.ownership_registry.release(worker_id);
+    if (!cleanup_ok) {
+        e.setError("merge rejected but cleanup incomplete — manual worktree/branch removal may be needed") catch {};
+        return 15; // TM_ERR_CLEANUP_INCOMPLETE
+    }
     return 0;
 }
 export fn tm_merge_get_status(engine: ?*Engine, worker_id: u32) c_int {
@@ -2188,6 +2200,7 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         8 => "TM_ERR_BUS", 9 => "TM_ERR_GITHUB", 10 => "TM_ERR_NOT_IMPLEMENTED",
         11 => "TM_ERR_TIMEOUT", 12 => "TM_ERR_INVALID_WORKER", 13 => "TM_ERR_ROLE",
         14 => "TM_ERR_OWNERSHIP",
+        15 => "TM_ERR_CLEANUP_INCOMPLETE",
         else => "TM_ERR_UNKNOWN",
     };
 }
@@ -2399,6 +2412,11 @@ test "engine create with null returns error" {
     var engine_ptr: ?*Engine = null;
     try std.testing.expect(tm_engine_create(null, &engine_ptr) == 99);
     try std.testing.expect(engine_ptr == null);
+}
+
+test "engine create with null out-param returns error" {
+    try std.testing.expect(tm_engine_create(".", null) == 99);
+    try std.testing.expectEqualStrings("out must not be NULL", std.mem.span(tm_engine_last_error(null)));
 }
 
 test "tm_worker_spawn returns TM_WORKER_INVALID on null engine" { try std.testing.expect(tm_worker_spawn(null, null, 0, null, null) == 0xFFFFFFFF); }
@@ -3220,6 +3238,10 @@ test "tm_merge_reject releases ownership" {
 
 test "tm_result_to_string maps TM_ERR_OWNERSHIP" {
     try std.testing.expectEqualStrings("TM_ERR_OWNERSHIP", std.mem.span(tm_result_to_string(14)));
+}
+
+test "tm_result_to_string maps TM_ERR_CLEANUP_INCOMPLETE" {
+    try std.testing.expectEqualStrings("TM_ERR_CLEANUP_INCOMPLETE", std.mem.span(tm_result_to_string(15)));
 }
 
 test "tm_interceptor_install null engine returns TM_ERR_UNKNOWN" {

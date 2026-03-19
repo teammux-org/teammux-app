@@ -55,10 +55,12 @@
 
 ## Audit-address sprint — New debt introduced
 
-| ID   | Module              | Issue                                                                  | Target | Breaking | Status |
-|------|---------------------|------------------------------------------------------------------------|--------|----------|--------|
-| TD29 | teammux.h           | 15 dead C exports have no deprecation annotation in the header         | v0.2   | NO       | OPEN   |
-| TD30 | teammux.h           | TM_ERR_PTY (6) is defined but no function returns it after PTY removal | v0.2   | NO       | OPEN   |
+| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
+| TD29 | teammux.h                | 15 dead C exports have no deprecation annotation in the header                     | v0.2   | NO       | OPEN   |
+| TD30 | teammux.h                | TM_ERR_PTY (6) is defined but no function returns it after PTY removal             | v0.2   | NO       | OPEN   |
+| TD31 | EngineClient.swift       | approveMerge/rejectMerge treat TM_ERR_CLEANUP_INCOMPLETE as hard failure           | v0.1.5 | NO       | OPEN   |
+| TD32 | merge.zig                | runGitLogged captures exit code but not git stderr for cleanup failure diagnostics  | v0.1.5 | NO       | OPEN   |
 
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
@@ -75,6 +77,8 @@
 - TD26: PRState (TeamMessage.swift, maps to tm_pr_state_t) and PRStatus (CoordinationTypes.swift, bus message workflow) both represent PR lifecycle state. PRState.closed is red, PRStatus.closed is grey. Unify into one type with consistent colors in v0.1.5.
 - TD27: ContextView observes hotReloadedWorkers via onChange, but Set.insert on an already-present element is a no-op — the Set doesn't mutate, so onChange doesn't fire. Rapid saves within the 3-second hot-reload window only show the first change. Fix requires engine to expose a reload counter or timestamp per worker. Refresh button works as manual workaround.
 - TD28: applyDiffHighlight compares old and new lines by positional index. An insertion near the top marks all subsequent shifted lines as changed. LCS-based diff would highlight only truly changed lines. Acceptable for a 2-second transient highlight but visually noisy on insertions/deletions.
+- TD31: EngineClient.swift approveMerge (line 895) and rejectMerge (line 922) use `guard result == TM_OK` which treats TM_ERR_CLEANUP_INCOMPLETE (15) as total failure. The merge/reject itself succeeded — only worktree/branch cleanup failed. Swift should treat code 15 as partial success (return true, log warning, let user know manual cleanup may be needed). Introduced by AA4 fix I12.
+- TD32: runGitLogged in merge.zig calls runGitCapture which sets stderr_behavior = .Ignore. Cleanup failure logs show operation name and exit code but not git's actual error message (e.g. "fatal: '/path' is not a working tree"). Adding stderr capture would improve debuggability for users told to do manual cleanup. Low priority — current logging is a major improvement over the previous silent discard.
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.
