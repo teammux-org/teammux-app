@@ -2414,7 +2414,10 @@ final class EngineClient: ObservableObject {
             }
             autonomousDispatches[completion.workerId] = dispatch
 
-            // Construct DispatchEvent locally instead of bridge reload (I16)
+            // Construct DispatchEvent locally instead of bridge reload (I16).
+            // delivered is optimistic — the coordinator may have recorded
+            // delivered=false if bus retry exhausted (I7). The Dispatch tab
+            // calls refreshDispatchHistory() on appear for reconciliation.
             let event = DispatchEvent(
                 targetWorkerId: completion.workerId,
                 instruction: instruction,
