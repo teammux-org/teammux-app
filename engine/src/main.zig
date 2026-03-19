@@ -1899,8 +1899,15 @@ export fn tm_ownership_get(engine: ?*Engine, worker_id: u32, count: ?*u32) ?[*]?
     const e = engine orelse return null;
     const alloc = e.allocator;
 
-    const rules = e.ownership_registry.getRules(worker_id) orelse return null;
-    if (rules.len == 0) return null;
+    // Thread-safe: copyRules duplicates all data under the registry lock
+    const rules = e.ownership_registry.copyRules(worker_id, alloc) catch {
+        e.setError("tm_ownership_get: allocation failed") catch {};
+        return null;
+    } orelse return null;
+    defer ownership.FileOwnershipRegistry.freeRulesCopy(alloc, rules);
+    if (rules.len == 0) {
+        return null;
+    }
 
     // Note: this is a C-ABI export returning ?[*] — errdefer does not apply.
     // All cleanup must be done manually in each catch block.
@@ -2018,8 +2025,12 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
         return 12; // TM_ERR_INVALID_WORKER
     };
 
-    // Get deny and write patterns from ownership registry
-    const rules = e.ownership_registry.getRules(worker_id);
+    // Get deny and write patterns from ownership registry (thread-safe copy)
+    const rules = e.ownership_registry.copyRules(worker_id, e.allocator) catch {
+        e.setError("tm_interceptor_install: allocation failed") catch {};
+        return 5; // TM_ERR_WORKTREE
+    };
+    defer if (rules) |r| ownership.FileOwnershipRegistry.freeRulesCopy(e.allocator, r);
 
     // Count deny vs write patterns
     var deny_count: usize = 0;
@@ -2030,10 +2041,7 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
         }
     }
 
-    // Build pattern arrays — copy pattern pointers from registry.
-    // NOTE: These are pointers into registry-owned memory. Safe because
-    // all C API calls are dispatched from the main thread; no concurrent
-    // register/release can occur during this function.
+    // Build pattern arrays from copied rules (caller-owned, safe from concurrent mutation)
     const deny_pats = e.allocator.alloc([]const u8, deny_count) catch {
         e.setError("tm_interceptor_install: allocation failed") catch {};
         return 5; // TM_ERR_WORKTREE
@@ -3182,8 +3190,8 @@ test "tm_worker_dismiss releases ownership" {
     try std.testing.expect(tm_ownership_check(engine_ptr, worker_id, check_path.ptr, &allowed) == 0);
     try std.testing.expect(allowed == true);
 
-    // Verify rules are gone via getRules
-    try std.testing.expect(e.ownership_registry.getRules(worker_id) == null);
+    // Verify rules are gone via copyRules
+    try std.testing.expect(try e.ownership_registry.copyRules(worker_id, std.testing.allocator) == null);
 }
 
 test "tm_merge_reject releases ownership" {
@@ -3227,13 +3235,17 @@ test "tm_merge_reject releases ownership" {
     try std.testing.expect(tm_ownership_register(engine_ptr, worker_id, pat.ptr, true) == 0);
 
     // Verify rules exist
-    try std.testing.expect(e.ownership_registry.getRules(worker_id) != null);
+    {
+        const rules_copy = try e.ownership_registry.copyRules(worker_id, std.testing.allocator) orelse return error.TestUnexpectedResult;
+        defer ownership.FileOwnershipRegistry.freeRulesCopy(std.testing.allocator, rules_copy);
+        try std.testing.expect(rules_copy.len > 0);
+    }
 
     // Reject merge — should release ownership
     try std.testing.expect(tm_merge_reject(engine_ptr, worker_id) == 0);
 
     // After reject, ownership released
-    try std.testing.expect(e.ownership_registry.getRules(worker_id) == null);
+    try std.testing.expect(try e.ownership_registry.copyRules(worker_id, std.testing.allocator) == null);
 }
 
 test "tm_result_to_string maps TM_ERR_OWNERSHIP" {
