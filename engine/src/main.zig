@@ -125,44 +125,62 @@ pub const Engine = struct {
     }
 
     pub fn sessionStart(self: *Engine) !void {
+        // Stage all subsystem inits in locals with errdefer rollback.
+        // Only assign to self.* after the full startup path succeeds.
+
         const config_path = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/config.toml", .{self.project_root});
         defer self.allocator.free(config_path);
         const override_path = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/config.local.toml", .{self.project_root});
         defer self.allocator.free(override_path);
-        self.cfg = config.loadWithOverrides(self.allocator, config_path, override_path) catch |err| {
+
+        var cfg = config.loadWithOverrides(self.allocator, config_path, override_path) catch |err| {
             self.setError("config load failed") catch {};
             return err;
         };
-        if (self.cfg) |cfg| {
-            if (cfg.project.github_repo) |repo| {
-                self.github_client.updateRepo(repo) catch |err| {
-                    self.setError("github client repo update failed") catch {};
-                    return err;
-                };
-            }
-        }
+        errdefer cfg.deinit(self.allocator);
+
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
-        self.message_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id, self.project_root) catch |err| {
+
+        var msg_bus = bus.MessageBus.init(self.allocator, log_dir, &self.session_id, self.project_root) catch |err| {
             self.setError("message bus init failed") catch {};
             return err;
         };
+        errdefer msg_bus.deinit();
+
         const cmd_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/commands", .{self.project_root});
         defer self.allocator.free(cmd_dir);
-        self.commands_watcher = commands.CommandWatcher.init(self.allocator, cmd_dir) catch |err| {
+
+        var cmd_watcher = commands.CommandWatcher.init(self.allocator, cmd_dir) catch |err| {
             self.setError("commands watcher init failed") catch {};
             return err;
         };
+        errdefer cmd_watcher.deinit();
+
         // Wire bus routing for /teammux-complete and /teammux-question
-        if (self.commands_watcher) |*w| {
-            w.bus_send_fn = busSendBridge;
-            w.bus_send_userdata = self;
-        }
-        // Initialize history logger for completion/question persistence (TD16)
-        self.history_logger = history_mod.HistoryLogger.init(self.allocator, self.project_root) catch |err| {
+        cmd_watcher.bus_send_fn = busSendBridge;
+        cmd_watcher.bus_send_userdata = self;
+
+        var hist_logger = history_mod.HistoryLogger.init(self.allocator, self.project_root) catch |err| {
             self.setError("history logger init failed") catch {};
             return err;
         };
+        errdefer hist_logger.deinit();
+
+        // Update github client repo from loaded config (before commit so errdefers still active)
+        if (cfg.project.github_repo) |repo| {
+            self.github_client.updateRepo(repo) catch |err| {
+                self.setError("github client repo update failed") catch {};
+                return err;
+            };
+        }
+
+        // All subsystems initialized — commit to self (no more errors possible)
+        self.cfg = cfg;
+        self.message_bus = msg_bus;
+        self.commands_watcher = cmd_watcher;
+        self.history_logger = hist_logger;
+
         // Wire bus routing for PR status events from GitHub polling
         self.github_client.bus_send_fn = busSendBridge;
         self.github_client.bus_send_userdata = self;
