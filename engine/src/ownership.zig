@@ -110,15 +110,6 @@ pub const FileOwnershipRegistry = struct {
         return false;
     }
 
-    /// Get rules for a worker (internal, no copy — caller must hold mutex or
-    /// ensure single-threaded access). Use copyRules() for thread-safe access.
-    fn getRules(self: *FileOwnershipRegistry, worker_id: WorkerId) ?[]const PathRule {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        return self.rules.get(worker_id);
-    }
-
     /// Thread-safe copy of rules for a worker. Returns null if no rules
     /// registered. Returned slice and all pattern strings are owned by the
     /// caller — free with freeRulesCopy().

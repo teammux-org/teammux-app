@@ -166,9 +166,10 @@ pub const Roster = struct {
         self.allocator.free(worker.model);
     }
 
-    /// Returns a raw internal pointer WITHOUT lock protection. Only safe in
-    /// single-threaded contexts (tests). Production code must use
-    /// copyWorkerFields() or hasWorker() instead.
+    /// Returns a raw internal pointer WITHOUT lock protection. Prefer
+    /// copyWorkerFields() or hasWorker() for thread-safe access.
+    /// NOTE: merge.zig and coordinator.zig still use this in production
+    /// paths — migration deferred to a follow-up stream.
     pub fn getWorker(self: *Roster, worker_id: WorkerId) ?*Worker {
         return self.workers.getPtr(worker_id);
     }
@@ -200,6 +201,7 @@ pub const Roster = struct {
         const binary = try alloc.dupe(u8, w.agent_binary);
         errdefer alloc.free(binary);
         const model = try alloc.dupe(u8, w.model);
+        errdefer alloc.free(model);
 
         return .{
             .id = w.id,

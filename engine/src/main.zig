@@ -201,7 +201,10 @@ pub const Engine = struct {
                     break :blk "";
                 };
                 const git_commit = if (msg_enum == .completion) blk: {
-                    const wf = self.roster.copyWorkerFields(from, self.allocator) catch break :blk null;
+                    const wf = self.roster.copyWorkerFields(from, self.allocator) catch |err| {
+                        std.log.warn("[teammux] history: git commit capture skipped for worker {d}: {}", .{ from, err });
+                        break :blk null;
+                    };
                     if (wf) |fields| {
                         defer fields.deinit(self.allocator);
                         break :blk history_mod.captureGitCommit(self.allocator, fields.worktree_path);
@@ -233,6 +236,8 @@ pub const Engine = struct {
         self.github_client.stopWebhooks();
     }
 
+    /// Set the last error message. Acquires last_error_mutex internally.
+    /// NEVER call from code that already holds last_error_mutex (non-recursive).
     fn setError(self: *Engine, msg: []const u8) !void {
         self.last_error_mutex.lock();
         defer self.last_error_mutex.unlock();
@@ -416,7 +421,10 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
         kv.value.destroy();
     }
     // Remove interceptor wrapper before worktree is deleted
-    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch null) |wf| {
+    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
+        std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
+        break :blk null;
+    }) |wf| {
         defer wf.deinit(e.allocator);
         interceptor.remove(e.allocator, wf.worktree_path) catch |err| {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
@@ -500,7 +508,10 @@ export fn tm_roster_free(roster: ?*CRoster) void {
 }
 export fn tm_worker_get(engine: ?*Engine, worker_id: u32) ?*CWorkerInfo {
     const e = engine orelse return null;
-    const wf = (e.roster.copyWorkerFields(worker_id, e.allocator) catch return null) orelse return null;
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("tm_worker_get: allocation failed") catch {};
+        return null;
+    } orelse return null;
     defer wf.deinit(e.allocator);
     const info = e.allocator.create(CWorkerInfo) catch return null;
     info.* = fillCWorkerInfoFromFields(e.allocator, wf) catch { e.allocator.destroy(info); return null; };
@@ -1275,7 +1286,10 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
     // The command-file path (busSendBridge) has its own history write.
     if (e.history_logger) |*logger| {
         const git_commit = blk: {
-            const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch break :blk null;
+            const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| {
+                std.log.warn("[teammux] history: git commit capture skipped for worker {d}: {}", .{ worker_id, err });
+                break :blk null;
+            };
             if (wf) |fields| {
                 defer fields.deinit(e.allocator);
                 break :blk history_mod.captureGitCommit(e.allocator, fields.worktree_path);
@@ -1537,7 +1551,10 @@ export fn tm_merge_reject(engine: ?*Engine, worker_id: u32) c_int {
         kv.value.destroy();
     }
     // Remove interceptor wrapper before worktree is deleted
-    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch null) |wf| {
+    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
+        std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
+        break :blk null;
+    }) |wf| {
         defer wf.deinit(e.allocator);
         interceptor.remove(e.allocator, wf.worktree_path) catch |err| {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
@@ -2125,7 +2142,10 @@ export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
 
 export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     const e = engine orelse return null;
-    const wf = (e.roster.copyWorkerFields(worker_id, e.allocator) catch return null) orelse return null;
+    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+        e.setError("tm_interceptor_path: allocation failed") catch {};
+        return null;
+    } orelse return null;
     defer wf.deinit(e.allocator);
     const path = interceptor.getInterceptorPath(std.heap.c_allocator, wf.worktree_path) catch {
         e.setError("tm_interceptor_path: filesystem error checking interceptor directory") catch {};
