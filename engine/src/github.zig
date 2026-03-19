@@ -63,6 +63,7 @@ pub const GitHubClient = struct {
     last_event_id: ?[]const u8,
     bus_send_fn: ?BusSendFn,
     bus_send_userdata: ?*anyopaque,
+    repo_mutex: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, repo: ?[]const u8) !GitHubClient {
         return .{
@@ -78,6 +79,7 @@ pub const GitHubClient = struct {
             .last_event_id = null,
             .bus_send_fn = null,
             .bus_send_userdata = null,
+            .repo_mutex = .{},
         };
     }
 
@@ -270,10 +272,24 @@ pub const GitHubClient = struct {
 
     /// Fetch recent events from GitHub Events API (repos/{owner}/{repo}/events).
     fn pollEvents(self: *GitHubClient) void {
-        const repo = self.repo orelse return;
         const allocator = self.allocator;
 
-        const endpoint = std.fmt.allocPrint(allocator, "repos/{s}/events", .{repo}) catch return;
+        // Hold repo_mutex just long enough to copy the repo string locally,
+        // so a concurrent updateRepo() cannot free it mid-read.
+        const repo_copy = blk: {
+            self.repo_mutex.lock();
+            defer self.repo_mutex.unlock();
+            break :blk allocator.dupe(u8, self.repo orelse return) catch {
+                std.log.warn("[teammux] pollEvents: repo string copy failed (OOM)", .{});
+                return;
+            };
+        };
+        defer allocator.free(repo_copy);
+
+        const endpoint = std.fmt.allocPrint(allocator, "repos/{s}/events", .{repo_copy}) catch {
+            std.log.warn("[teammux] pollEvents: endpoint format failed (OOM)", .{});
+            return;
+        };
         defer allocator.free(endpoint);
 
         const result = runGhCommand(allocator, &.{ "api", endpoint }) catch |err| {
@@ -471,16 +487,16 @@ pub const GitHubClient = struct {
         }
     }
 
-    // TODO(AA2): self.repo is read by the polling thread
-    // without synchronization. updateRepo must be called
-    // only when polling is stopped, or self.repo must be
-    // protected by a mutex. Fix belongs in AA2 concurrency
-    // pass alongside I2/I3.
-    /// Replace the repo string: dupe new value first (preserves old on OOM), then free old and swap.
+    /// Replace the repo string: dupe new value first (preserves old on OOM),
+    /// then swap under lock, then free old outside the lock.
+    /// repo_mutex serializes the swap with the repo read in pollEvents().
     pub fn updateRepo(self: *GitHubClient, new_repo: ?[]const u8) !void {
         const new = if (new_repo) |r| try self.allocator.dupe(u8, r) else null;
-        if (self.repo) |old| self.allocator.free(old);
+        self.repo_mutex.lock();
+        const old = self.repo;
         self.repo = new;
+        self.repo_mutex.unlock();
+        if (old) |o| self.allocator.free(o);
     }
 
     pub const NoRepo = error{NoRepo};
