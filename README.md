@@ -11,8 +11,6 @@ Most multi-agent setups rely on prompts and good behavior to prevent agents from
 - **Team Lead constraints** — Worker 0 is the Team Lead. It has a deny-all interceptor installed at session start — it reviews and merges, but never writes code directly.
 - **Coordination engine** — A Zig engine (libteammux.a) manages the full lifecycle: spawn, dispatch, messaging, completion signaling, PR creation, merge, and dismiss — all through a C API that Swift calls exclusively via a single EngineClient.
 
-<!-- TODO: Add screenshot or architecture diagram -->
-
 ## Requirements
 
 - macOS 15 Sequoia
@@ -26,8 +24,8 @@ Most multi-agent setups rely on prompts and good behavior to prevent agents from
 
 ```bash
 # Clone the repository
-git clone https://github.com/AkramHarazworktree/teammux.git
-cd teammux
+git clone https://github.com/teammux-org/teammux-app.git
+cd teammux-app
 
 # Build everything (engine + Swift + Ghostty)
 ./build.sh
@@ -59,7 +57,7 @@ cd engine && zig build test
 
 ## Project Structure
 
-```
+```text
 engine/src/          — Zig coordination engine
 engine/include/      — C API header (teammux.h)
 macos/Sources/Teammux/   — Swift application layer

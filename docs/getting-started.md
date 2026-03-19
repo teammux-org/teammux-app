@@ -23,8 +23,8 @@ git --version      # should show 2.40+
 ## 2. Clone and Build
 
 ```bash
-git clone https://github.com/AkramHarazworktree/teammux.git
-cd teammux
+git clone https://github.com/teammux-org/teammux-app.git
+cd teammux-app
 ./build.sh
 ```
 
@@ -123,9 +123,8 @@ The worker appears in the roster with status "idle".
 
 ## 7. The Team Lead Interface
 
-Worker 0 is the **Team Lead**. It is created automatically and has special constraints:
+Worker 0 is the **Team Lead** — a structural role that represents you, the operator. It is not spawned as an agent. Instead, the engine installs a deny-all interceptor at session start to enforce that the Team Lead reviews and merges but never writes code directly. It has these capabilities:
 
-- A **deny-all interceptor** is installed at session start — the Team Lead cannot write files
 - It can **dispatch tasks** to workers via the Dispatch tab
 - It can **respond to worker questions** that arrive via the message bus
 - It **reviews PRs** in the Git tab and approves or rejects merges

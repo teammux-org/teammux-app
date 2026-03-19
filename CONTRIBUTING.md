@@ -16,8 +16,8 @@ Thank you for your interest in contributing to Teammux. This guide covers develo
 
 ```bash
 # Clone the repository
-git clone https://github.com/AkramHarazworktree/teammux.git
-cd teammux
+git clone https://github.com/teammux-org/teammux-app.git
+cd teammux-app
 
 # Full build (engine + Swift app + Ghostty fork)
 ./build.sh
@@ -42,11 +42,12 @@ engine/src/              — Zig coordination engine source
 engine/include/          — C API header (teammux.h, source of truth)
 macos/Sources/Teammux/   — Swift application layer
   Engine/                — EngineClient.swift (sole tm_* call site)
+  GitHub/                — GitHubClient
   Models/                — CoordinationTypes, TeamMessage
   RightPane/             — Git, Diff, LiveFeed, Dispatch, Context tabs
+  Session/               — SessionState
+  Setup/                 — SetupView, TeamBuilderView, ProjectPickerView
   Workspace/             — RosterView, WorkerDetailDrawer, WorkerRow
-  Setup/                 — SetupView, SessionState
-  App/                   — AppDelegate
 src/                     — Ghostty upstream (DO NOT MODIFY)
 docs/                    — Documentation
   sprints/               — Per-sprint master specs and stream task files

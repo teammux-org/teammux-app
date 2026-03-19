@@ -4,7 +4,7 @@ Technical overview of the Teammux system design, data flow, and key decisions.
 
 ## System Diagram
 
-```
+```text
 ┌─────────────────────────────────────────────────────┐
 │                   Teammux.app                       │
 │                                                     │
@@ -40,7 +40,7 @@ Technical overview of the Teammux system design, data flow, and key decisions.
 │  │  hotreload.zig ─── role file watcher           │   │
 │  │  history.zig ─── JSONL persistence             │   │
 │  │  config.zig ─── TOML config loader             │   │
-│  │  pty.zig ─── PTY type definitions              │   │
+│  │  pty.zig ─── PTY types (Ghostty owns PTY fds)   │   │
 │  └──────────────────────────────────────────────┘   │
 │                                                     │
 │  ┌──────────────────────────────────────────────┐   │
@@ -55,7 +55,7 @@ Technical overview of the Teammux system design, data flow, and key decisions.
 
 Each worker operates in its own git worktree. This is the foundation of Teammux's isolation model.
 
-```
+```text
 project-root/
 ├── .git/                          ← shared git database
 ├── .teammux/
@@ -103,14 +103,14 @@ Rules come from the worker's role definition (TOML file) and are registered at s
 
 The interceptor is a shell script installed in each worker's worktree at `.git-wrapper/git`. It:
 
-1. Intercepts `git add`, `git commit -a`, `git stash`, `git apply`, and `git push`
+1. Intercepts `git add`, `git commit -a`, `git stash pop/apply`, `git apply`, and `git push` (to main/master)
 2. Checks each staged file against the ownership registry
 3. Blocks denied files with exit code 126 (POSIX "command cannot execute")
 4. Passes through allowed operations to the real `git` binary
 
 The interceptor directory is prepended to PATH when launching the worker's PTY, so the wrapper is found before the system `git`.
 
-Push-to-main is blocked for all workers — only the merge coordinator can merge to main.
+Push-to-main is blocked for workers that have deny patterns registered (which includes all workers spawned with role-based restrictions). Workers with no deny patterns receive a pass-through wrapper. The Team Lead's deny-all interceptor also blocks push.
 
 ## Team Lead Structural Constraints
 
@@ -127,7 +127,7 @@ These constraints are enforced by the engine, not by prompt instructions. An age
 
 The message bus (bus.zig) connects all components:
 
-```
+```text
 Worker PTY ──→ Command File ──→ commands.zig ──→ bus.zig ──→ Subscribers
                                                     │
 Agent writes    Engine detects   Parses command,    Routes to     Swift UI
@@ -169,7 +169,7 @@ Session state is persisted in two forms:
 
 ### Why a C API boundary?
 
-The engine is written in Zig for performance and manual memory control. The Swift UI layer is a standard SwiftUI application. The C API (`teammux.h`) provides a clean, stable boundary between the two. All 60+ engine functions are exported with C linkage, documented with lifetime semantics, and callable from Swift via a single `EngineClient.swift` file. This makes the engine independently testable (356+ tests) without the Swift layer.
+The engine is written in Zig for performance and manual memory control. The Swift UI layer is a standard SwiftUI application. The C API (`teammux.h`) provides a clean, stable boundary between the two. All engine functions are exported with C linkage, documented with lifetime semantics, and callable from Swift via a single `EngineClient.swift` file. This makes the engine independently testable with a comprehensive test suite without the Swift layer.
 
 ### Why git worktrees instead of containers?
 
