@@ -375,8 +375,15 @@ export fn tm_config_reload(engine: ?*Engine) c_int {
     defer e.allocator.free(p1);
     const p2 = std.fmt.allocPrint(e.allocator, "{s}/.teammux/config.local.toml", .{e.project_root}) catch return 7;
     defer e.allocator.free(p2);
+    // Load into local first — on failure, old config remains intact
+    const new_cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
+    // New config loaded successfully — swap
     if (e.cfg) |*old| old.deinit(e.allocator);
-    e.cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
+    e.cfg = new_cfg;
+    // Update GitHubClient repo if config has one
+    if (new_cfg.project.github_repo) |repo| {
+        e.github_client.updateRepo(repo) catch { e.setError("config reload: github repo update failed") catch {}; };
+    }
     return 0;
 }
 export fn tm_config_watch(engine: ?*Engine, callback: ?*const fn (?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
