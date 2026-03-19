@@ -48,7 +48,7 @@
 | TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | OPEN   |
 | TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown              | v0.1.5 | NO       | OPEN   |
 | TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.2   | NO       | OPEN   |
-| TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | v0.2   | NO       | OPEN   |
+| TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | AA3    | NO       | RESOLVED |
 | TD26 | TeamMessage / CoordTypes | PRState and PRStatus model same concept with divergent colors    | v0.1.5 | NO       | OPEN   |
 | TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange      | v0.1.5 | NO       | OPEN   |
 | TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff   | v0.1.5 | NO       | OPEN   |
