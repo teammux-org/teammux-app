@@ -427,17 +427,42 @@ export fn tm_config_get(engine: ?*Engine, key: ?[*:0]const u8) ?[*:0]const u8 {
 
 export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_type: c_int, worker_name: ?[*:0]const u8, task_description: ?[*:0]const u8) u32 {
     const e = engine orelse return 0xFFFFFFFF;
+    const ab = std.mem.span(agent_binary orelse return 0xFFFFFFFF);
+    const at: config.AgentType = @enumFromInt(agent_type);
+    const wn = std.mem.span(worker_name orelse return 0xFFFFFFFF);
     const td = std.mem.span(task_description orelse return 0xFFFFFFFF);
 
-    const id = e.roster.spawn(e.project_root, std.mem.span(agent_binary orelse return 0xFFFFFFFF), @enumFromInt(agent_type), std.mem.span(worker_name orelse return 0xFFFFFFFF), td) catch |err| {
-        e.setError(switch (err) { error.GitFailed => "git worktree add failed", else => "worker spawn failed" }) catch {};
+    // 1. Claim next worker ID from roster
+    const id = e.roster.claimNextId();
+
+    // 2. Create worktree via lifecycle (single worktree subsystem)
+    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, id, td) catch |err| {
+        e.setError(switch (err) {
+            error.GitFailed => "git worktree add failed",
+            error.NoHomeDir => "HOME not set, cannot resolve worktree root",
+            error.MkdirFailed => "failed to create worktree directory",
+            else => "worktree create failed",
+        }) catch {};
         return 0xFFFFFFFF;
     };
 
-    // Create lifecycle worktree AFTER roster spawn using actual ID — graceful degradation on failure
-    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, id, td) catch |err| {
-        std.log.warn("[teammux] worktree lifecycle create failed for worker {d}: {s}", .{ id, @errorName(err) });
-        e.setError("worker spawned but worktree lifecycle create failed") catch {};
+    // 3. Get path/branch from lifecycle registry
+    const entry = e.wt_registry.get(id) orelse {
+        e.setError("worktree created but not found in registry") catch {};
+        return 0xFFFFFFFF;
+    };
+
+    // 4. Register worker in roster with lifecycle-owned path/branch
+    e.roster.spawn(id, ab, at, wn, td, entry.path, entry.branch) catch |err| {
+        e.setError(switch (err) { else => "worker roster registration failed" }) catch {};
+        worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        return 0xFFFFFFFF;
+    };
+
+    // 5. Write context file into worktree
+    worktree.writeContextFile(e.allocator, entry.path, at, td, null, entry.branch) catch |err| {
+        std.log.warn("[teammux] context file write failed for worker {d}: {s}", .{ id, @errorName(err) });
+        e.setError("worker spawned but context file write failed") catch {};
     };
 
     return id;
@@ -458,7 +483,7 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
         };
     }
-    e.roster.dismiss(e.project_root, worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
+    e.roster.dismiss(worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
     e.ownership_registry.release(worker_id);
     // Remove lifecycle worktree AFTER roster dismiss
     worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);

@@ -71,51 +71,34 @@ pub const Roster = struct {
         };
     }
 
+    /// Claim the next available worker ID. The returned ID is reserved
+    /// and will not be reused. Caller must subsequently call spawn()
+    /// to fully create the worker entry, or accept the consumed slot.
+    pub fn claimNextId(self: *Roster) WorkerId {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
+
+    /// Register a worker with a pre-claimed ID and externally-created
+    /// worktree metadata. All string arguments are duped; the roster
+    /// owns the copies. Does NOT create git worktrees or context files —
+    /// the caller (tm_worker_spawn) handles that via worktree_lifecycle.
     pub fn spawn(
         self: *Roster,
-        project_root: []const u8,
+        id: WorkerId,
         agent_binary: []const u8,
         agent_type: config.AgentType,
         worker_name: []const u8,
         task_description: []const u8,
-    ) !WorkerId {
+        worktree_path: []const u8,
+        branch_name: []const u8,
+    ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const id = self.next_id;
-        self.next_id += 1;
-
-        // 1. Generate branch name
-        const branch = try makeBranchName(self.allocator, worker_name, task_description);
-        errdefer self.allocator.free(branch);
-
-        // 2. Build worktree path
-        const name_slug = try slugify(self.allocator, worker_name, 40);
-        defer self.allocator.free(name_slug);
-        const wt_path = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/worker-{s}", .{ project_root, name_slug });
-        errdefer self.allocator.free(wt_path);
-
-        // 3. Ensure .teammux directory exists
-        const teammux_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux", .{project_root});
-        defer self.allocator.free(teammux_dir);
-        std.fs.makeDirAbsolute(teammux_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-
-        // 4. Run: git worktree add {wt_path} -b {branch}
-        try runGit(self.allocator, project_root, &.{ "worktree", "add", wt_path, "-b", branch });
-
-        // 5. Write CLAUDE.md or AGENTS.md into worktree root
-        errdefer {
-            // Rollback: remove worktree if context file write fails
-            runGit(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }) catch |err| {
-                std.log.warn("[teammux] rollback worktree remove failed for {s}: {}", .{ wt_path, err });
-            };
-        }
-        try writeContextFile(self.allocator, wt_path, agent_type, task_description, null, branch);
-
-        // 6. Register worker in roster
         const owned_name = try self.allocator.dupe(u8, worker_name);
         errdefer self.allocator.free(owned_name);
         const owned_task = try self.allocator.dupe(u8, task_description);
@@ -124,38 +107,34 @@ pub const Roster = struct {
         errdefer self.allocator.free(owned_binary);
         const owned_model = try self.allocator.dupe(u8, ""); // model set later via config
         errdefer self.allocator.free(owned_model);
+        const owned_path = try self.allocator.dupe(u8, worktree_path);
+        errdefer self.allocator.free(owned_path);
+        const owned_branch = try self.allocator.dupe(u8, branch_name);
+        errdefer self.allocator.free(owned_branch);
 
         try self.workers.put(id, .{
             .id = id,
             .name = owned_name,
             .task_description = owned_task,
-            .branch_name = branch,
-            .worktree_path = wt_path,
+            .branch_name = owned_branch,
+            .worktree_path = owned_path,
             .status = .idle,
             .agent_type = agent_type,
             .agent_binary = owned_binary,
             .model = owned_model,
             .spawned_at = @intCast(std.time.timestamp()),
         });
-
-        return id;
     }
 
-    pub fn dismiss(self: *Roster, project_root: []const u8, worker_id: WorkerId) !void {
+    /// Remove a worker from the roster and free owned memory.
+    /// Does NOT remove git worktrees — the caller handles cleanup
+    /// via worktree_lifecycle.removeWorker().
+    pub fn dismiss(self: *Roster, worker_id: WorkerId) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const kv = self.workers.fetchRemove(worker_id) orelse return error.WorkerNotFound;
         const worker = kv.value;
-
-        // Remove worktree (force in case of uncommitted changes)
-        // Log but do not block on removal failure — the worker is still deregistered.
-        // A failed removal means the directory stays on disk; the next spawn with the
-        // same branch will fail with GitFailed, surfacing the root cause.
-        runGit(self.allocator, project_root, &.{ "worktree", "remove", "--force", worker.worktree_path }) catch |err| {
-            std.log.warn("[teammux] worktree remove failed for {s}: {}", .{ worker.worktree_path, err });
-        };
-        // Branch is KEPT permanently — never auto-delete
 
         // Free owned memory
         self.allocator.free(worker.name);
@@ -555,89 +534,52 @@ test "worktree - context file is AGENTS.md for codex_cli agent" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("CLAUDE.md", .{}));
 }
 
-test "worktree - spawn creates directory (integration)" {
-    // Set up a temp git repo
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(project_root);
-
-    // git init + initial commit (required for worktree add)
-    try runGit(std.testing.allocator, project_root, &.{ "init", "-b", "main" });
-    try runGit(std.testing.allocator, project_root, &.{ "config", "user.email", "test@test.com" });
-    try runGit(std.testing.allocator, project_root, &.{ "config", "user.name", "Test" });
-
-    // Create an initial commit (git worktree add requires at least one commit)
-    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{project_root});
-    defer std.testing.allocator.free(readme_path);
-    const readme = try std.fs.createFileAbsolute(readme_path, .{});
-    try readme.writeAll("# Test");
-    readme.close();
-    try runGit(std.testing.allocator, project_root, &.{ "add", "." });
-    try runGit(std.testing.allocator, project_root, &.{ "commit", "-m", "initial" });
-
-    // Spawn a worker
+test "worktree - claimNextId assigns sequential IDs" {
     var roster = Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(
-        project_root,
-        "/usr/bin/echo", // dummy agent binary
-        .claude_code,
-        "Frontend",
-        "implement auth",
-    );
+    try std.testing.expect(roster.claimNextId() == 1);
+    try std.testing.expect(roster.claimNextId() == 2);
+    try std.testing.expect(roster.claimNextId() == 3);
+}
+
+test "worktree - spawn registers metadata without git operations" {
+    var roster = Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = roster.claimNextId();
+    try roster.spawn(id, "/usr/bin/echo", .claude_code, "Frontend", "implement auth", "/tmp/wt/1", "teammux/1-implement-auth");
 
     try std.testing.expect(id == 1);
     try std.testing.expect(roster.count() == 1);
 
-    // Verify worktree directory was created
     const worker = roster.getWorker(id).?;
-    var wt_dir = try std.fs.openDirAbsolute(worker.worktree_path, .{});
-    defer wt_dir.close();
-
-    // Verify CLAUDE.md was written
-    const ctx_file = try wt_dir.openFile("CLAUDE.md", .{});
-    ctx_file.close();
-
-    // Verify branch was created
-    try std.testing.expect(std.mem.startsWith(u8, worker.branch_name, "frontend/teammux-"));
+    try std.testing.expectEqualStrings("Frontend", worker.name);
+    try std.testing.expectEqualStrings("implement auth", worker.task_description);
+    try std.testing.expectEqualStrings("/tmp/wt/1", worker.worktree_path);
+    try std.testing.expectEqualStrings("teammux/1-implement-auth", worker.branch_name);
+    try std.testing.expectEqualStrings("/usr/bin/echo", worker.agent_binary);
+    try std.testing.expect(worker.agent_type == .claude_code);
+    try std.testing.expect(worker.status == .idle);
 }
 
-test "worktree - dismiss removes directory keeps branch (integration)" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(project_root);
-
-    // Set up git repo
-    try runGit(std.testing.allocator, project_root, &.{ "init", "-b", "main" });
-    try runGit(std.testing.allocator, project_root, &.{ "config", "user.email", "test@test.com" });
-    try runGit(std.testing.allocator, project_root, &.{ "config", "user.name", "Test" });
-    const readme_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{project_root});
-    defer std.testing.allocator.free(readme_path);
-    const readme = try std.fs.createFileAbsolute(readme_path, .{});
-    try readme.writeAll("# Test");
-    readme.close();
-    try runGit(std.testing.allocator, project_root, &.{ "add", "." });
-    try runGit(std.testing.allocator, project_root, &.{ "commit", "-m", "initial" });
-
-    // Spawn and dismiss
+test "worktree - dismiss removes worker from roster without git ops" {
     var roster = Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(project_root, "/usr/bin/echo", .claude_code, "Backend", "fix login bug");
-    const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
-    defer std.testing.allocator.free(wt_path);
+    const id = roster.claimNextId();
+    try roster.spawn(id, "/usr/bin/echo", .claude_code, "Backend", "fix login bug", "/tmp/wt/1", "teammux/1-fix-login-bug");
+    try roster.dismiss(id);
 
-    try roster.dismiss(project_root, id);
-
-    // Worktree directory should be removed
-    try std.testing.expectError(error.FileNotFound, std.fs.openDirAbsolute(wt_path, .{}));
-
-    // Worker should be removed from roster
     try std.testing.expect(roster.getWorker(id) == null);
     try std.testing.expect(roster.count() == 0);
+}
+
+test "worktree - dismiss non-existent worker returns error" {
+    var roster = Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    try std.testing.expectError(error.WorkerNotFound, roster.dismiss(999));
 }
 
 test "worktree - generateRoleClaude contains all role sections" {
