@@ -418,6 +418,7 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
 
 // ─── Worktree lifecycle ──────────────────────────────────
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_worktree_create(engine: ?*Engine, worker_id: u32, task_description: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
     const td = std.mem.span(task_description orelse {
@@ -439,6 +440,7 @@ export fn tm_worktree_create(engine: ?*Engine, worker_id: u32, task_description:
     return 0;
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_worktree_remove(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
     worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
@@ -1081,6 +1083,7 @@ fn freeCDispatchEvent(ptr: ?*CDispatchEvent) void {
 
 // ─── Peer messaging — worker-to-worker ───────────────────
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_peer_question(engine: ?*Engine, from_id: u32, target_id: u32, message: ?[*:0]const u8) c_int {
     const e = engine orelse return 99; // TM_ERR_UNKNOWN
     const msg = std.mem.span(message orelse {
@@ -1133,6 +1136,7 @@ export fn tm_peer_question(engine: ?*Engine, from_id: u32, target_id: u32, messa
     return 0; // TM_OK
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_peer_delegate(engine: ?*Engine, from_id: u32, target_id: u32, task: ?[*:0]const u8) c_int {
     const e = engine orelse return 99; // TM_ERR_UNKNOWN
     const tsk = std.mem.span(task orelse {
@@ -1204,6 +1208,7 @@ const CQuestion = extern struct {
     timestamp: u64,
 };
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 /// Signal worker completion. Creates TM_MSG_COMPLETION message, routes through
 /// bus to Team Lead (worker 0), and persists to JSONL history log (TD16).
 export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]const u8, details: ?[*:0]const u8) c_int {
@@ -1268,6 +1273,7 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
     return 0;
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 /// Signal worker question. Creates TM_MSG_QUESTION message, routes through
 /// bus to Team Lead (worker 0), and persists to JSONL history log (TD16).
 export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]const u8, ctx: ?[*:0]const u8) c_int {
@@ -1326,6 +1332,7 @@ export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]c
     return 0;
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 /// Free a heap-allocated tm_completion_t.
 export fn tm_completion_free(completion: ?*CCompletion) void {
     if (completion) |c| {
@@ -1336,6 +1343,7 @@ export fn tm_completion_free(completion: ?*CCompletion) void {
     }
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 /// Free a heap-allocated tm_question_t.
 export fn tm_question_free(question: ?*CQuestion) void {
     if (question) |q| {
@@ -1441,6 +1449,7 @@ export fn tm_history_free(entries: ?[*]?*CHistoryEntry, count: u32) void {
     std.heap.c_allocator.free(ptrs[0..count]);
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 /// Clear all history entries (truncates the JSONL file).
 export fn tm_history_clear(engine: ?*Engine) c_int {
     const e = engine orelse return 99;
@@ -1872,6 +1881,7 @@ export fn tm_ownership_release(engine: ?*Engine, worker_id: u32) c_int {
     return 0;
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_ownership_get(engine: ?*Engine, worker_id: u32, count: ?*u32) ?[*]?*COwnershipEntry {
     if (count) |c| c.* = 0;
     const e = engine orelse return null;
@@ -1915,6 +1925,7 @@ export fn tm_ownership_get(engine: ?*Engine, worker_id: u32, count: ?*u32) ?[*]?
     return ptrs.ptr;
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_ownership_free(entries: ?[*]?*COwnershipEntry, count: u32) void {
     const ptrs = entries orelse return;
     for (0..count) |i| freeCOwnershipEntry(ptrs[i]);
@@ -1927,6 +1938,7 @@ fn freeCOwnershipEntry(ptr: ?*COwnershipEntry) void {
     std.heap.c_allocator.destroy(entry);
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_ownership_update(
     engine: ?*Engine,
     worker_id: u32,
@@ -2046,6 +2058,7 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
     return 0;
 }
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
     const w = e.roster.getWorker(worker_id) orelse {
@@ -2158,6 +2171,7 @@ export fn tm_role_unwatch(engine: ?*Engine, worker_id: u32) c_int {
 
 // ─── Utility ─────────────────────────────────────────────
 
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
     const name = std.mem.span(agent_name orelse return null);
     const result = github.resolveAgentBinary(std.heap.c_allocator, name) catch return null;
@@ -2166,6 +2180,7 @@ export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
 }
 export fn tm_free_string(str: ?[*:0]const u8) void { if (str) |s| { std.heap.c_allocator.free(std.mem.span(s)); } }
 export fn tm_version() [*:0]const u8 { return "0.1.0"; }
+// NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_result_to_string(result: c_int) [*:0]const u8 {
     return switch (result) {
         0 => "TM_OK", 1 => "TM_ERR_NOT_GIT", 2 => "TM_ERR_NO_GH", 3 => "TM_ERR_GH_UNAUTH",

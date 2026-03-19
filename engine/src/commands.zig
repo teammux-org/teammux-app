@@ -232,7 +232,7 @@ const ParsedCommand = struct {
 
 /// Parse a command JSON file: {"command": "/teammux-add", "args": {...}}
 /// Extracts command string and args as JSON string.
-pub fn parseCommandJson(allocator: std.mem.Allocator, content: []const u8) !ParsedCommand {
+fn parseCommandJson(allocator: std.mem.Allocator, content: []const u8) !ParsedCommand {
     // Find "command" field
     const cmd_value = extractJsonString(content, "command") orelse return error.InvalidJson;
     const command = try allocator.dupeZ(u8, cmd_value);
