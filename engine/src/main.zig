@@ -318,10 +318,14 @@ var last_create_error: [*:0]const u8 = "no error";
 // ─── Engine lifecycle ────────────────────────────────────
 
 export fn tm_engine_create(project_root: ?[*:0]const u8, out: ?*?*Engine) c_int {
-    if (out) |p| p.* = null;
+    const p = out orelse {
+        last_create_error = "out must not be NULL";
+        return 99;
+    };
+    p.* = null;
     const root = std.mem.span(project_root orelse { last_create_error = "project_root is NULL"; return 99; });
     const engine = Engine.create(std.heap.c_allocator, root) catch { last_create_error = "engine allocation failed"; return 99; };
-    if (out) |p| p.* = engine;
+    p.* = engine;
     return 0;
 }
 export fn tm_engine_destroy(engine: ?*Engine) void { if (engine) |e| e.destroy(); }
@@ -2399,6 +2403,11 @@ test "engine create with null returns error" {
     var engine_ptr: ?*Engine = null;
     try std.testing.expect(tm_engine_create(null, &engine_ptr) == 99);
     try std.testing.expect(engine_ptr == null);
+}
+
+test "engine create with null out-param returns error" {
+    try std.testing.expect(tm_engine_create(".", null) == 99);
+    try std.testing.expectEqualStrings("out must not be NULL", std.mem.span(tm_engine_last_error(null)));
 }
 
 test "tm_worker_spawn returns TM_WORKER_INVALID on null engine" { try std.testing.expect(tm_worker_spawn(null, null, 0, null, null) == 0xFFFFFFFF); }
