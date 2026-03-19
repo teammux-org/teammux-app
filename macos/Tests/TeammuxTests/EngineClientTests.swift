@@ -30,16 +30,6 @@ struct EngineClientTests {
         #expect(client.messages.isEmpty)
     }
 
-    @Test func gitHubDisconnectedOnCreate() {
-        let client = EngineClient()
-        #expect(client.githubStatus == .disconnected)
-    }
-
-    @Test func worktreeReadyQueueEmptyOnCreate() {
-        let client = EngineClient()
-        #expect(client.worktreeReadyQueue.isEmpty)
-    }
-
     @Test func lastErrorNilOnCreate() {
         let client = EngineClient()
         #expect(client.lastError == nil)
@@ -85,7 +75,6 @@ struct EngineClientTests {
         let client = EngineClient()
         let result = client.connectGitHub()
         #expect(result == false)
-        #expect(client.githubStatus == .disconnected)
         #expect(client.lastError == "Engine not created")
     }
 
@@ -123,7 +112,6 @@ struct EngineClientTests {
                 seq: 1
             )
         ]
-        client.githubStatus = .connected("test/repo")
         client.lastError = "some error"
         client.mergeStatuses[1] = .conflict
         client.pendingConflicts[1] = [
@@ -135,10 +123,8 @@ struct EngineClientTests {
 
         #expect(client.roster.isEmpty)
         #expect(client.messages.isEmpty)
-        #expect(client.worktreeReadyQueue.isEmpty)
         #expect(client.mergeStatuses.isEmpty)
         #expect(client.pendingConflicts.isEmpty)
-        #expect(client.githubStatus == .disconnected)
         #expect(client.lastError == nil)
         #expect(client.projectRoot == nil)
     }
@@ -272,16 +258,6 @@ struct EngineClientTests {
         client.destroy()
 
         #expect(client.surfaceView(for: 1) == nil)
-    }
-
-    // MARK: - WorktreeReady
-
-    @Test func worktreeReadyStruct() {
-        let ready = WorktreeReady(id: 1, worktreePath: "/tmp/wt", agentBinary: "claude", taskDescription: "test task")
-        #expect(ready.id == 1)
-        #expect(ready.worktreePath == "/tmp/wt")
-        #expect(ready.agentBinary == "claude")
-        #expect(ready.taskDescription == "test task")
     }
 
     // MARK: - Merge initial state

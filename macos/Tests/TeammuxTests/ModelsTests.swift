@@ -163,8 +163,6 @@ struct MessageTypeTests {
         #expect(MessageType.task.color == .blue)
         #expect(MessageType.instruction.color == .purple)
         #expect(MessageType.context.color == .secondary)
-        #expect(MessageType.statusReq.color == .orange)
-        #expect(MessageType.statusRpt.color == .green)
         #expect(MessageType.completion.color == .green)
         #expect(MessageType.error.color == .red)
         #expect(MessageType.broadcast.color == .yellow)
@@ -174,8 +172,6 @@ struct MessageTypeTests {
         #expect(MessageType.task.label == "Task")
         #expect(MessageType.instruction.label == "Instruction")
         #expect(MessageType.context.label == "Context")
-        #expect(MessageType.statusReq.label == "Status Request")
-        #expect(MessageType.statusRpt.label == "Status Report")
         #expect(MessageType.completion.label == "Completion")
         #expect(MessageType.error.label == "Error")
         #expect(MessageType.broadcast.label == "Broadcast")
@@ -185,8 +181,6 @@ struct MessageTypeTests {
         #expect(MessageType(fromCValue: 0) == .task)
         #expect(MessageType(fromCValue: 1) == .instruction)
         #expect(MessageType(fromCValue: 2) == .context)
-        #expect(MessageType(fromCValue: 3) == .statusReq)
-        #expect(MessageType(fromCValue: 4) == .statusRpt)
         #expect(MessageType(fromCValue: 5) == .completion)
         #expect(MessageType(fromCValue: 6) == .error)
         #expect(MessageType(fromCValue: 7) == .broadcast)
@@ -194,7 +188,10 @@ struct MessageTypeTests {
 
     @Test func messageTypeFromCValueUnknown() {
         // Unknown values should fall back to .task
-        #expect(MessageType(fromCValue: 8) == .task)
+        // Values 3 and 4 (statusReq/statusRpt) were removed — verify they fall through
+        #expect(MessageType(fromCValue: 3) == .task)
+        #expect(MessageType(fromCValue: 4) == .task)
+        #expect(MessageType(fromCValue: 9) == .task)
         #expect(MessageType(fromCValue: -1) == .task)
         #expect(MessageType(fromCValue: 100) == .task)
         #expect(MessageType(fromCValue: Int32.max) == .task)

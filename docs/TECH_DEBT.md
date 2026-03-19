@@ -53,6 +53,13 @@
 | TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange      | v0.1.5 | NO       | OPEN   |
 | TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff   | v0.1.5 | NO       | OPEN   |
 
+## Audit-address sprint — New debt introduced
+
+| ID   | Module              | Issue                                                                  | Target | Breaking | Status |
+|------|---------------------|------------------------------------------------------------------------|--------|----------|--------|
+| TD29 | teammux.h           | 15 dead C exports have no deprecation annotation in the header         | v0.2   | NO       | OPEN   |
+| TD30 | teammux.h           | TM_ERR_PTY (6) is defined but no function returns it after PTY removal | v0.2   | NO       | OPEN   |
+
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
 - TD16: CompletionReport and QuestionRequest cards ephemeral across sessions. T5 adds history.zig JSONL persistence, T10 adds Swift bridge loading on sessionStart with collapsible history section in LiveFeedView.
@@ -71,3 +78,5 @@
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.
+- TD29: AA6 marked 15 exports in main.zig with "NO SWIFT CALLER — candidate for removal in v0.2" but the authoritative header (teammux.h) still declares them without any deprecation annotation. Add matching comments in the header so consumers of the C API are aware. Exports: tm_worktree_create, tm_worktree_remove, tm_peer_question, tm_peer_delegate, tm_worker_complete, tm_worker_question, tm_completion_free, tm_question_free, tm_history_clear, tm_ownership_get, tm_ownership_free, tm_ownership_update, tm_interceptor_remove, tm_agent_resolve, tm_result_to_string.
+- TD30: AA6 removed tm_pty_send and tm_pty_fd (I18). TM_ERR_PTY=6 remains in tm_result_t and tm_result_to_string but is no longer returned by any function. Remove or mark as reserved in v0.2.

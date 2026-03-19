@@ -34,14 +34,6 @@ enum MergeStrategy: Int, Sendable {
 /// `spawnWorker` creates a worktree + branch, Swift creates a
 /// `Ghostty.SurfaceView` to launch the agent. Text injection goes
 /// via registered injector closures (backed by `SurfaceView.sendText()`).
-/// A worker whose worktree is ready but whose SurfaceView has not yet been created.
-struct WorktreeReady: Identifiable, Equatable, Sendable {
-    let id: UInt32  // worker ID, also serves as Identifiable.id
-    let worktreePath: String
-    let agentBinary: String
-    let taskDescription: String
-}
-
 @MainActor
 final class EngineClient: ObservableObject {
 
@@ -53,13 +45,8 @@ final class EngineClient: ObservableObject {
 
     @Published var roster: [WorkerInfo] = []
     @Published var messages: [TeamMessage] = []
-    @Published var githubStatus: GitHubStatus = .disconnected
     @Published var lastError: String? = nil
     @Published var projectRoot: String? = nil
-
-    /// Workers whose worktree is ready but whose SurfaceView has not
-    /// yet been created. `WorkerPaneView` observes this to spawn terminals.
-    @Published var worktreeReadyQueue: [WorktreeReady] = []
 
     /// Current merge status per worker ID. Updated by polling after `approveMerge`.
     @Published var mergeStatuses: [UInt32: MergeStatus] = [:]
@@ -294,7 +281,6 @@ final class EngineClient: ObservableObject {
         textInjectors.removeAll()
         roster.removeAll()
         messages.removeAll()
-        worktreeReadyQueue.removeAll()
         stopMergePolling()
         mergeStatuses.removeAll()
         pendingConflicts.removeAll()
@@ -313,7 +299,6 @@ final class EngineClient: ObservableObject {
         completionHistory.removeAll()
         workerPRs.removeAll()
         autonomousDispatches.removeAll()
-        githubStatus = .disconnected
         lastError = nil
     }
 
@@ -383,24 +368,6 @@ final class EngineClient: ObservableObject {
             return 0  // Return 0 to callers as "failed"
         }
 
-        // Query the fresh worker info to get the worktree path
-        if let infoPtr = tm_worker_get(engine, workerId) {
-            let path = String(cString: infoPtr.pointee.worktree_path)
-            let binary = String(cString: infoPtr.pointee.agent_binary)
-            let task = String(cString: infoPtr.pointee.task_description)
-            tm_worker_info_free(infoPtr)
-
-            worktreeReadyQueue.append(WorktreeReady(
-                id: workerId,
-                worktreePath: path,
-                agentBinary: binary,
-                taskDescription: task
-            ))
-        } else {
-            lastError = "Worker \(workerId) spawned but tm_worker_get returned nil"
-            Self.logger.error("Worker \(workerId) spawned but tm_worker_get returned nil")
-        }
-
         // Cache worktree path and branch for downstream consumers
         // (session persistence, context viewer, worker detail drawer).
         // The engine creates the worktree internally during tm_worker_spawn.
@@ -458,7 +425,6 @@ final class EngineClient: ObservableObject {
                 workerRoles.removeValue(forKey: workerId)
                 workerWorktrees.removeValue(forKey: workerId)
                 workerBranches.removeValue(forKey: workerId)
-                worktreeReadyQueue.removeAll { $0.id == workerId }
                 refreshRoster()
                 return 0
             }
@@ -558,17 +524,6 @@ final class EngineClient: ObservableObject {
             // tm_worktree_path query — use saved paths directly).
             workerWorktrees[workerId] = worker.worktreePath
             workerBranches[workerId] = worker.branchName
-
-            // Fix the worktreeReadyQueue entry to use the saved path
-            // (spawnWorker may have queued with a different/new path).
-            if let idx = worktreeReadyQueue.firstIndex(where: { $0.id == workerId }) {
-                worktreeReadyQueue[idx] = WorktreeReady(
-                    id: workerId,
-                    worktreePath: worker.worktreePath,
-                    agentBinary: worker.agentBinary,
-                    taskDescription: worker.taskDescription
-                )
-            }
         }
 
         // Merge snapshot dispatch events into dispatchHistory.
@@ -739,18 +694,15 @@ final class EngineClient: ObservableObject {
             let msg = lastEngineError() ?? "tm_github_auth failed (\(result.rawValue))"
             lastError = msg
             Self.logger.error("connectGitHub failed: \(msg)")
-            githubStatus = .error(msg)
             return false
         }
 
         if tm_github_is_authed(engine) {
-            githubStatus = .connected("engine")
             return true
         } else {
             let msg = "GitHub auth succeeded but is_authed returned false"
             lastError = msg
             Self.logger.error("\(msg)")
-            githubStatus = .error(msg)
             return false
         }
     }
@@ -1661,16 +1613,7 @@ final class EngineClient: ObservableObject {
     private func handleGitHubEvent(_ eventType: String, payload: String) {
         switch eventType {
         case "pull_request":
-            // Refresh auth status in case a PR event indicates changes
-            guard let engine else {
-                Self.logger.warning("handleGitHubEvent: engine is nil during pull_request event")
-                return
-            }
-            if tm_github_is_authed(engine) {
-                githubStatus = .connected("engine")
-            } else {
-                githubStatus = .disconnected
-            }
+            Self.logger.debug("Received pull_request event")
         default:
             Self.logger.debug("Unhandled GitHub event type: \(eventType)")
         }

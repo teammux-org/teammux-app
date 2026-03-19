@@ -57,8 +57,7 @@ typedef enum {
     TM_MSG_TASK        = 0,
     TM_MSG_INSTRUCTION = 1,
     TM_MSG_CONTEXT     = 2,
-    TM_MSG_STATUS_REQ  = 3,
-    TM_MSG_STATUS_RPT  = 4,
+    // 3 and 4 were status_req/status_rpt — removed (no sender or handler)
     TM_MSG_COMPLETION  = 5,
     TM_MSG_ERROR       = 6,
     TM_MSG_BROADCAST   = 7,
@@ -257,15 +256,8 @@ void              tm_worker_info_free(tm_worker_info_t* info);
 tm_subscription_t tm_roster_watch(tm_engine_t* engine, tm_roster_changed_cb callback, void* userdata);
 void              tm_roster_unwatch(tm_engine_t* engine, tm_subscription_t sub);
 
-// -----------------------------------------------------------------
-// PTY interaction
-// -----------------------------------------------------------------
-
-tm_result_t tm_pty_send(tm_engine_t* engine, tm_worker_id_t worker_id, const char* text);
-
-// Get the PTY file descriptor for a worker (used by Ghostty SurfaceView).
-// Returns -1 on failure or if worker not found.
-int         tm_pty_fd(tm_engine_t* engine, tm_worker_id_t worker_id);
+// PTY ownership belongs to Ghostty.
+// Teammux does not directly manage PTY file descriptors.
 
 // -----------------------------------------------------------------
 // Message bus
