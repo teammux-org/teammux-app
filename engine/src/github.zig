@@ -275,19 +275,21 @@ pub const GitHubClient = struct {
         const allocator = self.allocator;
 
         // Hold repo_mutex just long enough to copy the repo string locally,
-        // so updateRepo() on the main thread cannot free it mid-read.
-        self.repo_mutex.lock();
-        const repo_copy = if (self.repo) |r| allocator.dupe(u8, r) catch {
-            self.repo_mutex.unlock();
-            return;
-        } else {
-            self.repo_mutex.unlock();
-            return;
+        // so a concurrent updateRepo() cannot free it mid-read.
+        const repo_copy = blk: {
+            self.repo_mutex.lock();
+            defer self.repo_mutex.unlock();
+            break :blk allocator.dupe(u8, self.repo orelse return) catch {
+                std.log.warn("[teammux] pollEvents: repo string copy failed (OOM)", .{});
+                return;
+            };
         };
-        self.repo_mutex.unlock();
         defer allocator.free(repo_copy);
 
-        const endpoint = std.fmt.allocPrint(allocator, "repos/{s}/events", .{repo_copy}) catch return;
+        const endpoint = std.fmt.allocPrint(allocator, "repos/{s}/events", .{repo_copy}) catch {
+            std.log.warn("[teammux] pollEvents: endpoint format failed (OOM)", .{});
+            return;
+        };
         defer allocator.free(endpoint);
 
         const result = runGhCommand(allocator, &.{ "api", endpoint }) catch |err| {
@@ -485,8 +487,9 @@ pub const GitHubClient = struct {
         }
     }
 
-    /// Replace the repo string: dupe new value first (preserves old on OOM), then free old and swap.
-    /// repo_mutex ensures this is atomic with respect to pollEvents() on the polling thread.
+    /// Replace the repo string: dupe new value first (preserves old on OOM),
+    /// then swap under lock, then free old outside the lock.
+    /// repo_mutex serializes the swap with the repo read in pollEvents().
     pub fn updateRepo(self: *GitHubClient, new_repo: ?[]const u8) !void {
         const new = if (new_repo) |r| try self.allocator.dupe(u8, r) else null;
         self.repo_mutex.lock();
