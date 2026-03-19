@@ -185,6 +185,15 @@ pub const Engine = struct {
         // Wire bus routing for PR status events from GitHub polling
         self.github_client.bus_send_fn = busSendBridge;
         self.github_client.bus_send_userdata = self;
+
+        // Install Team Lead deny-all interceptor before any PTY surfaces are created.
+        // Worker 0 is structurally prevented from writing code (C4).
+        // This is a hard failure — session must not start without enforcement.
+        const tl_result = tm_interceptor_install(self, 0);
+        if (tl_result != 0) {
+            self.setError("Team Lead interceptor install failed — session cannot start without git write enforcement") catch {};
+            return error.InterceptorInstallFailed;
+        }
     }
 
     /// Bridge function for MessageBus routing from both CommandWatcher and GitHubClient.
@@ -253,6 +262,10 @@ pub const Engine = struct {
         if (self.commands_watcher) |*w| w.stop();
         if (self.config_watcher) |*w| w.stop();
         self.github_client.stopWebhooks();
+        // Clean up Team Lead interceptor from project root
+        interceptor.remove(self.allocator, self.project_root) catch |err| {
+            std.log.warn("[teammux] Team Lead interceptor cleanup failed: {}", .{err});
+        };
     }
 
     /// Set the last error message. Acquires last_error_mutex internally.
@@ -427,17 +440,49 @@ export fn tm_config_get(engine: ?*Engine, key: ?[*:0]const u8) ?[*:0]const u8 {
 
 export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_type: c_int, worker_name: ?[*:0]const u8, task_description: ?[*:0]const u8) u32 {
     const e = engine orelse return 0xFFFFFFFF;
+    const ab = std.mem.span(agent_binary orelse return 0xFFFFFFFF);
+    const at: config.AgentType = std.meta.intToEnum(config.AgentType, agent_type) catch {
+        e.setError("tm_worker_spawn: invalid agent_type") catch {};
+        return 0xFFFFFFFF;
+    };
+    const wn = std.mem.span(worker_name orelse return 0xFFFFFFFF);
     const td = std.mem.span(task_description orelse return 0xFFFFFFFF);
 
-    const id = e.roster.spawn(e.project_root, std.mem.span(agent_binary orelse return 0xFFFFFFFF), @enumFromInt(agent_type), std.mem.span(worker_name orelse return 0xFFFFFFFF), td) catch |err| {
-        e.setError(switch (err) { error.GitFailed => "git worktree add failed", else => "worker spawn failed" }) catch {};
+    // 1. Claim next worker ID from roster
+    const id = e.roster.claimNextId();
+
+    // 2. Create worktree via lifecycle (single worktree subsystem)
+    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, id, td) catch |err| {
+        e.setError(switch (err) {
+            error.GitFailed => "git worktree add failed",
+            error.NoHomeDir => "HOME not set, cannot resolve worktree root",
+            error.MkdirFailed => "failed to create worktree directory",
+            else => "worktree create failed",
+        }) catch {};
         return 0xFFFFFFFF;
     };
 
-    // Create lifecycle worktree AFTER roster spawn using actual ID — graceful degradation on failure
-    worktree_lifecycle.create(&e.wt_registry, e.cfgPtr(), e.project_root, id, td) catch |err| {
-        std.log.warn("[teammux] worktree lifecycle create failed for worker {d}: {s}", .{ id, @errorName(err) });
-        e.setError("worker spawned but worktree lifecycle create failed") catch {};
+    // 3. Get path/branch from lifecycle registry
+    const entry = e.wt_registry.get(id) orelse {
+        e.setError("worktree created but not found in registry — internal error") catch {};
+        worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        return 0xFFFFFFFF;
+    };
+
+    // 4. Register worker in roster with lifecycle-owned path/branch
+    e.roster.spawn(id, ab, at, wn, td, entry.path, entry.branch) catch |err| {
+        e.setError(switch (err) { else => "worker roster registration failed" }) catch {};
+        worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        return 0xFFFFFFFF;
+    };
+
+    // 5. Write context file into worktree — hard failure rolls back spawn
+    worktree.writeContextFile(e.allocator, entry.path, at, td, null, entry.branch) catch |err| {
+        std.log.err("[teammux] context file write failed for worker {d}: {s} — rolling back spawn", .{ id, @errorName(err) });
+        e.setError("worker spawn failed: could not write context file") catch {};
+        e.roster.dismiss(id) catch {};
+        worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        return 0xFFFFFFFF;
     };
 
     return id;
@@ -458,7 +503,7 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
         };
     }
-    e.roster.dismiss(e.project_root, worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
+    e.roster.dismiss(worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
     e.ownership_registry.release(worker_id);
     // Remove lifecycle worktree AFTER roster dismiss
     worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
@@ -698,7 +743,10 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
     });
 
     if (std.mem.eql(u8, cmd, "/teammux-assign")) {
-        handleAssignCommand(engine, args_ptr);
+        // C4: Block /teammux-assign entirely via command files — worker_id is
+        // spoofable in untrusted JSON. Task assignment must use tm_dispatch_task
+        // through the authenticated Swift UI path.
+        std.log.warn("[teammux] /teammux-assign: command-file dispatch disabled — use tm_dispatch_task from the Teammux UI", .{});
         return;
     }
     if (std.mem.eql(u8, cmd, "/teammux-ask")) {
@@ -716,42 +764,6 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
 
     // Forward unhandled commands to Swift callback
     if (engine.cmd_cb) |cb| cb(command_ptr, args_ptr, engine.cmd_cb_userdata);
-}
-
-fn handleAssignCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
-    const args = std.mem.span(args_ptr orelse {
-        std.log.warn("[teammux] /teammux-assign: args is NULL (expected JSON body)", .{});
-        return;
-    });
-
-    // Parse target_worker_id (integer or string) from JSON
-    const id_str = extractJsonStringValue(args, "target_worker_id") orelse
-        extractJsonNumber(args, "target_worker_id");
-    if (id_str == null) {
-        std.log.warn("[teammux] /teammux-assign: missing target_worker_id", .{});
-        return;
-    }
-    const worker_id = std.fmt.parseInt(u32, id_str.?, 10) catch {
-        std.log.warn("[teammux] /teammux-assign: invalid target_worker_id", .{});
-        return;
-    };
-
-    const instruction = extractJsonStringValue(args, "instruction") orelse {
-        std.log.warn("[teammux] /teammux-assign: missing instruction", .{});
-        return;
-    };
-
-    const b = &(engine.message_bus orelse {
-        std.log.warn("[teammux] /teammux-assign: message bus not available", .{});
-        return;
-    });
-    engine.coordinator.dispatchTask(&engine.roster, b, worker_id, instruction) catch |err| {
-        if (err == error.WorkerNotFound) {
-            std.log.warn("[teammux] /teammux-assign: worker {d} not found in roster", .{worker_id});
-        } else {
-            std.log.warn("[teammux] /teammux-assign: dispatch to worker {d} failed: {s}", .{ worker_id, @errorName(err) });
-        }
-    };
 }
 
 fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
@@ -1944,6 +1956,13 @@ export fn tm_ownership_check(engine: ?*Engine, worker_id: u32, file_path: ?[*:0]
 
 export fn tm_ownership_register(engine: ?*Engine, worker_id: u32, path_pattern: ?[*:0]const u8, allow_write: bool) c_int {
     const e = engine orelse return 99;
+
+    // Team Lead (worker 0) cannot receive write grants
+    if (worker_id == 0 and allow_write) {
+        e.setError("tm_ownership_register: write grants not allowed for Team Lead (worker 0)") catch {};
+        return 14; // TM_ERR_OWNERSHIP
+    }
+
     const pattern = std.mem.span(path_pattern orelse {
         e.setError("tm_ownership_register: path_pattern must not be NULL") catch {};
         return 14;
@@ -2036,6 +2055,12 @@ export fn tm_ownership_update(
 ) c_int {
     const e = engine orelse return 99;
 
+    // Team Lead (worker 0) cannot receive write grants
+    if (worker_id == 0 and write_count > 0) {
+        e.setError("tm_ownership_update: write grants not allowed for Team Lead (worker 0)") catch {};
+        return 14; // TM_ERR_OWNERSHIP
+    }
+
     // Convert C string arrays to Zig slices
     const write_slices = e.allocator.alloc([]const u8, write_count) catch {
         e.setError("tm_ownership_update: allocation failed") catch {};
@@ -2088,6 +2113,22 @@ export fn tm_ownership_update(
 
 export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+
+    // Team Lead (worker 0): deny-all interceptor in project root.
+    // Worker 0 is never in the roster, so handle before roster lookup.
+    if (worker_id == 0) {
+        const deny_all = [_][]const u8{"*"};
+        const empty = [_][]const u8{};
+        interceptor.install(e.allocator, e.project_root, 0, "Team Lead", &deny_all, &empty) catch |err| {
+            e.setError(switch (err) {
+                error.GitNotFound => "tm_interceptor_install: git binary not found on PATH",
+                else => "tm_interceptor_install: failed to install Team Lead wrapper",
+            }) catch {};
+            return 5; // TM_ERR_WORKTREE
+        };
+        return 0;
+    }
+
     const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
         e.setError("tm_interceptor_install: allocation failed") catch {};
         return 5; // TM_ERR_WORKTREE
@@ -2153,6 +2194,16 @@ export fn tm_interceptor_install(engine: ?*Engine, worker_id: u32) c_int {
 // NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+
+    // Team Lead (worker 0): interceptor lives in project root
+    if (worker_id == 0) {
+        interceptor.remove(e.allocator, e.project_root) catch {
+            e.setError("tm_interceptor_remove: failed to remove Team Lead wrapper") catch {};
+            return 5; // TM_ERR_WORKTREE
+        };
+        return 0;
+    }
+
     const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
         e.setError("tm_interceptor_remove: allocation failed") catch {};
         return 5; // TM_ERR_WORKTREE
@@ -2170,6 +2221,24 @@ export fn tm_interceptor_remove(engine: ?*Engine, worker_id: u32) c_int {
 
 export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
     const e = engine orelse return null;
+
+    // Team Lead (worker 0): interceptor lives in project root
+    if (worker_id == 0) {
+        const path = interceptor.getInterceptorPath(std.heap.c_allocator, e.project_root) catch {
+            e.setError("tm_interceptor_path: filesystem error checking Team Lead interceptor") catch {};
+            return null;
+        };
+        if (path) |p| {
+            const z = std.heap.c_allocator.dupeZ(u8, p) catch {
+                std.heap.c_allocator.free(p);
+                return null;
+            };
+            std.heap.c_allocator.free(p);
+            return z.ptr;
+        }
+        return null;
+    }
+
     const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
         e.setError("tm_interceptor_path: allocation failed") catch {};
         return null;
@@ -4174,7 +4243,7 @@ test "tm_dispatch_history_free handles null" {
     tm_dispatch_history_free(null, 0);
 }
 
-test "command routing wrapper routes /teammux-assign to coordinator" {
+test "command routing wrapper blocks /teammux-assign via command file (C4)" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -4192,7 +4261,9 @@ test "command routing wrapper routes /teammux-assign to coordinator" {
     // Add a worker to the roster
     try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
 
-    const args_json = "{\"target_worker_id\": 5, \"instruction\": \"refactor auth\"}";
+    // Even with a valid non-zero worker_id, /teammux-assign is blocked
+    // entirely via command files — task assignment must use tm_dispatch_task
+    const args_json = "{\"worker_id\": 1, \"target_worker_id\": 5, \"instruction\": \"refactor auth\"}";
     const args_z = try alloc.dupeZ(u8, args_json);
     defer alloc.free(args_z);
     const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
@@ -4200,10 +4271,9 @@ test "command routing wrapper routes /teammux-assign to coordinator" {
 
     commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
+    // No dispatch should have been recorded — command-file assign is disabled
     const history = e.coordinator.getHistory();
-    try std.testing.expect(history.len == 1);
-    try std.testing.expectEqualStrings("refactor auth", history[0].instruction);
-    try std.testing.expect(history[0].target_worker_id == 5);
+    try std.testing.expect(history.len == 0);
 }
 
 test "command routing wrapper forwards unknown commands to Swift callback" {
@@ -5755,6 +5825,107 @@ test "T16 integration 8: config.toml worktree_root override respected" {
     try std.testing.expect(std.mem.indexOf(u8, wt_path_str, "custom-worktrees") != null);
 
     try std.testing.expect(tm_worktree_remove(engine_ptr, 9) == 0);
+}
+
+// ─── C4: Team Lead enforcement tests ─────────────────────
+
+test "C4 - tm_interceptor_install worker 0 creates deny-all wrapper" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    // Install Team Lead interceptor (worker 0)
+    try std.testing.expect(tm_interceptor_install(e, 0) == 0);
+
+    // Verify wrapper exists in project root
+    const wrapper_path = try std.fmt.allocPrint(alloc, "{s}/.git-wrapper/git", .{root});
+    defer alloc.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(alloc, 64 * 1024);
+    defer alloc.free(content);
+
+    // Must contain deny-all pattern '*'
+    try std.testing.expect(std.mem.indexOf(u8, content, "'*'") != null);
+    // Must identify as Team Lead
+    try std.testing.expect(std.mem.indexOf(u8, content, "Team Lead") != null);
+    // Must have no write scope
+    try std.testing.expect(std.mem.indexOf(u8, content, "(none defined)") != null);
+
+    // Cleanup
+    try std.testing.expect(tm_interceptor_remove(e, 0) == 0);
+}
+
+test "C4 - tm_interceptor_path worker 0 returns project root wrapper" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    // Before install, path should be null
+    try std.testing.expect(tm_interceptor_path(e, 0) == null);
+
+    // Install and check path
+    try std.testing.expect(tm_interceptor_install(e, 0) == 0);
+    const path = tm_interceptor_path(e, 0);
+    try std.testing.expect(path != null);
+    const path_str = std.mem.span(path.?);
+    try std.testing.expect(std.mem.endsWith(u8, path_str, "/.git-wrapper"));
+    std.heap.c_allocator.free(path_str);
+
+    // Cleanup
+    try std.testing.expect(tm_interceptor_remove(e, 0) == 0);
+}
+
+test "C4 - tm_ownership_register rejects write grants for worker 0" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    // Write grant for worker 0 must fail
+    const pattern = "src/**";
+    const pat_z = try alloc.dupeZ(u8, pattern);
+    defer alloc.free(pat_z);
+    try std.testing.expect(tm_ownership_register(e, 0, pat_z.ptr, true) == 14);
+
+    // Deny pattern for worker 0 should succeed
+    try std.testing.expect(tm_ownership_register(e, 0, pat_z.ptr, false) == 0);
+}
+
+test "C4 - tm_ownership_update rejects write grants for worker 0" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const e = try Engine.create(alloc, root);
+    defer e.destroy();
+
+    const pat = try alloc.dupeZ(u8, "src/**");
+    defer alloc.free(pat);
+    var write_pats = [_]?[*:0]const u8{pat.ptr};
+    var deny_pats = [_]?[*:0]const u8{pat.ptr};
+
+    // Write grants for worker 0 via update must fail
+    try std.testing.expect(tm_ownership_update(e, 0, &write_pats, 1, null, 0) == 14);
+
+    // Deny-only update for worker 0 should succeed
+    try std.testing.expect(tm_ownership_update(e, 0, null, 0, &deny_pats, 1) == 0);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; _ = worktree_lifecycle; _ = history_mod; }

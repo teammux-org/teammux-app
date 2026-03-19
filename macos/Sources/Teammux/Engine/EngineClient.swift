@@ -1088,6 +1088,13 @@ final class EngineClient: ObservableObject {
         return path.isEmpty ? nil : path
     }
 
+    /// Get the interceptor directory path for the Team Lead (worker 0).
+    /// Used by TeamLeadTerminalView to inject the deny-all git wrapper
+    /// into the Team Lead's PTY PATH.
+    func teamLeadInterceptorPath() -> String? {
+        return interceptorPath(for: 0)
+    }
+
     // MARK: - Private: Role helpers
 
     /// Resolve a single role by ID. Returns `nil` if the role cannot be found

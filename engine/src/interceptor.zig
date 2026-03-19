@@ -312,7 +312,7 @@ fn generateInterceptorScript(
         \\elif [[ "$subcmd" == "push" ]]; then
         \\  for arg in "$@"; do
         \\    case "$arg" in
-        \\      main|master)
+        \\      main|master|*:main|*:master|*:refs/heads/main|*:refs/heads/master)
         \\        echo "[Teammux] Cannot push directly to main."
         \\        echo "[Teammux] Use /teammux-pr-ready to signal task completion."
         \\        exit 126
@@ -722,12 +722,78 @@ test "interceptor - wrapper contains push-to-main interception block" {
 
     // Push subcmd detection
     try std.testing.expect(std.mem.indexOf(u8, content, "\"$subcmd\" == \"push\"") != null);
-    // Only literal "main" and "master" are blocked — all other branch names pass through
-    try std.testing.expect(std.mem.indexOf(u8, content, "main|master)") != null);
-    // Verify case pattern is not expanded beyond main/master
-    try std.testing.expect(std.mem.indexOf(u8, content, "main|master|") == null);
+    // Literal "main" and "master" are blocked
+    try std.testing.expect(std.mem.indexOf(u8, content, "main|master|") != null);
     // Error message
     try std.testing.expect(std.mem.indexOf(u8, content, "Cannot push directly to main") != null);
     // Suggests PR workflow instead
     try std.testing.expect(std.mem.indexOf(u8, content, "/teammux-pr-ready") != null);
+}
+
+test "interceptor - push block catches HEAD:main refspec (TD25)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{"src/**"};
+    const write = [_][]const u8{"tests/**"};
+    try install(std.testing.allocator, path, 1, "test", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Wildcard pattern *:main catches HEAD:main, +HEAD:main, branch:main, etc.
+    try std.testing.expect(std.mem.indexOf(u8, content, "*:main|") != null);
+    // Wildcard pattern *:master catches HEAD:master, +HEAD:master, etc.
+    try std.testing.expect(std.mem.indexOf(u8, content, "*:master|") != null);
+}
+
+test "interceptor - push block catches refs/heads refspec (TD25)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{"src/**"};
+    const write = [_][]const u8{"tests/**"};
+    try install(std.testing.allocator, path, 1, "test", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Long-form refspec patterns: HEAD:refs/heads/main, +HEAD:refs/heads/main
+    try std.testing.expect(std.mem.indexOf(u8, content, "*:refs/heads/main|") != null);
+    // Long-form master variant
+    try std.testing.expect(std.mem.indexOf(u8, content, "*:refs/heads/master)") != null);
+}
+
+test "interceptor - push block catches force-push refspec (TD25)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+
+    const deny = [_][]const u8{"src/**"};
+    const write = [_][]const u8{"tests/**"};
+    try install(std.testing.allocator, path, 1, "test", &deny, &write);
+
+    const wrapper_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.git-wrapper/git", .{path});
+    defer std.testing.allocator.free(wrapper_path);
+    const file = try std.fs.openFileAbsolute(wrapper_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    defer std.testing.allocator.free(content);
+
+    // Full case pattern should contain all refspec wildcards in one line
+    // Covers: main, master, *:main, *:master, *:refs/heads/main, *:refs/heads/master
+    try std.testing.expect(std.mem.indexOf(u8, content, "main|master|*:main|*:master|*:refs/heads/main|*:refs/heads/master)") != null);
 }

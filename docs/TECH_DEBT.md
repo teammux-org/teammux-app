@@ -48,11 +48,10 @@
 | TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | OPEN   |
 | TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown              | v0.1.5 | NO       | OPEN   |
 | TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.2   | NO       | OPEN   |
-| TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | v0.2   | NO       | OPEN   |
+| TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | AA3    | NO       | RESOLVED |
 | TD26 | TeamMessage / CoordTypes | PRState and PRStatus model same concept with divergent colors    | v0.1.5 | NO       | OPEN   |
 | TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange      | v0.1.5 | NO       | OPEN   |
 | TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff   | v0.1.5 | NO       | OPEN   |
-
 ## Audit-address sprint — New debt introduced
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
@@ -63,6 +62,9 @@
 | TD32 | merge.zig                | runGitLogged captures exit code but not git stderr for cleanup failure diagnostics  | v0.1.5 | NO       | OPEN   |
 | TD33 | merge.zig / coordinator.zig | getWorker() returns raw pointer without lock in production paths                | v0.2   | NO       | OPEN   |
 | TD34 | main.zig (tm_roster_get) | Roster iteration uses raw pointers without holding roster mutex                    | v0.2   | NO       | OPEN   |
+| TD35 | worktree.zig             | Roster.claimNextId leaks ID slot when subsequent spawn step fails                  | v0.2   | NO       | OPEN   |
+| TD36 | main.zig                 | tm_interceptor_path worker 0 OOM returns null without setError                     | v0.1.5 | NO       | OPEN   |
+| TD37 | main.zig                 | sessionStop Team Lead interceptor cleanup failure not surfaced                     | v0.1.5 | NO       | OPEN   |
 
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
@@ -85,6 +87,9 @@
 - TD32: runGitLogged in merge.zig calls runGitCapture which sets stderr_behavior = .Ignore. Cleanup failure logs show operation name and exit code but not git's actual error message (e.g. "fatal: '/path' is not a working tree"). Adding stderr capture would improve debuggability for users told to do manual cleanup. Low priority — current logging is a major improvement over the previous silent discard.
 - TD33: merge.zig approve/reject (lines 84, 143, 219) and coordinator.zig dispatchTask (line 87) call roster.getWorker() without lock protection. Same race as audit finding I3 — concurrent dismiss can free worker strings while these functions read them. Line 143 is a write through the raw pointer (status mutation). AA2 stream scoped I3 fix to main.zig callers only. Migrate these to copyWorkerFields/hasWorker in v0.2.
 - TD34: tm_roster_get iterates e.roster.workers via .iterator() and passes entry.value_ptr (raw internal pointer) to fillCWorkerInfo without holding the roster mutex. A concurrent dismiss during iteration can free worker strings mid-copy. Either hold the mutex for the full iteration or copy all workers via copyWorkerFields first.
+- TD35: Roster.claimNextId() permanently increments next_id. If worktree_lifecycle.create or roster.spawn fails afterward, the ID slot is consumed with no worker registered. Over repeated failures, IDs increment without bound and gaps appear in the sequence. Fix: add an unclaimId() method or defer ID claim until after worktree creation succeeds. Low risk — IDs are u32, gaps are cosmetic.
+- TD36: tm_interceptor_path for worker 0 calls std.heap.c_allocator.dupeZ. On OOM, it frees the path and returns null without calling setError. Swift interprets null as "no interceptor installed" rather than "allocation failed", masking the root cause. Fix: add setError before returning null.
+- TD37: sessionStop calls interceptor.remove for the Team Lead wrapper. On failure, the error is logged via std.log.warn but not stored via setError. The orphaned .git-wrapper directory in project root can interfere with manual git usage after the app exits. Fix: call setError so Swift can surface a notification, or retry cleanup.
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.

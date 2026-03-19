@@ -247,7 +247,7 @@ pub const MergeCoordinator = struct {
         const br_deleted = runGitLogged(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "reject cleanup: branch delete");
 
         // Remove from roster (worktree directory already removed above)
-        roster.dismiss(project_root, worker_id) catch |err| switch (err) {
+        roster.dismiss(worker_id) catch |err| switch (err) {
             error.WorkerNotFound => {}, // Already removed by reject cleanup
         };
 
@@ -593,6 +593,43 @@ test "merge - runGitCapture captures output" {
 
 // ─── Integration tests ───────────────────────────────────
 
+/// Test helper: create a git worktree and register a worker in the roster.
+/// Roster.spawn is metadata-only (C3 unification), so we create the worktree
+/// via runGit and then register the worker with the resulting path/branch.
+fn spawnTestWorker(
+    allocator: std.mem.Allocator,
+    roster: *worktree.Roster,
+    project_root: []const u8,
+    worker_name: []const u8,
+    task_description: []const u8,
+) !worktree.WorkerId {
+    const id = roster.claimNextId();
+
+    // Generate path and branch
+    const name_slug = try worktree.slugify(allocator, worker_name, 40);
+    defer allocator.free(name_slug);
+    const wt_path = try std.fmt.allocPrint(allocator, "{s}/.teammux/worker-{s}", .{ project_root, name_slug });
+    defer allocator.free(wt_path);
+    const branch = try worktree.makeBranchName(allocator, worker_name, task_description);
+    defer allocator.free(branch);
+
+    // Ensure .teammux directory
+    const teammux_dir = try std.fmt.allocPrint(allocator, "{s}/.teammux", .{project_root});
+    defer allocator.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    // Create git worktree
+    try worktree.runGit(allocator, project_root, &.{ "worktree", "add", wt_path, "-b", branch });
+
+    // Register in roster (metadata only — no git ops)
+    try roster.spawn(id, "/usr/bin/echo", .claude_code, worker_name, task_description, wt_path, branch);
+
+    return id;
+}
+
 fn setupTestRepo(allocator: std.mem.Allocator) !struct { tmp: std.testing.TmpDir, path: []u8 } {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();
@@ -621,7 +658,7 @@ test "merge - reject removes worktree and branch (integration)" {
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker1", "fix bug");
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "Worker1", "fix bug");
     const branch_name = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.branch_name);
     defer std.testing.allocator.free(branch_name);
 
@@ -647,7 +684,7 @@ test "merge - approve clean merge (integration)" {
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker2", "add feature");
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "Worker2", "add feature");
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
@@ -685,7 +722,7 @@ test "merge - approve returns cleanup_incomplete when worktree already removed (
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker6", "cleanup test");
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "Worker6", "cleanup test");
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
@@ -720,7 +757,7 @@ test "merge - reject returns cleanup status (integration)" {
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker7", "reject cleanup");
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "Worker7", "reject cleanup");
 
     var mc = MergeCoordinator.init(std.testing.allocator);
     defer mc.deinit();
@@ -741,7 +778,7 @@ test "merge - approve with conflicts (integration)" {
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker3", "edit readme");
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "Worker3", "edit readme");
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
@@ -792,7 +829,7 @@ test "merge - reject after conflicted merge (integration)" {
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker4", "edit file");
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "Worker4", "edit file");
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
@@ -838,7 +875,7 @@ test "merge - approve squash strategy (integration)" {
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "Worker5", "squash feature");
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "Worker5", "squash feature");
     const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
     defer std.testing.allocator.free(wt_path);
 
@@ -886,8 +923,8 @@ test "merge - concurrent merge prevention" {
     var roster = worktree.Roster.init(std.testing.allocator);
     defer roster.deinit();
 
-    const id1 = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "WorkerA", "task a");
-    const id2 = try roster.spawn(repo.path, "/usr/bin/echo", .claude_code, "WorkerB", "task b");
+    const id1 = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "WorkerA", "task a");
+    const id2 = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "WorkerB", "task b");
     const wt1 = try std.testing.allocator.dupe(u8, roster.getWorker(id1).?.worktree_path);
     defer std.testing.allocator.free(wt1);
 
