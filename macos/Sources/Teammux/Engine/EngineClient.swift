@@ -495,6 +495,12 @@ final class EngineClient: ObservableObject {
         var skippedWorkers: [String] = []
         var idMapping: [UInt32: UInt32] = [:]  // old snapshot ID → new engine ID
 
+        // TD22: Role-based ownership is restored correctly — spawnWorker()
+        // calls resolveRole() + registerOwnership() when roleId is non-nil,
+        // re-registering write and deny patterns from the role TOML on disk.
+        // Runtime ownership changes made via direct tm_ownership_register()
+        // calls (outside the role file) are NOT persisted or restored here.
+        // Full registry snapshot deferred to v0.2 (see TECH_DEBT.md TD22).
         for worker in snapshot.workers {
             guard fm.fileExists(atPath: worker.worktreePath) else {
                 Self.logger.warning("restoreSession: worktree missing at \(worker.worktreePath) — skipping worker \(worker.id) (\(worker.name))")

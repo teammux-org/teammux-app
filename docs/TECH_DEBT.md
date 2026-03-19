@@ -45,7 +45,7 @@
 | ID   | Module                   | Issue                                                            | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------|--------|----------|--------|
 | TD21 | worktree_lifecycle.zig   | Dangling worktrees if engine crashes mid-spawn                   | v0.2   | NO       | OPEN   |
-| TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | OPEN   |
+| TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | PARTIAL |
 | TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown              | v0.1.5 | NO       | OPEN   |
 | TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.2   | NO       | OPEN   |
 | TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | AA3    | NO       | RESOLVED |
@@ -74,7 +74,7 @@
 - TD19: Interceptor wrapper uses exit 1 for enforcement — indistinguishable from real git errors. T3 changes all enforcement blocks to exit 126 (POSIX reserved for "command cannot execute").
 - TD20: EngineClient.lastError written by 50+ methods — stale errors bleed. T6 adds clear at method entry (minimal correct fix). Full Result<T, EngineError> migration deferred to future sprint.
 - TD21: tm_worktree_create creates directory and branch. On engine crash mid-spawn, worktree directory and branch may be left on disk. Recovery scan at engine init deferred to v0.2.
-- TD22: SessionState.swift restores worker roster and spawns workers into existing worktrees. FileOwnershipRegistry is rebuilt at spawn time from the role definition — but deny patterns from any runtime ownership changes (direct tm_ownership_register calls) are lost. Full registry snapshot deferred to v0.2.
+- TD22: PARTIALLY RESOLVED (v0.1.5-S4). Role-based ownership is correctly restored — restoreSession() calls spawnWorker() with the saved roleId, which resolves the role from disk and registers all write/deny patterns via tm_ownership_register. No code path in v0.1.4 makes runtime ownership changes outside the role file, so this covers all current scenarios. Remaining gap: runtime ownership changes made via direct tm_ownership_register calls (not from the role file) are not persisted or restored. Full registry snapshot deferred to v0.2.
 - TD23: ContextView renders CLAUDE.md as plain text with bold section headers (## prefix detection). True markdown rendering with a SwiftUI-compatible renderer deferred to v0.1.5 to avoid adding a dependency.
 - TD24: completion_history.jsonl is append-only and grows across all sessions. Log rotation (max size, archive old entries) deferred to v0.2. Risk is low for initial usage.
 - TD25: Push-to-main interceptor matches literal "main"/"master" tokens in $@. Refspec syntax (git push origin HEAD:main, refs/heads/feature:refs/heads/master) bypasses the check. Defense-in-depth only — workers operate in isolated worktrees on teammux/* branches. Full refspec destination parsing deferred to v0.2.
