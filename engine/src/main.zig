@@ -2320,7 +2320,7 @@ export fn tm_interceptor_path(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
 
 // ─── Role hot-reload ─────────────────────────────────────
 
-export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u8, callback: ?*const fn (u32, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) c_int {
+export fn tm_role_watch(engine: ?*Engine, worker_id: u32, role_id: ?[*:0]const u8, callback: ?*const fn (u32, ?[*:0]const u8, u64, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) c_int {
     const e = engine orelse return 99;
     const cb = callback orelse {
         // No dedicated TM_ERR_INVALID_ARG; reusing TM_ERR_ROLE for parameter errors
@@ -4241,7 +4241,7 @@ test "tm_role_watch null role_id returns TM_ERR_ROLE" {
     defer tm_engine_destroy(engine_ptr);
 
     const noop_cb = &struct {
-        fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+        fn cb(_: u32, _: ?[*:0]const u8, _: u64, _: ?*anyopaque) callconv(.c) void {}
     }.cb;
     // null role_id → TM_ERR_ROLE (13)
     try std.testing.expect(tm_role_watch(engine_ptr, 1, null, noop_cb, null) == 13);
@@ -4259,7 +4259,7 @@ test "tm_role_watch invalid worker_id returns TM_ERR_INVALID_WORKER" {
     defer tm_engine_destroy(engine_ptr);
 
     const noop_cb = &struct {
-        fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+        fn cb(_: u32, _: ?[*:0]const u8, _: u64, _: ?*anyopaque) callconv(.c) void {}
     }.cb;
     const role_z = try std.testing.allocator.dupeZ(u8, "test-role");
     defer std.testing.allocator.free(role_z);
