@@ -265,6 +265,7 @@ pub const Engine = struct {
         // Clean up Team Lead interceptor from project root
         interceptor.remove(self.allocator, self.project_root) catch |err| {
             std.log.warn("[teammux] Team Lead interceptor cleanup failed: {}", .{err});
+            self.setError("sessionStop: Team Lead interceptor cleanup failed — orphaned .git-wrapper may remain in project root") catch {};
         };
     }
 
