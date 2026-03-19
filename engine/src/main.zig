@@ -441,7 +441,10 @@ export fn tm_config_get(engine: ?*Engine, key: ?[*:0]const u8) ?[*:0]const u8 {
 export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_type: c_int, worker_name: ?[*:0]const u8, task_description: ?[*:0]const u8) u32 {
     const e = engine orelse return 0xFFFFFFFF;
     const ab = std.mem.span(agent_binary orelse return 0xFFFFFFFF);
-    const at: config.AgentType = @enumFromInt(agent_type);
+    const at: config.AgentType = std.meta.intToEnum(config.AgentType, agent_type) catch {
+        e.setError("tm_worker_spawn: invalid agent_type") catch {};
+        return 0xFFFFFFFF;
+    };
     const wn = std.mem.span(worker_name orelse return 0xFFFFFFFF);
     const td = std.mem.span(task_description orelse return 0xFFFFFFFF);
 
@@ -740,7 +743,10 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
     });
 
     if (std.mem.eql(u8, cmd, "/teammux-assign")) {
-        handleAssignCommand(engine, args_ptr);
+        // C4: Block /teammux-assign entirely via command files — worker_id is
+        // spoofable in untrusted JSON. Task assignment must use tm_dispatch_task
+        // through the authenticated Swift UI path.
+        std.log.warn("[teammux] /teammux-assign: command-file dispatch disabled — use tm_dispatch_task from the Teammux UI", .{});
         return;
     }
     if (std.mem.eql(u8, cmd, "/teammux-ask")) {
@@ -758,55 +764,6 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
 
     // Forward unhandled commands to Swift callback
     if (engine.cmd_cb) |cb| cb(command_ptr, args_ptr, engine.cmd_cb_userdata);
-}
-
-fn handleAssignCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
-    const args = std.mem.span(args_ptr orelse {
-        std.log.warn("[teammux] /teammux-assign: args is NULL (expected JSON body)", .{});
-        return;
-    });
-
-    // Block command-file dispatch for Team Lead — use tm_dispatch_task via UI.
-    // Missing worker_id defaults to 0 (Team Lead) to prevent bypass.
-    const from_id_str = extractJsonStringValue(args, "worker_id") orelse
-        extractJsonNumber(args, "worker_id");
-    const from_id: u32 = if (from_id_str) |fid|
-        std.fmt.parseInt(u32, fid, 10) catch 0
-    else
-        0; // Missing worker_id treated as Team Lead
-    if (from_id == 0) {
-        std.log.warn("[teammux] /teammux-assign: Team Lead (worker 0) cannot use command-file dispatch — use tm_dispatch_task from the Teammux UI", .{});
-        return;
-    }
-
-    // Parse target_worker_id (integer or string) from JSON
-    const id_str = extractJsonStringValue(args, "target_worker_id") orelse
-        extractJsonNumber(args, "target_worker_id");
-    if (id_str == null) {
-        std.log.warn("[teammux] /teammux-assign: missing target_worker_id", .{});
-        return;
-    }
-    const worker_id = std.fmt.parseInt(u32, id_str.?, 10) catch {
-        std.log.warn("[teammux] /teammux-assign: invalid target_worker_id", .{});
-        return;
-    };
-
-    const instruction = extractJsonStringValue(args, "instruction") orelse {
-        std.log.warn("[teammux] /teammux-assign: missing instruction", .{});
-        return;
-    };
-
-    const b = &(engine.message_bus orelse {
-        std.log.warn("[teammux] /teammux-assign: message bus not available", .{});
-        return;
-    });
-    engine.coordinator.dispatchTask(&engine.roster, b, worker_id, instruction) catch |err| {
-        if (err == error.WorkerNotFound) {
-            std.log.warn("[teammux] /teammux-assign: worker {d} not found in roster", .{worker_id});
-        } else {
-            std.log.warn("[teammux] /teammux-assign: dispatch to worker {d} failed: {s}", .{ worker_id, @errorName(err) });
-        }
-    };
 }
 
 fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
@@ -4286,7 +4243,7 @@ test "tm_dispatch_history_free handles null" {
     tm_dispatch_history_free(null, 0);
 }
 
-test "command routing wrapper routes /teammux-assign to coordinator" {
+test "command routing wrapper blocks /teammux-assign via command file (C4)" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -4304,6 +4261,8 @@ test "command routing wrapper routes /teammux-assign to coordinator" {
     // Add a worker to the roster
     try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
 
+    // Even with a valid non-zero worker_id, /teammux-assign is blocked
+    // entirely via command files — task assignment must use tm_dispatch_task
     const args_json = "{\"worker_id\": 1, \"target_worker_id\": 5, \"instruction\": \"refactor auth\"}";
     const args_z = try alloc.dupeZ(u8, args_json);
     defer alloc.free(args_z);
@@ -4312,10 +4271,9 @@ test "command routing wrapper routes /teammux-assign to coordinator" {
 
     commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
+    // No dispatch should have been recorded — command-file assign is disabled
     const history = e.coordinator.getHistory();
-    try std.testing.expect(history.len == 1);
-    try std.testing.expectEqualStrings("refactor auth", history[0].instruction);
-    try std.testing.expect(history[0].target_worker_id == 5);
+    try std.testing.expect(history.len == 0);
 }
 
 test "command routing wrapper forwards unknown commands to Swift callback" {
@@ -5946,67 +5904,6 @@ test "C4 - tm_ownership_register rejects write grants for worker 0" {
 
     // Deny pattern for worker 0 should succeed
     try std.testing.expect(tm_ownership_register(e, 0, pat_z.ptr, false) == 0);
-}
-
-test "C4 - /teammux-assign blocked for worker 0" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(root);
-
-    const e = try Engine.create(alloc, root);
-    defer e.destroy();
-
-    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
-    defer alloc.free(log_dir);
-    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "c4test", root);
-
-    // Add a target worker
-    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
-
-    // Assign from worker 0 should be blocked (no dispatch recorded)
-    const args_json = "{\"worker_id\": 0, \"target_worker_id\": 5, \"instruction\": \"should be blocked\"}";
-    const args_z = try alloc.dupeZ(u8, args_json);
-    defer alloc.free(args_z);
-    const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
-    defer alloc.free(cmd_z);
-
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
-
-    // No dispatch should have been recorded
-    const history = e.coordinator.getHistory();
-    try std.testing.expect(history.len == 0);
-}
-
-test "C4 - /teammux-assign blocked when worker_id field missing" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(root);
-
-    const e = try Engine.create(alloc, root);
-    defer e.destroy();
-
-    const log_dir = try std.fmt.allocPrint(alloc, "{s}/logs", .{root});
-    defer alloc.free(log_dir);
-    e.message_bus = try bus.MessageBus.init(alloc, log_dir, "c4bypass", root);
-
-    try e.roster.workers.put(5, try coordinator_mod.makeTestWorker(alloc, 5));
-
-    // Missing worker_id field should default to Team Lead (worker 0) and be blocked
-    const args_json = "{\"target_worker_id\": 5, \"instruction\": \"bypass attempt\"}";
-    const args_z = try alloc.dupeZ(u8, args_json);
-    defer alloc.free(args_z);
-    const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
-    defer alloc.free(cmd_z);
-
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
-
-    // Must NOT have dispatched — missing worker_id defaults to Team Lead
-    const history = e.coordinator.getHistory();
-    try std.testing.expect(history.len == 0);
 }
 
 test "C4 - tm_ownership_update rejects write grants for worker 0" {
