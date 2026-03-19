@@ -69,6 +69,11 @@ is a code issue.
 - DO NOT run git checkout or switch branches
 - DO NOT install dependencies or modify build configuration
 
+NOTE: Audit output files in docs/codex-audits/ are
+explicitly PERMITTED to be committed and pushed.
+The restrictions above apply to source files only
+(*.zig, *.swift, *.h, *.toml, *.md in repo root).
+
 ## Current State
 
 Version v0.1.4 shipped. Tag: v0.1.4.
