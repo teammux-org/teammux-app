@@ -210,15 +210,39 @@ struct HistoryEntry: Identifiable, Equatable, Sendable {
 
 // MARK: - PRStatus
 
-/// Status of a GitHub pull request created by a worker.
-/// Initially `.open` when created via `TM_MSG_PR_READY` or `createPR()`;
-/// updated via the `status` field in `TM_MSG_PR_STATUS` payloads.
-/// Distinct from `PRState` in TeamMessage.swift, which maps to the C
-/// `tm_pr_state_t` for the GitHub API bridge.
+/// Unified status of a GitHub pull request.
+/// Used both for bus message workflow (`TM_MSG_PR_STATUS`) and for the
+/// GitHub API bridge (`tm_pr_state_t` in teammux.h).
+/// Colors: open=green, merged=purple, closed=grey.
 enum PRStatus: String, Sendable, Codable {
     case open
     case merged
     case closed
+
+    /// Initialise from the C enum raw value (`tm_pr_state_t`).
+    /// TM_PR_OPEN=0, TM_PR_CLOSED=1, TM_PR_MERGED=2
+    init(fromCValue value: UInt32) {
+        switch value {
+        case 0: self = .open
+        case 1: self = .closed
+        case 2: self = .merged
+        default:
+            #if DEBUG
+            assertionFailure("Unknown tm_pr_state_t value: \(value)")
+            #endif
+            self = .closed
+        }
+    }
+
+    /// Initialise from a string (case-insensitive). Returns nil for unknown values.
+    init?(from string: String) {
+        switch string.lowercased() {
+        case "open":   self = .open
+        case "closed": self = .closed
+        case "merged": self = .merged
+        default:       return nil
+        }
+    }
 
     var label: String {
         switch self {

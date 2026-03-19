@@ -748,28 +748,29 @@ struct CValueRoundTripTests {
     }
 }
 
-// MARK: - PRState Tests
+// MARK: - PRStatus Tests (TD26: unified from former PRState + PRStatus)
 
 @Suite
-struct PRStateTests {
+struct PRStatusTests {
 
-    @Test func prStateFromString() {
-        #expect(PRState(from: "open") == .open)
-        #expect(PRState(from: "closed") == .closed)
-        #expect(PRState(from: "merged") == .merged)
-        #expect(PRState(from: "OPEN") == .open)  // case insensitive
-        #expect(PRState(from: "banana") == .unknown)
+    @Test func prStatusFromString() {
+        #expect(PRStatus(from: "open") == .open)
+        #expect(PRStatus(from: "closed") == .closed)
+        #expect(PRStatus(from: "merged") == .merged)
+        #expect(PRStatus(from: "OPEN") == .open)  // case insensitive
+        #expect(PRStatus(from: "banana") == nil)
     }
 
-    @Test func prStateFromCValue() {
-        #expect(PRState(fromCValue: 0) == .open)
-        #expect(PRState(fromCValue: 1) == .closed)
-        #expect(PRState(fromCValue: 2) == .merged)
+    @Test func prStatusFromCValue() {
+        #expect(PRStatus(fromCValue: 0) == .open)
+        #expect(PRStatus(fromCValue: 1) == .closed)
+        #expect(PRStatus(fromCValue: 2) == .merged)
     }
 
-    @Test func prStateFromCValueUnknown() {
-        #expect(PRState(fromCValue: 3) == .unknown)
-        #expect(PRState(fromCValue: 99) == .unknown)
+    @Test func prStatusColors() {
+        #expect(PRStatus.open.color == .green)
+        #expect(PRStatus.merged.color == .purple)
+        #expect(PRStatus.closed.color == .secondary)
     }
 }
 
