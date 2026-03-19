@@ -702,24 +702,77 @@ export fn tm_github_merge_pr(engine: ?*Engine, pr_number: u64, strategy: c_int) 
     };
     return 0;
 }
-export fn tm_github_get_diff(engine: ?*Engine, worker_id: u32) ?*CDiff {
+export fn tm_github_get_diff(engine: ?*Engine, pr_number: u64) ?*CDiff {
     const e = engine orelse return null;
-    const wf = e.roster.copyWorkerFields(worker_id, e.allocator) catch {
+    const alloc = e.allocator;
+
+    var diff = e.github_client.getDiff(alloc, pr_number) catch |err| {
+        const msg = if (err == error.NoRepo) "diff failed: no repo configured" else if (err == error.GhCommandFailed) "diff failed: GitHub API error" else "diff failed: unexpected error";
+        e.setError(msg) catch {};
+        return null;
+    };
+    defer diff.deinit(alloc);
+
+    // Convert Zig Diff to C-compatible CDiff
+    const c_diff = alloc.create(CDiff) catch {
         e.setError("diff failed: allocation error") catch {};
         return null;
-    } orelse {
-        e.setError("diff failed: worker not found") catch {};
+    };
+    errdefer alloc.destroy(c_diff);
+
+    const c_files = alloc.alloc(CDiffFile, diff.files.len) catch {
+        e.setError("diff failed: allocation error") catch {};
         return null;
     };
-    defer wf.deinit(e.allocator);
-    _ = e.github_client.getDiff(e.allocator, wf.branch_name) catch {
-        // getDiff returns NotImplemented in v0.1 — this is expected
-        e.setError("diff view not yet available (v0.2)") catch {};
-        return null;
+    errdefer alloc.free(c_files);
+
+    var filled: usize = 0;
+    errdefer for (c_files[0..filled]) |f| {
+        freeNullTerminated(f.file_path);
+        freeNullTerminated(f.patch);
     };
-    unreachable; // getDiff always returns error.NotImplemented in v0.1
+
+    for (diff.files, 0..) |file, i| {
+        const path_z = alloc.dupeZ(u8, file.path) catch {
+            e.setError("diff failed: allocation error") catch {};
+            return null;
+        };
+        const patch_z = alloc.dupeZ(u8, file.patch) catch {
+            alloc.free(path_z);
+            e.setError("diff failed: allocation error") catch {};
+            return null;
+        };
+
+        c_files[i] = .{
+            .file_path = path_z.ptr,
+            .status = @intFromEnum(file.status),
+            .additions = file.additions,
+            .deletions = file.deletions,
+            .patch = patch_z.ptr,
+        };
+        filled += 1;
+    }
+
+    c_diff.* = .{
+        .files = c_files.ptr,
+        .count = @intCast(diff.files.len),
+        .total_additions = diff.total_additions,
+        .total_deletions = diff.total_deletions,
+    };
+    return c_diff;
 }
-export fn tm_diff_free(diff: ?*CDiff) void { if (diff) |d| std.heap.c_allocator.destroy(d); }
+export fn tm_diff_free(diff: ?*CDiff) void {
+    const d = diff orelse return;
+    const count = d.count;
+    if (d.files) |files_ptr| {
+        for (files_ptr[0..count]) |f| {
+            freeNullTerminated(f.file_path);
+            freeNullTerminated(f.patch);
+        }
+        std.heap.c_allocator.free(files_ptr[0..count]);
+    }
+    std.heap.c_allocator.destroy(d);
+}
 export fn tm_github_webhooks_start(engine: ?*Engine, callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
     const e = engine orelse return 0;
     e.github_client.startWebhooks(e.allocator, callback, userdata) catch {

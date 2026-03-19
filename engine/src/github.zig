@@ -28,8 +28,16 @@ pub const Pr = struct {
     diff_url: []const u8,
 };
 
+pub const DiffFileStatus = enum(c_int) {
+    added = 0,
+    modified = 1,
+    deleted = 2,
+    renamed = 3,
+};
+
 pub const DiffFile = struct {
     path: []const u8,
+    status: DiffFileStatus,
     additions: i32,
     deletions: i32,
     patch: []const u8,
@@ -39,6 +47,14 @@ pub const Diff = struct {
     files: []DiffFile,
     total_additions: i32,
     total_deletions: i32,
+
+    pub fn deinit(self: *const Diff, allocator: std.mem.Allocator) void {
+        for (self.files) |file| {
+            allocator.free(file.path);
+            allocator.free(file.patch);
+        }
+        allocator.free(self.files);
+    }
 };
 
 // ─────────────────────────────────────────────────────────
@@ -135,7 +151,7 @@ pub const GitHubClient = struct {
         const url = try allocator.dupe(u8, std.mem.trim(u8, result, &[_]u8{ '\n', '\r', ' ' }));
 
         return .{
-            .pr_number = 0,
+            .pr_number = parsePrNumberFromUrl(url) orelse 0,
             .url = url,
             .title = try allocator.dupe(u8, title),
             .state = try allocator.dupe(u8, "open"),
@@ -167,21 +183,23 @@ pub const GitHubClient = struct {
         allocator.free(result);
     }
 
-    /// Get the diff for a worker's branch vs main.
+    /// Get the diff for a pull request via GitHub PR files API.
+    /// Caller must call result.deinit(allocator) when done.
     pub fn getDiff(
         self: *GitHubClient,
         allocator: std.mem.Allocator,
-        branch: []const u8,
+        pr_number: u64,
     ) !Diff {
-        _ = self;
-        _ = allocator;
-        _ = branch;
-        // TODO(v0.2): fetch and parse the GitHub compare API response.
-        // For v0.1, diff parsing is not implemented.
-        return error.NotImplemented;
-    }
+        const repo = self.repo orelse return error.NoRepo;
 
-    pub const NotImplemented = error{NotImplemented};
+        const endpoint = try std.fmt.allocPrint(allocator, "repos/{s}/pulls/{d}/files?per_page=100", .{ repo, pr_number });
+        defer allocator.free(endpoint);
+
+        const result = try runGhCommand(allocator, &.{ "api", endpoint });
+        defer allocator.free(result);
+
+        return parseDiffResponse(allocator, result);
+    }
 
     /// Start gh webhook forward for real-time GitHub events.
     /// If gh is not in PATH: skip retry, go straight to polling fallback.
@@ -743,6 +761,122 @@ fn extractJsonStringSimple(json: []const u8, key: []const u8) ?[]const u8 {
 }
 
 // ─────────────────────────────────────────────────────────
+// Diff parsing helpers
+// ─────────────────────────────────────────────────────────
+
+/// Parse the JSON response from GitHub's PR files API into a Diff.
+/// Caller must call result.deinit(allocator) when done.
+fn parseDiffResponse(allocator: std.mem.Allocator, json_data: []const u8) !Diff {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_data, .{});
+    defer parsed.deinit();
+
+    const files_array = switch (parsed.value) {
+        .array => |arr| arr,
+        else => return error.GhCommandFailed,
+    };
+
+    var files: std.ArrayList(DiffFile) = .{};
+    errdefer {
+        for (files.items) |f| {
+            allocator.free(f.path);
+            allocator.free(f.patch);
+        }
+        files.deinit(allocator);
+    }
+
+    var total_add: i32 = 0;
+    var total_del: i32 = 0;
+
+    for (files_array.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+
+        const filename = switch (obj.get("filename") orelse continue) {
+            .string => |s| s,
+            else => continue,
+        };
+
+        const status_str: []const u8 = blk: {
+            const v = obj.get("status") orelse break :blk "modified";
+            break :blk switch (v) {
+                .string => |s| s,
+                else => "modified",
+            };
+        };
+
+        const additions: i64 = blk: {
+            const v = obj.get("additions") orelse break :blk 0;
+            break :blk switch (v) {
+                .integer => |i| i,
+                else => 0,
+            };
+        };
+
+        const deletions: i64 = blk: {
+            const v = obj.get("deletions") orelse break :blk 0;
+            break :blk switch (v) {
+                .integer => |i| i,
+                else => 0,
+            };
+        };
+
+        const patch_str: []const u8 = blk: {
+            const v = obj.get("patch") orelse break :blk "";
+            break :blk switch (v) {
+                .string => |s| s,
+                else => "",
+            };
+        };
+
+        const add_i32: i32 = @intCast(additions);
+        const del_i32: i32 = @intCast(deletions);
+
+        const path = try allocator.dupe(u8, filename);
+        errdefer allocator.free(path);
+        const patch = try allocator.dupe(u8, patch_str);
+
+        try files.append(allocator, .{
+            .path = path,
+            .status = mapGitHubFileStatus(status_str),
+            .additions = add_i32,
+            .deletions = del_i32,
+            .patch = patch,
+        });
+
+        total_add += add_i32;
+        total_del += del_i32;
+    }
+
+    return .{
+        .files = try files.toOwnedSlice(allocator),
+        .total_additions = total_add,
+        .total_deletions = total_del,
+    };
+}
+
+/// Map GitHub PR files API status string to DiffFileStatus enum.
+fn mapGitHubFileStatus(status: []const u8) DiffFileStatus {
+    if (std.mem.eql(u8, status, "added")) return .added;
+    if (std.mem.eql(u8, status, "removed")) return .deleted;
+    if (std.mem.eql(u8, status, "renamed")) return .renamed;
+    return .modified; // "modified", "changed", "copied", etc.
+}
+
+/// Parse PR number from a GitHub PR URL.
+/// URL format: https://github.com/{owner}/{repo}/pull/{number}
+pub fn parsePrNumberFromUrl(url: []const u8) ?u64 {
+    const needle = "/pull/";
+    const pos = std.mem.lastIndexOf(u8, url, needle) orelse return null;
+    const after = url[pos + needle.len ..];
+    var end: usize = 0;
+    while (end < after.len and after[end] >= '0' and after[end] <= '9') : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseInt(u64, after[0..end], 10) catch null;
+}
+
+// ─────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────
 
@@ -1261,4 +1395,109 @@ test "github - extractJsonStringSimple handles escaped quotes in value" {
 test "github - extractJsonStringSimple returns null for truncated input" {
     const json = "{\"url\":\"https://example.com";
     try std.testing.expect(extractJsonStringSimple(json, "url") == null);
+}
+
+// ─── Diff parsing tests ──────────────────────────────────
+
+test "github - parsePrNumberFromUrl parses valid GitHub PR URLs" {
+    try std.testing.expect(parsePrNumberFromUrl("https://github.com/owner/repo/pull/42").? == 42);
+    try std.testing.expect(parsePrNumberFromUrl("https://github.com/org/project/pull/1").? == 1);
+    try std.testing.expect(parsePrNumberFromUrl("https://github.com/a/b/pull/999").? == 999);
+}
+
+test "github - parsePrNumberFromUrl returns null for invalid URLs" {
+    try std.testing.expect(parsePrNumberFromUrl("https://github.com/owner/repo") == null);
+    try std.testing.expect(parsePrNumberFromUrl("https://github.com/owner/repo/issues/42") == null);
+    try std.testing.expect(parsePrNumberFromUrl("") == null);
+    try std.testing.expect(parsePrNumberFromUrl("/pull/") == null);
+}
+
+test "github - mapGitHubFileStatus maps correctly" {
+    try std.testing.expect(mapGitHubFileStatus("added") == .added);
+    try std.testing.expect(mapGitHubFileStatus("removed") == .deleted);
+    try std.testing.expect(mapGitHubFileStatus("renamed") == .renamed);
+    try std.testing.expect(mapGitHubFileStatus("modified") == .modified);
+    try std.testing.expect(mapGitHubFileStatus("changed") == .modified);
+    try std.testing.expect(mapGitHubFileStatus("copied") == .modified);
+    try std.testing.expect(mapGitHubFileStatus("unknown") == .modified);
+}
+
+test "github - parseDiffResponse parses valid PR files JSON" {
+    const json =
+        \\[{"filename":"src/main.zig","status":"modified","additions":10,"deletions":5,"patch":"@@ -1,5 +1,10 @@\n context\n-old\n+new"},
+        \\{"filename":"README.md","status":"added","additions":20,"deletions":0,"patch":"@@ -0,0 +1,20 @@\n+new file"}]
+    ;
+
+    var diff = try parseDiffResponse(std.testing.allocator, json);
+    defer diff.deinit(std.testing.allocator);
+
+    try std.testing.expect(diff.files.len == 2);
+    try std.testing.expect(diff.total_additions == 30);
+    try std.testing.expect(diff.total_deletions == 5);
+
+    try std.testing.expectEqualStrings("src/main.zig", diff.files[0].path);
+    try std.testing.expect(diff.files[0].status == .modified);
+    try std.testing.expect(diff.files[0].additions == 10);
+    try std.testing.expect(diff.files[0].deletions == 5);
+
+    try std.testing.expectEqualStrings("README.md", diff.files[1].path);
+    try std.testing.expect(diff.files[1].status == .added);
+    try std.testing.expect(diff.files[1].additions == 20);
+}
+
+test "github - parseDiffResponse handles all status types" {
+    const json =
+        \\[{"filename":"a.zig","status":"added","additions":1,"deletions":0,"patch":"+new"},
+        \\{"filename":"b.zig","status":"removed","additions":0,"deletions":1,"patch":"-old"},
+        \\{"filename":"c.zig","status":"renamed","additions":0,"deletions":0,"patch":""},
+        \\{"filename":"d.zig","status":"modified","additions":2,"deletions":1,"patch":"@@ diff"}]
+    ;
+
+    var diff = try parseDiffResponse(std.testing.allocator, json);
+    defer diff.deinit(std.testing.allocator);
+
+    try std.testing.expect(diff.files[0].status == .added);
+    try std.testing.expect(diff.files[1].status == .deleted);
+    try std.testing.expect(diff.files[2].status == .renamed);
+    try std.testing.expect(diff.files[3].status == .modified);
+}
+
+test "github - parseDiffResponse handles missing patch field" {
+    const json =
+        \\[{"filename":"binary.png","status":"added","additions":0,"deletions":0}]
+    ;
+
+    var diff = try parseDiffResponse(std.testing.allocator, json);
+    defer diff.deinit(std.testing.allocator);
+
+    try std.testing.expect(diff.files.len == 1);
+    try std.testing.expectEqualStrings("", diff.files[0].patch);
+}
+
+test "github - parseDiffResponse returns empty for empty array" {
+    var diff = try parseDiffResponse(std.testing.allocator, "[]");
+    defer diff.deinit(std.testing.allocator);
+
+    try std.testing.expect(diff.files.len == 0);
+    try std.testing.expect(diff.total_additions == 0);
+    try std.testing.expect(diff.total_deletions == 0);
+}
+
+test "github - parseDiffResponse errors on non-array JSON" {
+    const result = parseDiffResponse(std.testing.allocator, "{}");
+    try std.testing.expectError(error.GhCommandFailed, result);
+}
+
+test "github - parseDiffResponse skips malformed entries" {
+    const json =
+        \\[{"not_a_file":true},
+        \\{"filename":"good.zig","status":"modified","additions":1,"deletions":0,"patch":"ok"},
+        \\42]
+    ;
+
+    var diff = try parseDiffResponse(std.testing.allocator, json);
+    defer diff.deinit(std.testing.allocator);
+
+    try std.testing.expect(diff.files.len == 1);
+    try std.testing.expectEqualStrings("good.zig", diff.files[0].path);
 }
