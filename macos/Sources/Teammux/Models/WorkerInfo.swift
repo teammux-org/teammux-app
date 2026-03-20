@@ -102,6 +102,42 @@ enum AgentType: Equatable, Hashable, Sendable {
     }
 }
 
+// MARK: - HealthStatus
+
+/// Maps to `tm_health_status_t` in teammux.h.
+/// HEALTHY=0, STALLED=1, ERRORED=2
+enum HealthStatus: Int, CaseIterable, Sendable {
+    case healthy = 0
+    case stalled = 1
+    case errored = 2
+
+    /// Semantic color for health indicator dots.
+    var color: Color {
+        switch self {
+        case .healthy: return .green
+        case .stalled: return .yellow
+        case .errored: return .red
+        }
+    }
+
+    /// Human-readable label.
+    var label: String {
+        switch self {
+        case .healthy: return "Healthy"
+        case .stalled: return "Stalled"
+        case .errored: return "Errored"
+        }
+    }
+
+    init(fromCValue value: Int32) {
+        if let known = HealthStatus(rawValue: Int(value)) {
+            self = known
+        } else {
+            self = .healthy
+        }
+    }
+}
+
 // MARK: - WorkerInfo
 
 /// A snapshot of a single worker's state, mirroring `tm_worker_info_t`.
@@ -117,4 +153,6 @@ struct WorkerInfo: Identifiable, Equatable, Sendable {
     let agentBinary: String
     let model: String
     let spawnedAt: Date
+    let lastActivityTs: Date
+    let healthStatus: HealthStatus
 }
