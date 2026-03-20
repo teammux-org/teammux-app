@@ -139,17 +139,27 @@ pub const Coordinator = struct {
 /// dies unexpectedly. Marks the worker as errored and releases all
 /// ownership entries. Does NOT remove the worktree — preserves the
 /// worker's in-progress work for Team Lead inspection.
+/// Thread-safe: acquires roster mutex for status mutation.
+/// Ownership release is internally mutex-protected.
 /// Returns true if worker was found and state updated, false otherwise.
 pub fn ptyDiedCallback(
     roster: *worktree.Roster,
     ownership_registry: *ownership.FileOwnershipRegistry,
     worker_id: worktree.WorkerId,
 ) bool {
-    // Mark worker status as errored (getWorker returns raw pointer — TD33)
-    const w = roster.getWorker(worker_id) orelse return false;
+    // Acquire roster mutex for thread-safe status mutation.
+    // Called from PtyMonitor background thread — must not use getWorker()
+    // which returns a raw pointer without lock protection (TD33).
+    roster.mutex.lock();
+    const w = roster.workers.getPtr(worker_id) orelse {
+        roster.mutex.unlock();
+        return false;
+    };
     w.status = .err;
+    roster.mutex.unlock();
 
     // Release all ownership entries for the dead worker
+    // (ownership.release acquires its own mutex internally)
     ownership_registry.release(worker_id);
 
     // Worktree is intentionally preserved — Team Lead can inspect or salvage work

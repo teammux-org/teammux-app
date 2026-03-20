@@ -97,8 +97,11 @@ const PtyMonitor = struct {
     }
 
     fn pollOnce(self: *PtyMonitor) void {
+        // Fixed buffer for dead PIDs per poll cycle. If >32 die simultaneously,
+        // excess are caught on next poll (500ms later) — self-healing.
         var dead: [32]struct { pid: std.posix.pid_t, wid: worktree.WorkerId } = undefined;
         var dead_count: usize = 0;
+        var overflow = false;
 
         // Collect dead PIDs under lock
         {
@@ -111,6 +114,8 @@ const PtyMonitor = struct {
                     if (dead_count < dead.len) {
                         dead[dead_count] = .{ .pid = entry.key_ptr.*, .wid = entry.value_ptr.* };
                         dead_count += 1;
+                    } else {
+                        overflow = true;
                     }
                 }
             }
@@ -118,6 +123,10 @@ const PtyMonitor = struct {
             for (dead[0..dead_count]) |d| {
                 _ = self.pids.remove(d.pid);
             }
+        }
+
+        if (overflow) {
+            std.log.warn("[teammux] PtyMonitor: dead PID buffer full ({d}), deferring remainder to next poll", .{dead.len});
         }
 
         // Fire callbacks outside lock (avoids deadlock with engine mutexes)
@@ -142,6 +151,7 @@ const PtyMonitor = struct {
         if (std.c.kill(pid, 0) == 0) return true;
         // EPERM (errno 1) means process exists but different user — still alive.
         // ESRCH (errno 3) means no such process — dead.
+        // Hardcoded: std.c does not expose ESRCH as a named constant.
         return std.c._errno().* != 3;
     }
 };
@@ -358,6 +368,7 @@ pub const Engine = struct {
         // Start PTY death monitor — polls registered PIDs for exit events
         self.pty_monitor.start() catch |err| {
             std.log.warn("[teammux] PTY monitor start failed: {} — relying on direct tm_worker_pty_died calls", .{err});
+            self.setError("PTY death monitor failed to start — worker crash detection is degraded") catch {};
         };
     }
 
@@ -439,7 +450,8 @@ pub const Engine = struct {
 
     /// Handle PTY death for a worker. Called by both PtyMonitor (background)
     /// and tm_worker_pty_died (direct C API). Performs state reconciliation:
-    /// marks worker errored, releases ownership, fires bus event, sets error.
+    /// marks worker errored, releases ownership, fires bus event (best-effort
+    /// — delivery failures are logged but not propagated), sets error.
     /// Does NOT remove the worktree — preserves the worker's in-progress work.
     fn handlePtyDied(self: *Engine, worker_id: worktree.WorkerId, exit_code: i32) void {
         // State reconciliation: mark errored + release ownership
@@ -450,16 +462,21 @@ pub const Engine = struct {
         // Unwatch PID (no-op if not monitored or already removed)
         self.pty_monitor.unwatch(worker_id);
 
-        // Fire TM_MSG_PTY_DIED on message bus (best-effort)
+        // Notify Team Lead (worker 0) via bus — from=dying_worker, to=team_lead.
+        // Best-effort: delivery failures are logged but reconciliation already succeeded.
         if (self.message_bus) |*b| {
             var buf: [128]u8 = undefined;
-            const payload = std.fmt.bufPrint(&buf, "{{\"worker_id\":{d},\"exit_code\":{d}}}", .{ worker_id, exit_code }) catch return;
-            b.send(0, worker_id, .pty_died, payload) catch {};
+            const payload = std.fmt.bufPrint(&buf, "{{\"worker_id\":{d},\"exit_code\":{d}}}", .{ worker_id, exit_code }) catch
+                "{\"worker_id\":0,\"exit_code\":-1}";
+            b.send(0, worker_id, .pty_died, payload) catch |err| {
+                std.log.err("[teammux] PTY death bus notification failed for worker {d}: {}", .{ worker_id, err });
+            };
         }
 
         // Set last error with worker ID and exit code
         var err_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&err_buf, "worker {d} PTY died with exit code {d}", .{ worker_id, exit_code }) catch return;
+        const msg = std.fmt.bufPrint(&err_buf, "worker {d} PTY died with exit code {d}", .{ worker_id, exit_code }) catch
+            "worker PTY died (details unavailable)";
         self.setError(msg) catch {};
     }
 
@@ -6719,10 +6736,16 @@ test "tm_worker_pty_died fires TM_MSG_PTY_DIED on bus" {
         var received: bool = false;
         var received_type: c_int = -1;
         var received_from: u32 = 0;
+        var received_to: u32 = 0;
+        var payload_has_worker_id: bool = false;
+        var payload_has_exit_code: bool = false;
     };
     State.received = false;
     State.received_type = -1;
     State.received_from = 0;
+    State.received_to = 0;
+    State.payload_has_worker_id = false;
+    State.payload_has_exit_code = false;
 
     const callback = struct {
         fn cb(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
@@ -6730,6 +6753,12 @@ test "tm_worker_pty_died fires TM_MSG_PTY_DIED on bus" {
                 State.received = true;
                 State.received_type = m.msg_type;
                 State.received_from = m.from;
+                State.received_to = m.to;
+                if (m.payload) |p| {
+                    const payload = std.mem.span(p);
+                    State.payload_has_worker_id = std.mem.indexOf(u8, payload, "\"worker_id\":1") != null;
+                    State.payload_has_exit_code = std.mem.indexOf(u8, payload, "\"exit_code\":42") != null;
+                }
             }
             return 0;
         }
@@ -6740,10 +6769,13 @@ test "tm_worker_pty_died fires TM_MSG_PTY_DIED on bus" {
     try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
     _ = tm_worker_pty_died(engine, 1, 42);
 
-    // Verify TM_MSG_PTY_DIED (17) received
+    // Verify TM_MSG_PTY_DIED received with correct routing and payload
     try std.testing.expect(State.received);
-    try std.testing.expect(State.received_type == 17); // TM_MSG_PTY_DIED
-    try std.testing.expect(State.received_from == 1);
+    try std.testing.expect(State.received_type == @intFromEnum(bus.MessageType.pty_died));
+    try std.testing.expect(State.received_from == 1); // from dying worker
+    try std.testing.expect(State.received_to == 0); // to Team Lead (worker 0)
+    try std.testing.expect(State.payload_has_worker_id);
+    try std.testing.expect(State.payload_has_exit_code);
 }
 
 test "tm_worker_pty_died is idempotent" {
