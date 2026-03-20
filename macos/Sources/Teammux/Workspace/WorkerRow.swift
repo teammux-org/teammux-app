@@ -31,6 +31,14 @@ struct WorkerRow: View {
                 .fill(worker.status.color)
                 .frame(width: 8, height: 8)
 
+            // Health indicator dot (only shown when not healthy)
+            if worker.healthStatus != .healthy {
+                Circle()
+                    .fill(worker.healthStatus.color)
+                    .frame(width: 6, height: 6)
+                    .help("Health: \(worker.healthStatus.label)")
+            }
+
             // Role emoji badge (only when role is assigned with non-empty emoji)
             if let role, !role.emoji.isEmpty {
                 Text(role.emoji)
