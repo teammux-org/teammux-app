@@ -182,6 +182,8 @@ pub fn makeTestWorker(alloc: std.mem.Allocator, id: worktree.WorkerId) !worktree
         .agent_binary = try alloc.dupe(u8, "echo"),
         .model = try alloc.dupe(u8, ""),
         .spawned_at = 0,
+        .last_activity_ts = std.time.timestamp(),
+        .health_status = .healthy,
     };
 }
 
