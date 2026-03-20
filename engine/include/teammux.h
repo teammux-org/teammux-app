@@ -474,7 +474,8 @@ tm_result_t tm_peer_delegate(tm_engine_t* engine,
 // {project_root}/.teammux/logs/completion_history.jsonl.
 // Entries are appended on every tm_worker_complete / tm_worker_question
 // call and on every /teammux-complete and /teammux-question command file.
-// Atomic write via read-rewrite-rename pattern.
+// Direct append with async write queue (I15). Auto-rotation at
+// configurable size limit, default 1 MiB (TD24).
 // -----------------------------------------------------------------
 
 typedef struct {
@@ -498,6 +499,11 @@ void tm_history_free(tm_history_entry_t** entries, uint32_t count);
 // Clear all history entries (truncates the JSONL file to zero length).
 // Missing file is a no-op (returns TM_OK).
 tm_result_t tm_history_clear(tm_engine_t* engine);
+
+// Manually trigger history log rotation (TD24).
+// Rotates completion_history.jsonl → .1, .1 → .2, discards old .2.
+// Flushes async queue before rotating. Returns TM_OK on success.
+tm_result_t tm_history_rotate(tm_engine_t* engine);
 
 // -----------------------------------------------------------------
 // Utility

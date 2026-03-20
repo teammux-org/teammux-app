@@ -190,6 +190,15 @@ pub const Engine = struct {
         self.commands_watcher = cmd_watcher;
         self.history_logger = hist_logger;
 
+        // Start async history writer (I15) — must be after commit to self so
+        // the writer thread's self pointer targets the stable Engine-embedded logger.
+        if (self.history_logger) |*logger| {
+            logger.startWriter() catch |err| {
+                std.log.warn("[teammux] history: async writer start failed, writes will be synchronous: {}", .{err});
+                self.setError("history: async writer unavailable — history writes will block the event loop") catch {};
+            };
+        }
+
         // Wire bus routing for PR status events from GitHub polling
         self.github_client.bus_send_fn = busSendBridge;
         self.github_client.bus_send_userdata = self;
@@ -270,6 +279,8 @@ pub const Engine = struct {
         if (self.commands_watcher) |*w| w.stop();
         if (self.config_watcher) |*w| w.stop();
         self.github_client.stopWebhooks();
+        // Stop async history writer — drain queue before session ends
+        if (self.history_logger) |*logger| logger.shutdown();
         // Clean up Team Lead interceptor from project root
         interceptor.remove(self.allocator, self.project_root) catch |err| {
             std.log.warn("[teammux] Team Lead interceptor cleanup failed: {}", .{err});
@@ -1619,8 +1630,26 @@ export fn tm_history_clear(engine: ?*Engine) c_int {
         e.setError("tm_history_clear: history logger not initialized") catch {};
         return 99;
     });
-    logger.clear() catch {
+    logger.clear() catch |err| {
+        std.log.err("[teammux] tm_history_clear failed: {}", .{err});
         e.setError("tm_history_clear: failed to clear history") catch {};
+        return 99;
+    };
+    return 0;
+}
+
+/// Manually trigger history log rotation (TD24).
+/// Rotates completion_history.jsonl → .1, .1 → .2, discards old .2.
+/// Returns TM_OK on success. Flushes async queue before rotating.
+export fn tm_history_rotate(engine: ?*Engine) c_int {
+    const e = engine orelse return 99;
+    var logger = &(e.history_logger orelse {
+        e.setError("tm_history_rotate: history logger not initialized") catch {};
+        return 99;
+    });
+    logger.rotate() catch |err| {
+        std.log.err("[teammux] tm_history_rotate failed: {}", .{err});
+        e.setError("tm_history_rotate: rotation failed") catch {};
         return 99;
     };
     return 0;
@@ -4041,6 +4070,27 @@ test "tm_history_clear null engine returns TM_ERR_UNKNOWN" {
 
 test "tm_history_free handles null" {
     tm_history_free(null, 0);
+}
+
+test "tm_history_rotate null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_history_rotate(null) == 99);
+}
+
+test "tm_history_rotate without session returns TM_ERR_UNKNOWN" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    // history_logger is null without session start
+    try std.testing.expect(tm_history_rotate(engine_ptr) == 99);
 }
 
 test "tm_worker_complete persists to history JSONL via C API" {
