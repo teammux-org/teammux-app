@@ -84,7 +84,9 @@ pub const Coordinator = struct {
         kind: DispatchKind,
         content: []const u8,
     ) !void {
-        // TD33: thread-safe existence check via hasWorker
+        // Check under lock — roster can be mutated concurrently by spawn/dismiss.
+        // TOCTOU: worker could be dismissed between this check and bus.send;
+        // acceptable since bus records delivered=false on failure.
         if (!roster.hasWorker(worker_id)) return error.WorkerNotFound;
 
         var delivered = true;

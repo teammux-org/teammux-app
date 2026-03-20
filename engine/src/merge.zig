@@ -84,7 +84,7 @@ pub const MergeCoordinator = struct {
             if (active != worker_id) return error.MergeInProgress;
         }
 
-        // Look up worker — thread-safe copy (TD33: no raw getWorker in production paths)
+        // Thread-safe: copy fields under lock, safe to use after roster mutations
         const wf = try roster.copyWorkerFields(worker_id, self.allocator) orelse return error.WorkerNotFound;
         defer wf.deinit(self.allocator);
         const branch_name = try self.allocator.dupe(u8, wf.branch_name);
@@ -142,9 +142,10 @@ pub const MergeCoordinator = struct {
             const wt_removed = runGitLoggedWithStderr(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "merge cleanup: worktree remove");
             const br_deleted = runGitLoggedWithStderr(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "merge cleanup: branch delete");
 
-            // Update worker status to complete (keep roster entry for C1 history display)
-            // TD33: thread-safe status mutation via setWorkerStatus
-            _ = roster.setWorkerStatus(worker_id, .complete);
+            // Update worker status under lock — worker may be concurrently read by tm_roster_get
+            if (!roster.setWorkerStatus(worker_id, .complete)) {
+                std.log.warn("[teammux] merge approve: worker {d} vanished from roster after successful merge — status not updated to complete", .{worker_id});
+            }
 
             if (!wt_removed or !br_deleted) return .cleanup_incomplete;
             return .success;
@@ -219,7 +220,7 @@ pub const MergeCoordinator = struct {
         project_root: []const u8,
         worker_id: worktree.WorkerId,
     ) !bool {
-        // Look up worker — thread-safe copy (TD33: no raw getWorker in production paths)
+        // Thread-safe: copy fields under lock, safe to use after roster mutations
         const wf = try roster.copyWorkerFields(worker_id, self.allocator) orelse return error.WorkerNotFound;
         defer wf.deinit(self.allocator);
         const branch_name = try self.allocator.dupe(u8, wf.branch_name);
