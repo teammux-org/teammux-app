@@ -17,6 +17,7 @@ struct ConflictView: View {
 
     @State private var isActionInFlight = false
     @State private var actionError: String?
+    @State private var cleanupWarning: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -85,6 +86,13 @@ struct ConflictView: View {
                     .lineLimit(2)
             }
 
+            if let warning = cleanupWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 11))
+                    .foregroundColor(.orange)
+                    .lineLimit(2)
+            }
+
             HStack(spacing: 12) {
                 Button(action: forceMerge) {
                     if isActionInFlight {
@@ -124,10 +132,15 @@ struct ConflictView: View {
     private func forceMerge() {
         isActionInFlight = true
         actionError = nil
+        cleanupWarning = nil
         Task { @MainActor in
             let success = engine.approveMerge(workerId: worker.id, strategy: .merge)
             if success {
-                dismiss()
+                if let warning = engine.lastError {
+                    cleanupWarning = warning
+                } else {
+                    dismiss()
+                }
             } else {
                 actionError = engine.lastError ?? "Force merge failed"
             }
