@@ -7348,16 +7348,16 @@ test "S15 integration 2: crash recovery — orphaned worktree cleaned on init" {
     // sessionStart loads config which resolves worktree_root, then calls recoverOrphans
     e.sessionStart() catch {
         // sessionStart may fail on bus/history init in minimal env — that's OK,
-        // recovery runs before those steps. Check if orphan was cleaned.
+        // recovery runs before those steps. Still assert orphan was cleaned.
         e.sessionStop();
         tm_engine_destroy(engine_ptr);
 
-        // Verify orphan directory was removed
+        // Verify orphan directory was removed even if sessionStart failed partway
         _ = std.fs.openDirAbsolute(orphan_path, .{}) catch |err| {
             try std.testing.expect(err == error.FileNotFound);
             return; // Success — orphan cleaned despite session start failure
         };
-        return; // Directory still exists but recovery may not have run yet
+        return error.OrphanNotCleaned;
     };
 
     e.sessionStop();
@@ -7386,26 +7386,19 @@ test "S15 integration 3: history rotation — small max_size triggers archive" {
     // Append entries to trigger rotation
     try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "test-role", .content = "completed task alpha with enough content to exceed the sixty-four byte limit", .git_commit = null, .timestamp = 1000 });
 
-    // After first rotation: .jsonl.1 should exist
+    // After first rotation: .jsonl.1 must exist
     const archive1 = try std.fmt.allocPrint(alloc, "{s}/completion_history.jsonl.1", .{logger.dir_path});
     defer alloc.free(archive1);
-    const stat1 = std.fs.cwd().statFile(archive1) catch |err| {
-        // If archive doesn't exist, rotation may not have triggered
-        try std.testing.expect(err != error.FileNotFound);
-        return;
-    };
+    const stat1 = try std.fs.cwd().statFile(archive1);
     try std.testing.expect(stat1.size > 0);
 
     // Append more to trigger second rotation
     try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "second entry also exceeding the sixty-four byte limit for rotation", .git_commit = null, .timestamp = 2000 });
 
-    // .jsonl.2 should now exist (old .1 → .2)
+    // .jsonl.2 must now exist (old .1 → .2)
     const archive2 = try std.fmt.allocPrint(alloc, "{s}/completion_history.jsonl.2", .{logger.dir_path});
     defer alloc.free(archive2);
-    const stat2 = std.fs.cwd().statFile(archive2) catch |err| {
-        try std.testing.expect(err != error.FileNotFound);
-        return;
-    };
+    const stat2 = try std.fs.cwd().statFile(archive2);
     try std.testing.expect(stat2.size > 0);
 
     // .jsonl.3 must NOT exist (max 2 archives)

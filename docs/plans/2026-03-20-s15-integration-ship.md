@@ -10,16 +10,16 @@
 
 ---
 
-### Task 1: Integration Test — Roster Safety (S1)
+## Task 1: Integration Test — Roster Safety (S1)
 
 **Files:**
-- Modify: `engine/src/main.zig` (before line 7223)
+- Modify: `engine/src/main.zig` (before final `test { _ = ... }` line)
 
 **Test:** Spawn 3 workers via C API in a real git repo, dismiss one, verify roster count drops to 2, get roster snapshot again to confirm no use-after-free crash (copyWorkerFields pattern validated).
 
 ---
 
-### Task 2: Integration Test — Crash Recovery (S2)
+## Task 2: Integration Test — Crash Recovery (S2)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -28,7 +28,7 @@
 
 ---
 
-### Task 3: Integration Test — History Rotation (S3)
+## Task 3: Integration Test — History Rotation (S3)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -37,7 +37,7 @@
 
 ---
 
-### Task 4: Integration Test — Bus Reliability / Unknown Command (S4/I6)
+## Task 4: Integration Test — Bus Reliability / Unknown Command (S4/I6)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -46,7 +46,7 @@
 
 ---
 
-### Task 5: Integration Test — Dispatch Delivery Failure (S4/I7)
+## Task 5: Integration Test — Dispatch Delivery Failure (S4/I7)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -55,7 +55,7 @@
 
 ---
 
-### Task 6: Integration Test — PTY Death (S5/I8)
+## Task 6: Integration Test — PTY Death (S5/I8)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -64,7 +64,7 @@
 
 ---
 
-### Task 7: Integration Test — Diff Pagination (S7)
+## Task 7: Integration Test — Diff Pagination (S7)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -73,16 +73,16 @@
 
 ---
 
-### Task 8: Integration Test — Worker Health Stall (S11)
+## Task 8: Integration Test — Worker Health Stall (S11)
 
 **Files:**
 - Modify: `engine/src/main.zig`
 
-**Test:** Create engine, add worker with old last_activity_ts (past threshold), call checkWorkerHealth, verify health_status = .stalled.
+**Test:** Create engine, add worker with old last_activity_ts (400s ago, past 300s default threshold), call checkWorkerHealth(300), verify health_status = .stalled.
 
 ---
 
-### Task 9: Integration Test — Agent Memory (S13)
+## Task 9: Integration Test — Agent Memory (S13)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -91,7 +91,7 @@
 
 ---
 
-### Task 10: Integration Test — MergeCoordinator Conflict Resolution (S10)
+## Task 10: Integration Test — MergeCoordinator Conflict Resolution (S10)
 
 **Files:**
 - Modify: `engine/src/main.zig`
@@ -100,7 +100,7 @@
 
 ---
 
-### Task 11: Documentation Updates
+## Task 11: Documentation Updates
 
 **Files:**
 - Modify: `docs/TECH_DEBT.md` — TD21/24/29/30/33/34/35 → RESOLVED, TD42/43/44 → RESOLVED
@@ -109,7 +109,7 @@
 
 ---
 
-### Task 12: Tag and Release
+## Task 12: Tag and Release
 
 **Commands:**
 - `git tag -a v0.1.6 -m "..."`
