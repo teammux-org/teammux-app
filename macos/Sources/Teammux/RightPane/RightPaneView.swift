@@ -10,81 +10,90 @@ enum RightTab: String, CaseIterable, Identifiable {
     case liveFeed = "Live Feed"
     case dispatch = "Dispatch"
     case context = "Context"
+    case you = "You"
 
     var id: String { rawValue }
 
     var iconName: String {
         switch self {
-        case .teamLead: return "person.fill"
+        case .teamLead: return "terminal"
         case .git:      return "arrow.triangle.branch"
         case .diff:     return "doc.text.magnifyingglass"
-        case .liveFeed: return "antenna.radiowaves.left.and.right"
-        case .dispatch: return "paperplane.fill"
-        case .context:  return "doc.text.fill"
+        case .liveFeed: return "bubble.left.and.bubble.right"
+        case .dispatch: return "paperplane"
+        case .context:  return "doc.text"
+        case .you:      return "person.fill"
         }
+    }
+
+    /// Keyboard shortcut number (1-based) for Cmd+N switching.
+    var shortcutIndex: Int {
+        switch self {
+        case .teamLead: return 1
+        case .git:      return 2
+        case .diff:     return 3
+        case .liveFeed: return 4
+        case .dispatch: return 5
+        case .context:  return 6
+        case .you:      return 7
+        }
+    }
+
+    /// Returns the RightTab for a given shortcut number, or nil.
+    static func fromShortcut(_ number: Int) -> RightTab? {
+        allCases.first { $0.shortcutIndex == number }
     }
 }
 
 // MARK: - RightPaneView
 
-/// Right pane with a custom tab bar (not native segmented control)
-/// routing to a content view for each tab.
-///
-/// The active tab is indicated by a thin underline in accent color.
+/// Right pane with a vertical icon rail on the far right edge
+/// routing to a content view for each pane.
 struct RightPaneView: View {
     @ObservedObject var engine: EngineClient
 
     @State private var activeTab: RightTab = .teamLead
     @State private var diffSelectedWorkerId: UInt32? = nil
     @State private var contextSelectedWorkerId: UInt32? = nil
+    @State private var keyMonitor: Any?
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Custom tab bar
-            tabBar
+        HStack(spacing: 0) {
+            // Pane content
+            tabContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(.easeInOut(duration: 0.15), value: activeTab)
 
             Divider()
 
-            // Tab content
-            tabContent
+            // Vertical icon rail on far right edge
+            PaneIconRail(activeTab: $activeTab)
         }
         .background(Color(nsColor: .controlBackgroundColor))
+        .onAppear { installKeyMonitor() }
+        .onDisappear { removeKeyMonitor() }
     }
 
-    // MARK: - Tab bar
+    // MARK: - Keyboard shortcuts (Cmd+1..7)
 
-    private var tabBar: some View {
-        HStack(spacing: 0) {
-            ForEach(RightTab.allCases) { tab in
-                tabButton(for: tab)
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+                  let chars = event.charactersIgnoringModifiers,
+                  let number = Int(chars),
+                  let tab = RightTab.fromShortcut(number) else {
+                return event
             }
-        }
-        .padding(.horizontal, 4)
-        .padding(.top, 4)
-    }
-
-    private func tabButton(for tab: RightTab) -> some View {
-        Button(action: {
             activeTab = tab
-        }) {
-            VStack(spacing: 4) {
-                HStack(spacing: 4) {
-                    Image(systemName: tab.iconName)
-                        .font(.system(size: 10))
-                    Text(tab.rawValue)
-                        .font(.system(size: 11, weight: activeTab == tab ? .semibold : .regular))
-                }
-                .foregroundColor(activeTab == tab ? .primary : .secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-
-                // Underline indicator
-                Rectangle()
-                    .fill(activeTab == tab ? Color.accentColor : Color.clear)
-                    .frame(height: 2)
-            }
+            return nil
         }
-        .buttonStyle(.plain)
+    }
+
+    private func removeKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
     }
 
     // MARK: - Tab content
@@ -104,6 +113,27 @@ struct RightPaneView: View {
             DispatchView(engine: engine)
         case .context:
             ContextView(engine: engine, selectedWorkerId: $contextSelectedWorkerId)
+        case .you:
+            youPlaceholder
         }
+    }
+
+    // MARK: - You placeholder (S12 will replace with UserTerminalView)
+
+    private var youPlaceholder: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "person.fill")
+                .font(.system(size: 32))
+                .foregroundColor(.secondary)
+            Text("Your Terminal")
+                .font(.headline)
+                .foregroundColor(.secondary)
+            Text("Your Claude Code session will appear here.")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
     }
 }
