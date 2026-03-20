@@ -54,7 +54,7 @@ struct WorkerRow: View {
                 Text(worker.taskDescription)
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .truncationMode(.tail)
 
                 // Role name (only when role is assigned)

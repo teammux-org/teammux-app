@@ -86,17 +86,22 @@ struct RosterView: View {
     // MARK: - Empty roster
 
     private var emptyRoster: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 12) {
             Spacer()
             Image(systemName: "person.2.slash")
-                .font(.system(size: 24))
+                .font(.system(size: 32))
                 .foregroundColor(.secondary)
             Text("No workers yet")
+                .font(.headline)
+                .foregroundColor(.secondary)
+            Text("Spawn workers to begin coordination.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
             Spacer()
         }
         .frame(maxWidth: .infinity)
+        .padding()
     }
 
     // MARK: - Bottom bar

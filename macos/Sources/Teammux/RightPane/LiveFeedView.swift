@@ -253,7 +253,7 @@ struct LiveFeedView: View {
 
     private var emptyState: some View {
         VStack(spacing: 12) {
-            Image(systemName: "antenna.radiowaves.left.and.right")
+            Image(systemName: "bubble.left.and.bubble.right")
                 .font(.system(size: 32))
                 .foregroundColor(.secondary)
 
@@ -261,7 +261,7 @@ struct LiveFeedView: View {
                 .font(.headline)
                 .foregroundColor(.secondary)
 
-            Text("Messages between the Team Lead and workers will appear here.")
+            Text("Messages and events will appear here as workers coordinate.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)

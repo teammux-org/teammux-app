@@ -124,6 +124,13 @@
 | TD53 | GitWorkerRow / ConflictView | No os.Logger — merge action warnings/errors not logged, unlike PRCardView                      | v0.1.7 | NO       | OPEN   |
 | TD54 | EngineClient.swift          | getMergeStatus() clears lastError as side effect — compound methods lose intermediate warnings  | v0.1.7 | NO       | OPEN   |
 
+## v0.1.6 S14 — Open debt
+
+| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
+| TD55 | RightPane views (Swift)  | Empty state pattern duplicated across 6+ views — extract shared EmptyStateView     | v0.2   | NO       | OPEN   |
+| TD56 | RightPaneView.swift      | Cmd+1..7 shortcuts use window-scoped NSEvent monitor — may conflict with future menu shortcuts | v0.2   | NO       | OPEN   |
+
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
 - TD16: CompletionReport and QuestionRequest cards ephemeral across sessions. T5 adds history.zig JSONL persistence, T10 adds Swift bridge loading on sessionStart with collapsible history section in LiveFeedView.
@@ -169,3 +176,5 @@
 - TD47: rotate() does delete .2, rename .1→.2, rename .jsonl→.1 sequentially. If the third rename fails, .2 is already deleted and .1 already moved. Next rotation would lose the generation in .2. Fix: reverse order (rename .jsonl→.1 first) or add rollback. Discovered during v0.1.6-S3 review.
 - TD48: queue_dropped counter increments on overflow but is never exposed. No C API to query drop count, no setError on first drop. Fix: add tm_history_queue_stats export or call setError on first drop. Discovered during v0.1.6-S3 review.
 - TD49: tm_history_load returns NULL with count=0 for both empty history and load failure. Swift callers cannot distinguish. setError is called on failure but not on "logger not initialized". Fix: differentiate via count sentinel or additional out parameter. Pre-existing pattern, surfaced during v0.1.6-S3 review.
+- TD55: GitView, DiffView, DispatchView, LiveFeedView, ContextView, RosterView, and RightPaneView (youPlaceholder) all use identical empty state structure (VStack with 32pt icon, headline, subheadline). Extract a shared EmptyStateView(icon:title:subtitle:) component. Target v0.2.
+- TD56: RightPaneView installs an NSEvent.addLocalMonitorForEvents for Cmd+1..7. This swallows the events before they reach the responder chain. If the app later adds menu bar items with Cmd+1..7 shortcuts, they will conflict. Consider migrating to SwiftUI .commands() at the App/Scene level. Target v0.2.
