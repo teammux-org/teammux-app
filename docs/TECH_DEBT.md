@@ -40,13 +40,13 @@
 | TD19 | interceptor.zig             | Interceptor exit code indistinguishable from git errors            | T3     | NO       | RESOLVED |
 | TD20 | EngineClient                | lastError is shared mutable state — stale errors bleed across calls| T6     | NO       | RESOLVED |
 
-## v0.1.4 — Open debt (target updated to v0.1.6)
+## v0.1.4 — Partially resolved (target updated to v0.1.6)
 
-| ID   | Module                   | Issue                                                            | Target | Breaking | Status  |
-|------|--------------------------|------------------------------------------------------------------|--------|----------|---------|
-| TD21 | worktree_lifecycle.zig   | Dangling worktrees if engine crashes mid-spawn                   | v0.1.6 | NO       | OPEN    |
-| TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | PARTIAL |
-| TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.1.6 | NO       | OPEN    |
+| ID   | Module                   | Issue                                                            | Target | Breaking | Status   |
+|------|--------------------------|------------------------------------------------------------------|--------|----------|----------|
+| TD21 | worktree_lifecycle.zig   | Dangling worktrees if engine crashes mid-spawn                   | v0.1.6 | NO       | RESOLVED |
+| TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | PARTIAL  |
+| TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.1.6 | NO       | RESOLVED |
 
 ## v0.1.5 — Resolved
 
@@ -62,37 +62,37 @@
 | TD36 | main.zig                 | tm_interceptor_path worker 0 OOM returns null without setError| S3     | NO       | RESOLVED |
 | TD37 | main.zig                 | sessionStop TL interceptor cleanup failure not surfaced       | S3     | NO       | RESOLVED |
 
-## Audit-address sprint — Open debt (target updated to v0.1.6)
+## Audit-address sprint — Resolved (v0.1.6)
 
 | ID   | Module                      | Issue                                                                              | Target | Breaking | Status |
 |------|-----------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
-| TD29 | teammux.h                   | 15 dead C exports have no deprecation annotation in the header                     | v0.1.6 | NO       | OPEN   |
-| TD30 | teammux.h                   | TM_ERR_PTY (6) is defined but no function returns it after PTY removal             | v0.1.6 | NO       | OPEN   |
-| TD33 | merge.zig / coordinator.zig | getWorker() returns raw pointer without lock in production paths                   | v0.1.6 | NO       | OPEN   |
-| TD34 | main.zig (tm_roster_get)    | Roster iteration uses raw pointers without holding roster mutex                    | v0.1.6 | NO       | OPEN   |
-| TD35 | worktree.zig                | Roster.claimNextId leaks ID slot when subsequent spawn step fails                  | v0.1.6 | NO       | OPEN   |
+| TD29 | teammux.h                   | 15 dead C exports have no deprecation annotation in the header                     | v0.1.6 | NO       | RESOLVED |
+| TD30 | teammux.h                   | TM_ERR_PTY (6) is defined but no function returns it after PTY removal             | v0.1.6 | NO       | RESOLVED |
+| TD33 | merge.zig / coordinator.zig | getWorker() returns raw pointer without lock in production paths                   | v0.1.6 | NO       | RESOLVED |
+| TD34 | main.zig (tm_roster_get)    | Roster iteration uses raw pointers without holding roster mutex                    | v0.1.6 | NO       | RESOLVED |
+| TD35 | worktree.zig                | Roster.claimNextId leaks ID slot when subsequent spawn step fails                  | v0.1.6 | NO       | RESOLVED |
 
-## v0.1.5 S2 — Open debt (target updated to v0.1.6)
+## v0.1.5 S2 — Partially resolved (TD39 deferred to v0.2)
 
 | ID   | Module                   | Issue                                                                                    | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------------|--------|----------|--------|
 | TD38 | GitView / ConflictView   | UI callers don't surface CLEANUP_INCOMPLETE warning — lastError only checked on !success | v0.1.6 | NO       | RESOLVED |
 | TD39 | merge.zig (test)         | cleanup_incomplete integration test is non-deterministic                                  | v0.2   | NO       | OPEN   |
 
-## v0.1.5 S5 — Open debt (target updated to v0.1.6)
+## v0.1.5 S5 — Resolved (v0.1.6)
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
 | TD40 | github.zig               | getDiff limited to 100 files (no pagination), 1 MiB buffer cap                    | v0.1.6 | NO       | RESOLVED |
 | TD41 | DiffView.swift           | loadDiff calls engine.getDiff synchronously on MainActor, blocking UI              | v0.1.6 | NO       | RESOLVED |
 
-## v0.1.5 S6 — Open debt (target updated to v0.1.6)
+## v0.1.5 S6 — Resolved (v0.1.6)
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
-| TD42 | ContextView.swift        | LCS changedLineIndices has no unit tests                                           | v0.1.6 | NO       | OPEN   |
-| TD43 | hotreload.zig            | reload_count value never asserted in Zig tests                                     | v0.1.6 | NO       | OPEN   |
-| TD44 | ContextView.swift        | LCS DP table uses O(m*n) memory — two-row optimization deferred                    | v0.1.6 | NO       | OPEN   |
+| TD42 | ContextView.swift        | LCS changedLineIndices has no unit tests                                           | v0.1.6 | NO       | RESOLVED |
+| TD43 | hotreload.zig            | reload_count value never asserted in Zig tests                                     | v0.1.6 | NO       | RESOLVED |
+| TD44 | ContextView.swift        | LCS DP table uses O(m*n) memory — two-row optimization deferred                    | v0.1.6 | NO       | RESOLVED |
 
 ## v0.1.6 S2 — Open debt
 

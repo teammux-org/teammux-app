@@ -1,8 +1,9 @@
 # Teammux v0.1.6 — Sprint Master Spec
 
 **Theme:** Depth & Polish
-**Status:** In Progress
+**Status:** Complete
 **Baseline:** v0.1.5 tag, 388 engine tests passing
+**Final:** v0.1.6 tag, 475 engine tests passing
 
 ## Objective
 
