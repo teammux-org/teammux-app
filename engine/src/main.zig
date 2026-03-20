@@ -158,6 +158,10 @@ pub const Engine = struct {
         };
         errdefer msg_bus.deinit();
 
+        // I13: Wire error notification callback so PR delivery failures surface via setError
+        msg_bus.error_notify_cb = busErrorNotifyCallback;
+        msg_bus.error_notify_userdata = self;
+
         const cmd_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/commands", .{self.project_root});
         defer self.allocator.free(cmd_dir);
 
@@ -170,6 +174,10 @@ pub const Engine = struct {
         // Wire bus routing for /teammux-complete and /teammux-question
         cmd_watcher.bus_send_fn = busSendBridge;
         cmd_watcher.bus_send_userdata = self;
+
+        // I6: Wire error callback so command failures surface via setError
+        cmd_watcher.error_cb = commandErrorCallback;
+        cmd_watcher.error_cb_userdata = self;
 
         var hist_logger = history_mod.HistoryLogger.init(self.allocator, self.project_root) catch |err| {
             self.setError("history logger init failed") catch {};
@@ -824,6 +832,32 @@ export fn tm_github_webhooks_stop(engine: ?*Engine, sub: u32) void { _ = sub; if
 
 // ─── Commands ────────────────────────────────────────────
 
+/// I6: Error callback for CommandWatcher — surfaces command processing errors via setError.
+fn commandErrorCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
+        std.log.warn("[teammux] commandErrorCallback: null engine pointer", .{});
+        return;
+    }));
+    if (msg) |m| {
+        engine.setError(std.mem.span(m)) catch |err| {
+            std.log.err("[teammux] commandErrorCallback: setError failed: {s}", .{@errorName(err)});
+        };
+    }
+}
+
+/// I13: Error callback for MessageBus — surfaces PR delivery failures via setError.
+fn busErrorNotifyCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
+        std.log.warn("[teammux] busErrorNotifyCallback: null engine pointer", .{});
+        return;
+    }));
+    if (msg) |m| {
+        engine.setError(std.mem.span(m)) catch |err| {
+            std.log.err("[teammux] busErrorNotifyCallback: setError failed: {s}", .{@errorName(err)});
+        };
+    }
+}
+
 // Command routing wrapper — add new /teammux-* command handlers as additional branches below.
 fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
     const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
@@ -1166,6 +1200,10 @@ export fn tm_dispatch_task(engine: ?*Engine, target_worker_id: u32, instruction:
             e.setError("tm_dispatch_task: worker not found") catch {};
             return 12; // TM_ERR_INVALID_WORKER
         }
+        if (err == error.DeliveryFailed) {
+            e.setError("tm_dispatch_task: delivery failed after retries") catch {};
+            return 16; // TM_ERR_DELIVERY_FAILED
+        }
         e.setError("tm_dispatch_task: dispatch failed") catch {};
         return 8;
     };
@@ -1185,6 +1223,10 @@ export fn tm_dispatch_response(engine: ?*Engine, target_worker_id: u32, response
         if (err == error.WorkerNotFound) {
             e.setError("tm_dispatch_response: worker not found") catch {};
             return 12; // TM_ERR_INVALID_WORKER
+        }
+        if (err == error.DeliveryFailed) {
+            e.setError("tm_dispatch_response: delivery failed after retries") catch {};
+            return 16; // TM_ERR_DELIVERY_FAILED
         }
         e.setError("tm_dispatch_response: dispatch failed") catch {};
         return 8;
@@ -2478,6 +2520,7 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         11 => "TM_ERR_TIMEOUT", 12 => "TM_ERR_INVALID_WORKER", 13 => "TM_ERR_ROLE",
         14 => "TM_ERR_OWNERSHIP",
         15 => "TM_ERR_CLEANUP_INCOMPLETE",
+        16 => "TM_ERR_DELIVERY_FAILED",
         else => "TM_ERR_UNKNOWN",
     };
 }

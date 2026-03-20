@@ -45,9 +45,8 @@ pub const Coordinator = struct {
 
     /// Dispatch a task instruction to a specific worker.
     /// Validates worker exists in roster, routes through bus, records in history.
-    /// If bus delivery fails, the event is still recorded with delivered=false
-    /// and a warning is logged. The function returns success in this case —
-    /// callers should check dispatch history for delivery status.
+    /// If bus delivery fails, the event is recorded with delivered=false
+    /// and error.DeliveryFailed is returned so callers can surface the failure.
     pub fn dispatchTask(
         self: *Coordinator,
         roster: *worktree.Roster,
@@ -100,6 +99,9 @@ pub const Coordinator = struct {
         };
 
         try self.recordEvent(worker_id, content, delivered, kind);
+
+        // I7: Propagate delivery failure so callers can surface it
+        if (!delivered) return error.DeliveryFailed;
     }
 
     fn recordEvent(
@@ -334,7 +336,7 @@ test "coordinator - deinit frees all history strings" {
     // If deinit fails to free, testing allocator will panic with leak report
 }
 
-test "coordinator - delivery failure records event with delivered=false" {
+test "coordinator - delivery failure returns DeliveryFailed and records event (I7)" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -360,10 +362,49 @@ test "coordinator - delivery failure records event with delivered=false" {
     var coord = Coordinator.init(alloc);
     defer coord.deinit();
 
-    try coord.dispatchTask(&roster, &message_bus, 1, "will fail delivery");
+    // I7: DeliveryFailed is now propagated to caller
+    try std.testing.expectError(error.DeliveryFailed, coord.dispatchTask(&roster, &message_bus, 1, "will fail delivery"));
 
+    // Event still recorded with delivered=false
     const history = coord.getHistory();
     try std.testing.expect(history.len == 1);
     try std.testing.expect(history[0].delivered == false);
     try std.testing.expectEqualStrings("will fail delivery", history[0].instruction);
+}
+
+test "coordinator - dispatchResponse delivery failure returns DeliveryFailed (I7)" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(log_dir);
+
+    var message_bus = try bus.MessageBus.init(alloc, log_dir, "cordrspf", log_dir);
+    defer message_bus.deinit();
+    message_bus.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const callback = struct {
+        fn cb(_: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            return 8; // always fail
+        }
+    }.cb;
+    message_bus.subscribe(callback, null);
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+    try roster.workers.put(2, try makeTestWorker(alloc, 2));
+
+    var coord = Coordinator.init(alloc);
+    defer coord.deinit();
+
+    // I7: DeliveryFailed propagated from dispatchResponse too
+    try std.testing.expectError(error.DeliveryFailed, coord.dispatchResponse(&roster, &message_bus, 2, "answer will fail"));
+
+    // Event still recorded with delivered=false and response kind
+    const history = coord.getHistory();
+    try std.testing.expect(history.len == 1);
+    try std.testing.expect(history[0].delivered == false);
+    try std.testing.expect(history[0].kind == .response);
+    try std.testing.expectEqualStrings("answer will fail", history[0].instruction);
 }
