@@ -313,6 +313,7 @@ const CDiff = extern struct {
 const CConflict = extern struct {
     file_path: ?[*:0]const u8, conflict_type: ?[*:0]const u8,
     ours: ?[*:0]const u8, theirs: ?[*:0]const u8,
+    resolution: c_int,
 };
 const CRole = extern struct {
     id: ?[*:0]const u8, name: ?[*:0]const u8, division: ?[*:0]const u8,
@@ -341,8 +342,8 @@ comptime {
     if (@sizeOf(CWorkerInfo) != 72) @compileError("CWorkerInfo size mismatch with tm_worker_info_t");
     // CMessage (bus.zig): u32 + u32 + c_int + ptr + u64 + u64 + ptr = 48 bytes on arm64
     if (@sizeOf(bus.CMessage) != 48) @compileError("CMessage size mismatch with tm_message_t");
-    // CConflict: 4 ptrs = 32 bytes on arm64
-    if (@sizeOf(CConflict) != 32) @compileError("CConflict size mismatch with tm_conflict_t");
+    // CConflict: 4 ptrs(32) + c_int(4) + pad(4) = 40 bytes on arm64
+    if (@sizeOf(CConflict) != 40) @compileError("CConflict size mismatch with tm_conflict_t");
     // CRole: 5 ptrs + 2*(ptr + u32) + 2 bools + pad = 72 bytes on arm64
     if (@sizeOf(CRole) != 72) @compileError("CRole size mismatch with tm_role_t");
     // COwnershipEntry: ptr(8) + u32(4) + bool(1) + pad(3) = 16 bytes on arm64
@@ -1677,6 +1678,7 @@ export fn tm_merge_conflicts_get(engine: ?*Engine, worker_id: u32, count: ?*u32)
     };
     if (conflicts.len == 0) { if (count) |c| c.* = 0; return null; }
 
+    const resolutions = e.merge_coordinator.getResolutions(worker_id);
     const alloc = e.allocator;
     const ptrs = alloc.alloc(?*CConflict, conflicts.len) catch { if (count) |c| c.* = 0; return null; };
     for (conflicts, 0..) |conf, i| {
@@ -1684,7 +1686,7 @@ export fn tm_merge_conflicts_get(engine: ?*Engine, worker_id: u32, count: ?*u32)
             for (0..i) |j| freeCConflict(ptrs[j]);
             alloc.free(ptrs); if (count) |c| c.* = 0; return null;
         };
-        cc.* = fillCConflict(alloc, conf) catch {
+        cc.* = fillCConflict(alloc, conf, resolutions) catch {
             alloc.destroy(cc);
             for (0..i) |j| freeCConflict(ptrs[j]);
             alloc.free(ptrs); if (count) |c| c.* = 0; return null;
@@ -1698,6 +1700,67 @@ export fn tm_merge_conflicts_free(conflicts: ?[*]?*CConflict, count: u32) void {
     const ptrs = conflicts orelse return;
     for (0..count) |i| freeCConflict(ptrs[i]);
     std.heap.c_allocator.free(ptrs[0..count]);
+}
+export fn tm_conflict_resolve(engine: ?*Engine, worker_id: u32, file_path: ?[*:0]const u8, resolution: c_int) c_int {
+    const e = engine orelse return 99;
+    const fp = std.mem.span(file_path orelse {
+        e.setError("tm_conflict_resolve: file_path is NULL") catch {};
+        return 12;
+    });
+    const res: merge.ConflictResolution = switch (resolution) {
+        0 => .ours,
+        1 => .theirs,
+        2 => .skip,
+        else => {
+            e.setError("tm_conflict_resolve: invalid resolution value") catch {};
+            return 12;
+        },
+    };
+    e.merge_coordinator.resolveConflict(e.project_root, worker_id, fp, res) catch |err| {
+        e.setError(switch (err) {
+            error.NoActiveMerge => "conflict resolve failed: no active merge for this worker",
+            error.NoConflicts => "conflict resolve failed: no conflicts for this worker",
+            error.FileNotInConflicts => "conflict resolve failed: file not in conflict list",
+            error.InvalidResolution => "conflict resolve failed: invalid resolution",
+            error.GitFailed => "conflict resolve failed: git operation failed",
+            else => "conflict resolve failed",
+        }) catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    };
+    return 0;
+}
+export fn tm_conflict_finalize(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    // Stop and remove role watcher before finalize cleanup
+    if (e.role_watchers.fetchRemove(worker_id)) |kv| {
+        kv.value.destroy();
+    }
+    // Remove interceptor wrapper before worktree is deleted
+    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
+        std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
+        break :blk null;
+    }) |wf| {
+        defer wf.deinit(e.allocator);
+        interceptor.remove(e.allocator, wf.worktree_path) catch |err| {
+            std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
+        };
+    }
+    const result = e.merge_coordinator.finalizeMerge(&e.roster, e.project_root, worker_id) catch |err| {
+        e.setError(switch (err) {
+            error.NoActiveMerge => "conflict finalize failed: no active merge for this worker",
+            error.NoConflicts => "conflict finalize failed: no conflicts for this worker",
+            error.UnresolvedConflicts => "conflict finalize failed: unresolved files remain",
+            error.GitFailed => "conflict finalize failed: git commit failed",
+            else => "conflict finalize failed",
+        }) catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    };
+    e.ownership_registry.release(worker_id);
+    if (result == .cleanup_incomplete) {
+        e.setError("merge finalized but cleanup incomplete — manual worktree/branch removal may be needed") catch {};
+        return 15; // TM_ERR_CLEANUP_INCOMPLETE
+    }
+    return 0;
 }
 
 // ─── Roles ───────────────────────────────────────────────
@@ -2541,12 +2604,16 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return buf;
 }
 
-fn fillCConflict(alloc: std.mem.Allocator, c: merge.Conflict) !CConflict {
+fn fillCConflict(alloc: std.mem.Allocator, c: merge.Conflict, resolutions: ?*std.StringHashMap(merge.ConflictResolution)) !CConflict {
     const fp = try alloc.dupeZ(u8, c.file_path); errdefer alloc.free(fp);
     const ct = try alloc.dupeZ(u8, c.conflict_type); errdefer alloc.free(ct);
     const ours = try alloc.dupeZ(u8, c.ours); errdefer alloc.free(ours);
     const theirs = try alloc.dupeZ(u8, c.theirs);
-    return .{ .file_path = fp.ptr, .conflict_type = ct.ptr, .ours = ours.ptr, .theirs = theirs.ptr };
+    const res: c_int = if (resolutions) |r|
+        @intFromEnum(r.get(c.file_path) orelse merge.ConflictResolution.pending)
+    else
+        @intFromEnum(merge.ConflictResolution.pending);
+    return .{ .file_path = fp.ptr, .conflict_type = ct.ptr, .ours = ours.ptr, .theirs = theirs.ptr, .resolution = res };
 }
 
 fn freeCConflict(ptr: ?*CConflict) void {
@@ -2662,6 +2729,8 @@ test "tm_merge_conflicts_get null returns null" {
     try std.testing.expect(count == 0);
 }
 test "tm_merge_conflicts_free handles null" { tm_merge_conflicts_free(null, 0); }
+test "tm_conflict_resolve null engine returns TM_ERR_UNKNOWN" { try std.testing.expect(tm_conflict_resolve(null, 0, null, 0) == 99); }
+test "tm_conflict_finalize null engine returns TM_ERR_UNKNOWN" { try std.testing.expect(tm_conflict_finalize(null, 0) == 99); }
 
 // ─── Role API tests ──────────────────────────────────────
 
