@@ -83,8 +83,8 @@
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
-| TD40 | github.zig               | getDiff limited to 100 files (no pagination), 1 MiB buffer cap                    | v0.1.6 | NO       | OPEN   |
-| TD41 | DiffView.swift           | loadDiff calls engine.getDiff synchronously on MainActor, blocking UI              | v0.1.6 | NO       | OPEN   |
+| TD40 | github.zig               | getDiff limited to 100 files (no pagination), 1 MiB buffer cap                    | v0.1.6 | NO       | RESOLVED |
+| TD41 | DiffView.swift           | loadDiff calls engine.getDiff synchronously on MainActor, blocking UI              | v0.1.6 | NO       | RESOLVED |
 
 ## v0.1.5 S6 — Open debt (target updated to v0.1.6)
 
@@ -108,6 +108,14 @@
 | TD47 | history.zig                | rotate() partial-rename can leave archives inconsistent if middle rename fails              | v0.2   | NO       | OPEN   |
 | TD48 | history.zig                | enqueue() queue_dropped counter has no external consumer — not queryable via C API          | v0.2   | NO       | OPEN   |
 | TD49 | main.zig (tm_history_load) | Returns NULL for both "no entries" and "error" — ambiguous for Swift callers                | v0.2   | NO       | OPEN   |
+
+## v0.1.6 S7 — Open debt
+
+| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
+| TD50 | DiffView / EngineClient  | Task.detached calls @MainActor getDiff without await — latent strict-concurrency violation | v0.2   | NO       | OPEN   |
+| TD51 | github.zig               | runGhCommand discards stderr — gh failures produce opaque GhCommandFailed errors   | v0.2   | NO       | OPEN   |
+| TD52 | github.zig               | readToEndAlloc StreamTooLong leaves child process un-waited (potential zombie)      | v0.2   | NO       | OPEN   |
 
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
@@ -135,8 +143,8 @@
 - TD37: RESOLVED (v0.1.5-S3). setError on sessionStop interceptor cleanup failure.
 - TD38: UI callers never display CLEANUP_INCOMPLETE warning — only checked on !success path. GitView.approveMerge, rejectMerge, PREventCard.approveMerge, rejectMerge, ConflictView.forceMerge all affected. Target moved v0.2 → v0.1.6.
 - TD39: merge.zig cleanup_incomplete test non-deterministic. Remains v0.2.
-- TD40: getDiff uses ?per_page=100 without --paginate. PRs >100 files silently truncated. runGhCommand caps at 1 MiB. Target moved v0.2 → v0.1.6.
-- TD41: DiffView.loadDiff wraps getDiff in Task { @MainActor in } — blocks main thread 1-5s during gh subprocess. Target moved v0.2 → v0.1.6.
+- TD40: RESOLVED (v0.1.6-S7). getDiff uses --paginate --slurp --jq 'add // []' for full pagination. runGhCommand accepts configurable max_output (10 MiB for getDiff). Page count logged.
+- TD41: RESOLVED (v0.1.6-S7). loadDiff uses Task.detached with engine captured before detach and result dispatched via await MainActor.run. Loading spinner renders during fetch.
 - TD42: changedLineIndices has no unit tests. Target moved v0.2 → v0.1.6.
 - TD43: reload_count value never asserted in Zig tests. Target moved v0.2 → v0.1.6.
 - TD44: LCS DP table O(m*n) memory. Two-row optimization deferred. Target moved v0.2 → v0.1.6.
@@ -144,6 +152,9 @@
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - TD45: recoverOrphans() and cleanupOrphanBranches() added in v0.1.6-S2 have no unit tests. Integration test would need to create a git repo, spawn a worktree via lifecycle, remove the registry entry without git cleanup, then call recoverOrphans and assert directory/branch removal. Target v0.1.7.
+- TD50: Task.detached calls @MainActor-isolated getDiff(for:) without await. Works in non-strict concurrency mode (call runs off MainActor as intended). Under -strict-concurrency=complete, getDiff needs nonisolated annotation or the C FFI call must be extracted to a nonisolated wrapper.
+- TD51: runGhCommand sets stderr_behavior=.Ignore. gh failures (auth expired, rate limit, network errors) produce opaque GhCommandFailed with no diagnostic. Capture stderr and log at warn level before returning error.
+- TD52: When readToEndAlloc hits max_output limit, it returns error.StreamTooLong via try, skipping child.wait(). The gh child process is never reaped. Catch StreamTooLong, kill+wait the child, then return the error.
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.
 - TD46: writerLoop catches writeToDisk errors and logs at .err, but the entry is freed and lost. Transient disk errors (full, permission, NFS) cause permanent data loss. Fix: retry with backoff or dead-letter queue. Discovered during v0.1.6-S3 review.
 - TD47: rotate() does delete .2, rename .1→.2, rename .jsonl→.1 sequentially. If the third rename fails, .2 is already deleted and .1 already moved. Next rotation would lose the generation in .2. Fix: reverse order (rename .jsonl→.1 first) or add rollback. Discovered during v0.1.6-S3 review.
