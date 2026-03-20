@@ -2443,8 +2443,10 @@ export fn tm_memory_append(engine: ?*Engine, worker_id: u32, summary: ?[*:0]cons
     };
     const now: u64 = @intCast(std.time.timestamp());
     memory_mod.append(e.allocator, wt_path, sum, now) catch |err| {
-        e.setError(std.fmt.allocPrint(e.allocator, "tm_memory_append: write failed: {}", .{err}) catch
-            "tm_memory_append: write failed") catch {};
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "tm_memory_append: write failed: {s}", .{@errorName(err)}) catch
+            "tm_memory_append: write failed";
+        e.setError(msg) catch {};
         return 5; // TM_ERR_WORKTREE — filesystem write error in worktree
     };
     return 0;
@@ -2460,8 +2462,10 @@ export fn tm_memory_read(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
         return null;
     };
     const content = memory_mod.read(e.allocator, wt_path) catch |err| {
-        e.setError(std.fmt.allocPrint(e.allocator, "tm_memory_read: read failed: {}", .{err}) catch
-            "tm_memory_read: read failed") catch {};
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "tm_memory_read: read failed: {s}", .{@errorName(err)}) catch
+            "tm_memory_read: read failed";
+        e.setError(msg) catch {};
         return null;
     } orelse return null; // file-not-found — no setError, expected case
     defer e.allocator.free(content);

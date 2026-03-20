@@ -151,7 +151,7 @@ test "memory - read returns null for missing file" {
 }
 
 test "memory - formatTimestamp produces ISO 8601" {
-    // 2024-03-21T06:26:40Z
+    // 1711000000 = 2024-03-21T05:46:40Z
     const ts = try formatTimestamp(std.testing.allocator, 1711000000);
     defer std.testing.allocator.free(ts);
     try std.testing.expectEqualStrings("2024-03-21T05:46:40Z", ts);
