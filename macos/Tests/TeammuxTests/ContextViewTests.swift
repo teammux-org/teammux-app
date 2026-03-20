@@ -120,4 +120,24 @@ struct ContextViewLCSTests {
         // "b" and "c" are LCS; "a" is new at index 0
         #expect(result == Set([0]))
     }
+
+    // MARK: - Duplicate/repeated lines
+
+    @Test func duplicateLines() {
+        let old = ["a", "b", "a"]
+        let new = ["a", "a", "b"]
+        let result = ContextView.changedLineIndices(old: old, new: new)
+        // LCS length 2 ("a","b"); new index 1 ("a") is the non-LCS element
+        #expect(result.count == 1)
+    }
+
+    // MARK: - Trailing empty string (real-world from components(separatedBy:))
+
+    @Test func trailingEmptyString() {
+        let old = ["line 1", "line 2", ""]
+        let new = ["line 1", "CHANGED", ""]
+        let result = ContextView.changedLineIndices(old: old, new: new)
+        // "line 1" and "" are LCS; only index 1 changed
+        #expect(result == Set([1]))
+    }
 }

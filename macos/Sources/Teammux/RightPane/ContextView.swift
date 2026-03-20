@@ -323,9 +323,10 @@ struct ContextView: View {
     /// Compute indices of lines in `newLines` that are NOT part of the LCS
     /// with `oldLines` — these are truly added or changed lines.
     ///
-    /// TD44: Uses two-row optimization — O(n) space for LCS lengths instead
-    /// of O(m*n). A compact UInt8 direction table is used for backtracking
-    /// (1 byte per cell vs 8 bytes for the former full Int DP table).
+    /// TD44: Two-row optimization reduces LCS length computation from O(m*n)
+    /// to O(n) space. A flat UInt8 direction table (m*n bytes) replaces the
+    /// former Int 2D DP table (m*n*8 bytes) for backtracking — 8x reduction
+    /// in peak memory, same O(m*n) asymptotic total.
     static func changedLineIndices(old oldLines: [String], new newLines: [String]) -> Set<Int> {
         let m = oldLines.count
         let n = newLines.count
