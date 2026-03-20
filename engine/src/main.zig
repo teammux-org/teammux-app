@@ -5989,10 +5989,11 @@ test "C4 - tm_ownership_update rejects write grants for worker 0" {
 
 // ─── S8 integration tests ─────────────────────────────────
 
-test "S8 scenario 1: updateRepo thread safety — mutex protects concurrent repo swap" {
-    // Verify that updateRepo() and pollEvents() can operate concurrently without
-    // use-after-free. updateRepo() dupes new before locking, swaps under lock,
-    // frees old outside lock. pollEvents() copies repo under lock.
+test "S8 scenario 1: updateRepo thread safety — mutex serializes repo swap" {
+    // Verify that updateRepo() correctly dupes new value, swaps under lock,
+    // and frees old outside lock. Confirms the mutex is available after
+    // operations (not stuck locked). Sequential test — actual concurrency
+    // is safe by the dupe-before-lock/free-after-unlock design pattern.
     const alloc = std.testing.allocator;
 
     var client = try github.GitHubClient.init(alloc, "owner/initial-repo");
@@ -6022,9 +6023,10 @@ test "S8 scenario 1: updateRepo thread safety — mutex protects concurrent repo
     try std.testing.expectEqualStrings("owner/restored-repo", client.repo.?);
 }
 
-test "S8 scenario 1b: updateRepo under polling — pollEvents reads repo copy safely" {
-    // Simulate the exact race: pollEvents takes a repo copy under lock,
-    // then updateRepo swaps repo. The copy should remain valid.
+test "S8 scenario 1b: updateRepo value isolation — snapshot survives swap" {
+    // Verify value isolation: a repo string copied under lock remains valid
+    // and unchanged after updateRepo swaps the underlying repo. Demonstrates
+    // that the snapshot-and-swap pattern produces correct results.
     const alloc = std.testing.allocator;
 
     var client = try github.GitHubClient.init(alloc, "owner/poll-repo");
@@ -6098,8 +6100,10 @@ test "S8 scenario 1c: config reload calls updateRepo via tm_config_reload path" 
 }
 
 test "S8 scenario 2: merge cleanup incomplete returns correct status and logs stderr" {
-    // Verify MergeCoordinator.approve returns .cleanup_incomplete when
-    // merge succeeds but worktree cleanup fails.
+    // NOTE: Non-deterministic (see TD39). On some git versions, the pre-removed
+    // worktree may not cause cleanup failure, resulting in .success instead of
+    // .cleanup_incomplete. Validates the code path compiles and runs but may
+    // not exercise the cleanup_incomplete variant on all systems.
     // Strategy: commit on worker branch, pre-remove worktree (but keep branch
     // so git merge can find commits), then approve. Merge succeeds but
     // cleanup of the already-removed worktree fails → cleanup_incomplete.
@@ -6165,10 +6169,11 @@ test "S8 scenario 2c: MergeCoordinator.ApproveResult has cleanup_incomplete vari
     try std.testing.expect(result != .conflict);
 }
 
-test "S8 scenario 3: session restore ownership — register, release, re-register" {
-    // Simulate session restore: register ownership rules for a worker,
-    // release them (simulating session save/stop), then re-register
-    // (simulating restore). Verify deny patterns are enforced after restore.
+test "S8 scenario 3: ownership register-release-reregister cycle" {
+    // Verify the C API supports the register-release-reregister cycle that
+    // Swift's session restore relies on. The actual restore path
+    // (restoreSession → spawnWorker → role resolution) is Swift-side;
+    // this test confirms the engine-side contract.
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6218,9 +6223,10 @@ test "S8 scenario 3: session restore ownership — register, release, re-registe
     try std.testing.expect(allowed == true);
 }
 
-test "S8 scenario 3b: ownership survives engine destroy and re-create" {
-    // Simulate full session lifecycle: create engine, register ownership,
-    // destroy engine, create new engine, re-register, verify enforcement.
+test "S8 scenario 3b: ownership resets on engine destroy — re-register restores enforcement" {
+    // Full session lifecycle: create engine, register ownership, destroy
+    // engine, create new engine, verify clean slate, re-register, verify
+    // enforcement. Confirms ownership does not leak across engine lifetimes.
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
