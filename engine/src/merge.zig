@@ -288,6 +288,55 @@ pub const MergeCoordinator = struct {
         return self.conflicts.get(worker_id);
     }
 
+    /// Get the per-file resolution map for a worker, or null.
+    pub fn getResolutions(self: *MergeCoordinator, worker_id: worktree.WorkerId) ?*std.StringHashMap(ConflictResolution) {
+        return self.resolutions.getPtr(worker_id);
+    }
+
+    /// Resolve a single file in a conflicted merge.
+    /// For ours/theirs: runs git checkout --ours/--theirs then git add.
+    /// For skip: records resolution without git ops.
+    /// Resolution can be changed freely (ours<->theirs<->skip).
+    pub fn resolveConflict(
+        self: *MergeCoordinator,
+        project_root: []const u8,
+        worker_id: worktree.WorkerId,
+        file_path: []const u8,
+        resolution: ConflictResolution,
+    ) !void {
+        // Must have an active merge for this worker
+        if (self.active_merge == null or self.active_merge.? != worker_id) return error.NoActiveMerge;
+        if (resolution == .pending) return error.InvalidResolution;
+
+        // Verify file is in the resolution map
+        const file_resolutions = self.resolutions.getPtr(worker_id) orelse return error.NoConflicts;
+        const res_ptr = file_resolutions.getPtr(file_path) orelse return error.FileNotInConflicts;
+
+        // Apply git operations
+        switch (resolution) {
+            .ours => {
+                const r1 = try runGitCapture(self.allocator, project_root, &.{ "checkout", "--ours", file_path });
+                defer r1.deinit(self.allocator);
+                if (r1.exit_code != 0) return error.GitFailed;
+                const r2 = try runGitCapture(self.allocator, project_root, &.{ "add", file_path });
+                defer r2.deinit(self.allocator);
+                if (r2.exit_code != 0) return error.GitFailed;
+            },
+            .theirs => {
+                const r1 = try runGitCapture(self.allocator, project_root, &.{ "checkout", "--theirs", file_path });
+                defer r1.deinit(self.allocator);
+                if (r1.exit_code != 0) return error.GitFailed;
+                const r2 = try runGitCapture(self.allocator, project_root, &.{ "add", file_path });
+                defer r2.deinit(self.allocator);
+                if (r2.exit_code != 0) return error.GitFailed;
+            },
+            .skip => {}, // No git ops — just record the resolution
+            .pending => unreachable,
+        }
+
+        res_ptr.* = resolution;
+    }
+
     // ─── Internal helpers ────────────────────────────────────
 
     fn detectConflicts(self: *MergeCoordinator, project_root: []const u8) ![]Conflict {
@@ -1036,4 +1085,35 @@ test "merge - concurrent merge prevention" {
 
     // Clean up
     _ = try mc.reject(&roster, repo.path, id1);
+}
+
+test "merge - resolveConflict rejects when no active merge" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    const result = mc.resolveConflict("/tmp", 1, "file.txt", .ours);
+    try std.testing.expectError(error.NoActiveMerge, result);
+}
+
+test "merge - resolveConflict rejects wrong worker" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 5;
+    const result = mc.resolveConflict("/tmp", 99, "file.txt", .ours);
+    try std.testing.expectError(error.NoActiveMerge, result);
+}
+
+test "merge - resolveConflict rejects file not in conflicts" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    var file_map = std.StringHashMap(ConflictResolution).init(std.testing.allocator);
+    const key = try std.testing.allocator.dupe(u8, "other.txt");
+    try file_map.put(key, .pending);
+    try mc.resolutions.put(1, file_map);
+
+    const result = mc.resolveConflict("/tmp", 1, "missing.txt", .ours);
+    try std.testing.expectError(error.FileNotInConflicts, result);
 }
