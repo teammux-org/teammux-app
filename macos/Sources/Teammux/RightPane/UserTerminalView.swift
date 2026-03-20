@@ -6,10 +6,11 @@ import os
 
 /// Right-pane tab displaying the user's own terminal session.
 ///
-/// Spawns a Ghostty surface running the user's default shell ($SHELL)
-/// in the project root directory. No claude binary injection, no role,
-/// no interceptor — this is a raw shell the user controls.
-/// The PTY persists for the session duration.
+/// Creates a Ghostty surface running the user's default shell ($SHELL,
+/// falling back to /bin/zsh) in the project root directory. No claude
+/// binary injection, no role, no interceptor — the shell runs with the
+/// user's standard environment. Follows the same lifecycle as
+/// TeamLeadTerminalView (recreated on tab switch).
 struct UserTerminalView: View {
     @EnvironmentObject var ghosttyApp: Ghostty.App
     @ObservedObject var engine: EngineClient
@@ -52,7 +53,8 @@ struct UserTerminalView: View {
 
 /// NSViewRepresentable that creates a Ghostty.SurfaceView for the user's terminal.
 /// Configured to run the user's default shell in the project root directory.
-/// No git interceptor — the user has full, unrestricted shell access.
+/// No git interceptor or PATH modifications — the shell runs with the user's
+/// standard environment.
 struct UserTerminalSurfaceRepresentable: NSViewRepresentable {
     private static let logger = Logger(subsystem: "com.teammux.app", category: "UserTerminalSurfaceRepresentable")
 
@@ -73,7 +75,11 @@ struct UserTerminalSurfaceRepresentable: NSViewRepresentable {
 
         if let root = projectRoot {
             config.workingDirectory = root
+        } else {
+            Self.logger.warning("engine.projectRoot is nil — user terminal will open in default directory instead of project root")
         }
+
+        Self.logger.info("User terminal surface created: shell=\(shell, privacy: .public) workingDirectory=\(projectRoot ?? "<default>", privacy: .public)")
 
         let surfaceView = Ghostty.SurfaceView(app, baseConfig: config)
         return surfaceView
