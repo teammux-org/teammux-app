@@ -94,6 +94,12 @@
 | TD43 | hotreload.zig            | reload_count value never asserted in Zig tests                                     | v0.1.6 | NO       | OPEN   |
 | TD44 | ContextView.swift        | LCS DP table uses O(m*n) memory — two-row optimization deferred                    | v0.1.6 | NO       | OPEN   |
 
+## v0.1.6 S2 — Open debt
+
+| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
+| TD45 | worktree_lifecycle.zig   | recoverOrphans and cleanupOrphanBranches have no unit tests                        | v0.1.7 | NO       | OPEN   |
+
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
 - TD16: CompletionReport and QuestionRequest cards ephemeral across sessions. T5 adds history.zig JSONL persistence, T10 adds Swift bridge loading on sessionStart with collapsible history section in LiveFeedView.
@@ -128,4 +134,5 @@
 - updateRepo TODO(AA2): RESOLVED (v0.1.5-S1). repo_mutex added to GitHubClient.
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
+- TD45: recoverOrphans() and cleanupOrphanBranches() added in v0.1.6-S2 have no unit tests. Integration test would need to create a git repo, spawn a worktree via lifecycle, remove the registry entry without git cleanup, then call recoverOrphans and assert directory/branch removal. Target v0.1.7.
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.

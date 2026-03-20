@@ -141,6 +141,14 @@ pub const Engine = struct {
         };
         errdefer cfg.deinit(self.allocator);
 
+        // TD21: Scan for orphaned worktrees left by a previous engine crash.
+        // Must run after config load (needs worktree_root) and while roster is
+        // still empty (so all leftover directories are correctly identified as orphans).
+        const orphan_count = worktree_lifecycle.recoverOrphans(self.allocator, &cfg, self.project_root, &self.roster);
+        if (orphan_count > 0) {
+            self.setError("recovered orphaned worktree(s) from previous crash") catch {};
+        }
+
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
 

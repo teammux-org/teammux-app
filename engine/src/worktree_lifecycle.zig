@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const worktree = @import("worktree.zig");
+const merge = @import("merge.zig");
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -198,22 +199,152 @@ pub fn create(
 }
 
 /// Remove a specific worker's worktree.
-/// Runs git worktree remove --force, then frees registry entry.
-/// Logs but does not fail if git removal fails (fire-and-forget cleanup).
+/// Ordered cleanup: git operations run before registry drop to avoid orphans.
+/// 1. git worktree remove --force
+/// 2. git branch -D
+/// 3. Drop registry entry and free memory (only if git ops succeeded)
+/// If either git step fails, the registry entry is retained so that
+/// the TD21 startup recovery sweep can retry on next engine init.
 pub fn removeWorker(
     registry: *WorktreeRegistry,
     project_path: []const u8,
     worker_id: u32,
 ) void {
-    const kv = registry.entries.fetchRemove(worker_id) orelse return;
-    const entry = kv.value;
+    const entry = registry.entries.get(worker_id) orelse return;
 
-    worktree.runGit(registry.allocator, project_path, &.{ "worktree", "remove", "--force", entry.path }) catch |err| {
-        std.log.warn("[teammux] lifecycle worktree remove failed for worker {d}: {}", .{ worker_id, err });
+    // Step 1: git worktree remove --force (before dropping registry entry)
+    const worktree_removed = merge.runGitLoggedWithStderr(
+        registry.allocator,
+        project_path,
+        &.{ "worktree", "remove", "--force", entry.path },
+        "lifecycle worktree remove",
+    );
+
+    // Step 2: git branch -D (before dropping registry entry)
+    const branch_removed = merge.runGitLoggedWithStderr(
+        registry.allocator,
+        project_path,
+        &.{ "branch", "-D", entry.branch },
+        "lifecycle branch delete",
+    );
+
+    // Step 3: drop registry entry ONLY if both git ops succeeded.
+    // On failure, retain the entry so recoverOrphans can retry at next startup.
+    if (!worktree_removed or !branch_removed) return;
+
+    const kv = registry.entries.fetchRemove(worker_id).?;
+    registry.allocator.free(kv.value.path);
+    registry.allocator.free(kv.value.branch);
+}
+
+/// Scan worktree root for orphaned worktree directories left by a previous
+/// engine crash. For each numeric subdirectory not present in the roster,
+/// run git worktree remove --force and discover+delete branches matching
+/// the teammux/{id}-* pattern. Returns the count of orphans successfully
+/// cleaned up (0 if none found or scan could not begin).
+pub fn recoverOrphans(
+    allocator: std.mem.Allocator,
+    cfg: ?*const config.Config,
+    project_path: []const u8,
+    roster: *worktree.Roster,
+) u32 {
+    const root = resolveWorktreeRoot(allocator, cfg, project_path) catch |err| {
+        std.log.warn("[teammux] recovery: cannot resolve worktree root: {}", .{err});
+        return 0;
     };
+    defer allocator.free(root);
 
-    registry.allocator.free(entry.path);
-    registry.allocator.free(entry.branch);
+    // Support both absolute and relative worktree_root (matches create() behavior)
+    var dir = (if (root.len > 0 and root[0] == '/')
+        std.fs.openDirAbsolute(root, .{ .iterate = true })
+    else
+        std.fs.cwd().openDir(root, .{ .iterate = true })) catch |err| {
+        if (err == error.FileNotFound) return 0; // No worktree root — nothing to recover
+        std.log.err("[teammux] recovery: cannot open worktree root {s}: {}", .{ root, err });
+        return 0;
+    };
+    defer dir.close();
+
+    var orphan_count: u32 = 0;
+    var iter = dir.iterate();
+    while (true) {
+        const maybe_entry = iter.next() catch |err| {
+            std.log.err("[teammux] recovery: directory iteration failed after {d} orphan(s): {}", .{ orphan_count, err });
+            break;
+        };
+        const entry = maybe_entry orelse break;
+        if (entry.kind != .directory) continue;
+
+        // Parse numeric directory name as worker ID
+        const worker_id = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+
+        // Skip if roster has this worker (not an orphan)
+        if (roster.hasWorker(worker_id)) continue;
+
+        // Orphan detected — clean up
+        const wt_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, entry.name }) catch |err| {
+            std.log.err("[teammux] recovery: cannot build path for orphan worker {d}: {}", .{ worker_id, err });
+            continue;
+        };
+        defer allocator.free(wt_path);
+
+        std.log.warn("[teammux] recovery: orphaned worktree found for worker {d} at {s}", .{ worker_id, wt_path });
+
+        // Step 1: git worktree remove --force
+        const removed = merge.runGitLoggedWithStderr(
+            allocator,
+            project_path,
+            &.{ "worktree", "remove", "--force", wt_path },
+            "recovery worktree remove",
+        );
+
+        // Step 2: find and delete matching branches (teammux/{id}-*)
+        cleanupOrphanBranches(allocator, project_path, worker_id);
+
+        if (removed) {
+            orphan_count += 1;
+        }
+    }
+
+    if (orphan_count > 0) {
+        std.log.warn("[teammux] recovery: cleaned up {d} orphaned worktree(s)", .{orphan_count});
+    }
+
+    return orphan_count;
+}
+
+/// Discover and delete all git branches matching teammux/{worker_id}-* pattern.
+fn cleanupOrphanBranches(allocator: std.mem.Allocator, project_path: []const u8, worker_id: u32) void {
+    const pattern = std.fmt.allocPrint(allocator, "teammux/{d}-*", .{worker_id}) catch {
+        std.log.err("[teammux] recovery: cannot allocate branch pattern for worker {d}", .{worker_id});
+        return;
+    };
+    defer allocator.free(pattern);
+
+    const result = merge.runGitCapture(allocator, project_path, &.{ "branch", "--list", pattern }) catch |err| {
+        std.log.warn("[teammux] recovery: branch list failed for worker {d}: {}", .{ worker_id, err });
+        return;
+    };
+    defer result.deinit(allocator);
+
+    if (result.exit_code != 0) {
+        std.log.warn("[teammux] recovery: git branch --list exited with code {d} for worker {d}", .{ result.exit_code, worker_id });
+        return;
+    }
+
+    // Parse branch names from stdout (one per line, may have leading whitespace/*)
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '*', '\r' });
+        if (line.len == 0) continue;
+
+        _ = merge.runGitLoggedWithStderr(
+            allocator,
+            project_path,
+            &.{ "branch", "-D", line },
+            "recovery branch delete",
+        );
+    }
 }
 
 /// Get worktree path for a worker. Returns null if not registered.
