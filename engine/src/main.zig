@@ -556,7 +556,10 @@ export fn tm_worktree_branch(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
 export fn tm_roster_get(engine: ?*Engine) ?*CRoster {
     const e = engine orelse return null;
     const alloc = e.allocator;
-    const count = e.roster.count();
+    // TD34: hold roster mutex for the entire iteration to prevent data races
+    e.roster.mutex.lock();
+    defer e.roster.mutex.unlock();
+    const count: u32 = @intCast(e.roster.workers.count());
     const c_roster = alloc.create(CRoster) catch return null;
     const c_workers = alloc.alloc(CWorkerInfo, count) catch { alloc.destroy(c_roster); return null; };
     var idx: usize = 0;
