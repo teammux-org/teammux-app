@@ -77,6 +77,7 @@ struct RightPaneView: View {
     // MARK: - Keyboard shortcuts (Cmd+1..7)
 
     private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
                   let chars = event.charactersIgnoringModifiers,
