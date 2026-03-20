@@ -4072,6 +4072,27 @@ test "tm_history_free handles null" {
     tm_history_free(null, 0);
 }
 
+test "tm_history_rotate null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_history_rotate(null) == 99);
+}
+
+test "tm_history_rotate without session returns TM_ERR_UNKNOWN" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    var engine_ptr: ?*Engine = null;
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
+    defer tm_engine_destroy(engine_ptr);
+
+    // history_logger is null without session start
+    try std.testing.expect(tm_history_rotate(engine_ptr) == 99);
+}
+
 test "tm_worker_complete persists to history JSONL via C API" {
     const alloc = std.testing.allocator;
 
