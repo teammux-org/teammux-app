@@ -176,15 +176,18 @@ struct DiffView: View {
 
         isLoading = true
         diffError = nil
-        Task { @MainActor in
+        let engine = self.engine
+        Task.detached {
             let result = engine.getDiff(for: workerId)
-            diffFiles = result
-            // If result is empty and engine reported an error, it was an API failure
-            // rather than genuinely no changes.
-            if result.isEmpty, let engineError = engine.lastError {
-                diffError = engineError
+            await MainActor.run {
+                self.diffFiles = result
+                // If result is empty and engine reported an error, it was an API failure
+                // rather than genuinely no changes.
+                if result.isEmpty, let engineError = engine.lastError {
+                    self.diffError = engineError
+                }
+                self.isLoading = false
             }
-            isLoading = false
         }
     }
 }
