@@ -150,6 +150,10 @@ pub const Engine = struct {
         };
         errdefer msg_bus.deinit();
 
+        // I13: Wire error notification callback so PR delivery failures surface via setError
+        msg_bus.error_notify_cb = busErrorNotifyCallback;
+        msg_bus.error_notify_userdata = self;
+
         const cmd_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/commands", .{self.project_root});
         defer self.allocator.free(cmd_dir);
 
@@ -791,6 +795,14 @@ export fn tm_github_webhooks_stop(engine: ?*Engine, sub: u32) void { _ = sub; if
 
 /// I6: Error callback for CommandWatcher — surfaces command processing errors via setError.
 fn commandErrorCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(userdata orelse return));
+    if (msg) |m| {
+        engine.setError(std.mem.span(m)) catch {};
+    }
+}
+
+/// I13: Error callback for MessageBus — surfaces PR delivery failures via setError.
+fn busErrorNotifyCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
     const engine: *Engine = @ptrCast(@alignCast(userdata orelse return));
     if (msg) |m| {
         engine.setError(std.mem.span(m)) catch {};

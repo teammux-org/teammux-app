@@ -64,11 +64,21 @@ pub const MessageBus = struct {
     project_root: []const u8,
     subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
     subscriber_userdata: ?*anyopaque,
+    /// I13: Error notification callback — called when PR message delivery fails
+    /// after all retries. Args: (message_type_name, worker_id, error_reason, userdata).
+    error_notify_cb: ?*const fn (?[*:0]const u8, ?*anyopaque) callconv(.c) void = null,
+    error_notify_userdata: ?*anyopaque = null,
     commit_cache: ?[]const u8 = null,
     retry_delays_ns: [3]u64 = .{
         1 * std.time.ns_per_s,
         2 * std.time.ns_per_s,
         4 * std.time.ns_per_s,
+    },
+    /// I13: Shorter retry delays for PR_READY and PR_STATUS messages (100ms/200ms/400ms)
+    pr_retry_delays_ns: [3]u64 = .{
+        100 * std.time.ns_per_ms,
+        200 * std.time.ns_per_ms,
+        400 * std.time.ns_per_ms,
     },
 
     pub fn init(allocator: std.mem.Allocator, log_dir: []const u8, session_id: []const u8, project_root: []const u8) !MessageBus {
@@ -190,8 +200,9 @@ pub const MessageBus = struct {
         try self.appendLog(msg);
 
         // 5. Fire callback to Swift for delivery with retry on failure.
-        // Initial attempt + up to 3 retries with exponential backoff (1s, 2s, 4s).
-        // On 4th failure: append FAILED line to JSONL log and return error.
+        // Initial attempt + up to 3 retries with exponential backoff.
+        // I13: PR_READY/PR_STATUS use shorter delays (100ms/200ms/400ms).
+        // On 4th failure: append FAILED line to JSONL log, notify error callback, return error.
         if (self.subscriber_cb) |cb| {
             var c_msg = try self.toCMessage(msg);
             defer self.freeCMessage(c_msg);
@@ -199,9 +210,13 @@ pub const MessageBus = struct {
             var last_rc = cb(&c_msg, self.subscriber_userdata);
             if (last_rc == 0) return; // TM_OK — delivered
 
+            // I13: Select retry delays based on message type
+            const is_pr_msg = msg_type == .pr_ready or msg_type == .pr_status;
+            const delays = if (is_pr_msg) self.pr_retry_delays_ns else self.retry_delays_ns;
+
             // Initial attempt failed — retry up to 3 times
-            for (self.retry_delays_ns) |delay| {
-                std.log.info("[teammux] message seq={d} delivery failed (rc={d}), retrying in {d}s", .{ seq, last_rc, delay / std.time.ns_per_s });
+            for (delays) |delay| {
+                std.log.info("[teammux] message seq={d} delivery failed (rc={d}), retrying in {d}ms", .{ seq, last_rc, delay / std.time.ns_per_ms });
                 std.Thread.sleep(delay);
                 last_rc = cb(&c_msg, self.subscriber_userdata);
                 if (last_rc == 0) return; // TM_OK — delivered on retry
@@ -212,6 +227,12 @@ pub const MessageBus = struct {
             self.appendFailedLog(seq, 3) catch |err| {
                 std.log.info("[teammux] message seq={d} FAILED audit log also failed: {s}", .{ seq, @errorName(err) });
             };
+
+            // I13: Notify error callback for PR messages so engine can surface via setError
+            if (is_pr_msg) {
+                self.notifyDeliveryError(msg_type, from);
+            }
+
             return error.DeliveryFailed;
         } else {
             std.log.info("[teammux] message seq={d} logged but no subscriber (undelivered)", .{seq});
@@ -247,6 +268,18 @@ pub const MessageBus = struct {
     ) void {
         self.subscriber_cb = callback;
         self.subscriber_userdata = userdata;
+    }
+
+    /// I13: Notify the error callback that a PR message delivery failed after all retries.
+    /// Formats a human-readable error with the message type and worker ID.
+    fn notifyDeliveryError(self: *MessageBus, msg_type: MessageType, worker_id: worktree.WorkerId) void {
+        if (self.error_notify_cb) |cb| {
+            const msg = std.fmt.allocPrint(self.allocator, "{s} delivery failed for worker {d} after retries", .{ msg_type.toString(), worker_id }) catch return;
+            defer self.allocator.free(msg);
+            const msg_z = self.allocator.dupeZ(u8, msg) catch return;
+            defer self.allocator.free(msg_z);
+            cb(msg_z.ptr, self.error_notify_userdata);
+        }
     }
 
     fn appendLog(self: *MessageBus, msg: Message) !void {
@@ -892,4 +925,146 @@ test "bus - retry exhaustion logs FAILED" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"retries\":3") != null);
     // Verify seq in FAILED line matches the original message's seq (0)
     try std.testing.expect(std.mem.indexOf(u8, content, "\"seq\":0,\"delivery_status\":\"FAILED\"") != null);
+}
+
+test "bus - I13 pr_ready uses shorter retry delays" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "prretry1", log_dir);
+    defer b.deinit();
+    b.pr_retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var call_count: u32 = 0;
+    };
+    State.call_count = 0;
+
+    const callback = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            State.call_count += 1;
+            // Fail first 2 times, succeed on 3rd (retry 2)
+            return if (State.call_count <= 2) 8 else 0;
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    // PR_READY uses pr_retry_delays_ns
+    try b.send(0, 1, .pr_ready, "\"pr ready test\"");
+
+    // 1 initial + 2 retries = 3 calls before success
+    try std.testing.expect(State.call_count == 3);
+}
+
+test "bus - I13 pr_status uses shorter retry delays" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "prretry2", log_dir);
+    defer b.deinit();
+    b.pr_retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var call_count: u32 = 0;
+    };
+    State.call_count = 0;
+
+    const callback = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            State.call_count += 1;
+            return 8; // always fail
+        }
+    }.cb;
+
+    b.subscribe(callback, null);
+    try std.testing.expectError(error.DeliveryFailed, b.send(0, 2, .pr_status, "\"pr status test\""));
+
+    // 1 initial + 3 retries = 4 total calls
+    try std.testing.expect(State.call_count == 4);
+}
+
+test "bus - I13 error_notify_cb called on pr_ready delivery failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "prnotif1", log_dir);
+    defer b.deinit();
+    b.pr_retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var notified: bool = false;
+        var msg_buf: [256]u8 = undefined;
+        var msg_len: usize = 0;
+    };
+    State.notified = false;
+    State.msg_len = 0;
+
+    const error_cb = struct {
+        fn cb(msg: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            State.notified = true;
+            if (msg) |m| {
+                const slice = std.mem.span(m);
+                const len = @min(slice.len, State.msg_buf.len);
+                @memcpy(State.msg_buf[0..len], slice[0..len]);
+                State.msg_len = len;
+            }
+        }
+    }.cb;
+
+    b.error_notify_cb = error_cb;
+
+    const subscriber = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            return 8; // always fail
+        }
+    }.cb;
+    b.subscribe(subscriber, null);
+
+    try std.testing.expectError(error.DeliveryFailed, b.send(0, 3, .pr_ready, "\"notify test\""));
+
+    // error_notify_cb was called with PR message type and worker ID
+    try std.testing.expect(State.notified);
+    try std.testing.expect(std.mem.indexOf(u8, State.msg_buf[0..State.msg_len], "pr_ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, State.msg_buf[0..State.msg_len], "worker 3") != null);
+}
+
+test "bus - I13 error_notify_cb NOT called for non-PR delivery failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(log_dir);
+
+    var b = try MessageBus.init(std.testing.allocator, log_dir, "prnotif2", log_dir);
+    defer b.deinit();
+    b.retry_delays_ns = .{ 0, 0, 0 }; // no sleep in tests
+
+    const State = struct {
+        var notified: bool = false;
+    };
+    State.notified = false;
+
+    const error_cb = struct {
+        fn cb(_: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            State.notified = true;
+        }
+    }.cb;
+
+    b.error_notify_cb = error_cb;
+
+    const subscriber = struct {
+        fn cb(_: ?*const CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            return 8; // always fail
+        }
+    }.cb;
+    b.subscribe(subscriber, null);
+
+    // Non-PR message (task) — error_notify_cb should NOT be called
+    try std.testing.expectError(error.DeliveryFailed, b.send(1, 0, .task, "\"non-pr fail\""));
+    try std.testing.expect(!State.notified);
 }
