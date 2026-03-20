@@ -100,6 +100,15 @@
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
 | TD45 | worktree_lifecycle.zig   | recoverOrphans and cleanupOrphanBranches have no unit tests                        | v0.1.7 | NO       | OPEN   |
 
+## v0.1.6 S3 — Open debt
+
+| ID   | Module                     | Issue                                                                                      | Target | Breaking | Status |
+|------|----------------------------|--------------------------------------------------------------------------------------------|--------|----------|--------|
+| TD46 | history.zig                | Async writer writeToDisk failure permanently loses entry — no retry or dead-letter queue    | v0.2   | NO       | OPEN   |
+| TD47 | history.zig                | rotate() partial-rename can leave archives inconsistent if middle rename fails              | v0.2   | NO       | OPEN   |
+| TD48 | history.zig                | enqueue() queue_dropped counter has no external consumer — not queryable via C API          | v0.2   | NO       | OPEN   |
+| TD49 | main.zig (tm_history_load) | Returns NULL for both "no entries" and "error" — ambiguous for Swift callers                | v0.2   | NO       | OPEN   |
+
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
 - TD16: CompletionReport and QuestionRequest cards ephemeral across sessions. T5 adds history.zig JSONL persistence, T10 adds Swift bridge loading on sessionStart with collapsible history section in LiveFeedView.
@@ -136,3 +145,7 @@
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - TD45: recoverOrphans() and cleanupOrphanBranches() added in v0.1.6-S2 have no unit tests. Integration test would need to create a git repo, spawn a worktree via lifecycle, remove the registry entry without git cleanup, then call recoverOrphans and assert directory/branch removal. Target v0.1.7.
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.
+- TD46: writerLoop catches writeToDisk errors and logs at .err, but the entry is freed and lost. Transient disk errors (full, permission, NFS) cause permanent data loss. Fix: retry with backoff or dead-letter queue. Discovered during v0.1.6-S3 review.
+- TD47: rotate() does delete .2, rename .1→.2, rename .jsonl→.1 sequentially. If the third rename fails, .2 is already deleted and .1 already moved. Next rotation would lose the generation in .2. Fix: reverse order (rename .jsonl→.1 first) or add rollback. Discovered during v0.1.6-S3 review.
+- TD48: queue_dropped counter increments on overflow but is never exposed. No C API to query drop count, no setError on first drop. Fix: add tm_history_queue_stats export or call setError on first drop. Discovered during v0.1.6-S3 review.
+- TD49: tm_history_load returns NULL with count=0 for both empty history and load failure. Swift callers cannot distinguish. setError is called on failure but not on "logger not initialized". Fix: differentiate via count sentinel or additional out parameter. Pre-existing pattern, surfaced during v0.1.6-S3 review.
