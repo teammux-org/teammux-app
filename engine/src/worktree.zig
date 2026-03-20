@@ -71,15 +71,26 @@ pub const Roster = struct {
         };
     }
 
-    /// Claim the next available worker ID. The returned ID is reserved
-    /// and will not be reused. Caller must subsequently call spawn()
-    /// to fully create the worker entry, or accept the consumed slot.
+    /// Claim the next available worker ID. The returned ID is reserved.
+    /// Caller must subsequently call spawn() to fully create the worker
+    /// entry, or call unclaimId() to release the slot on failure.
     pub fn claimNextId(self: *Roster) WorkerId {
         self.mutex.lock();
         defer self.mutex.unlock();
         const id = self.next_id;
         self.next_id += 1;
         return id;
+    }
+
+    /// Release a claimed ID slot when spawn fails after claimNextId.
+    /// Only reclaims if id == next_id - 1 (the most recently claimed);
+    /// otherwise the slot is consumed (non-contiguous reclaim is unsafe).
+    pub fn unclaimId(self: *Roster, id: WorkerId) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.next_id > 0 and id == self.next_id - 1) {
+            self.next_id -= 1;
+        }
     }
 
     /// Register a worker with a pre-claimed ID and externally-created

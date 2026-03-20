@@ -460,6 +460,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
             error.MkdirFailed => "failed to create worktree directory",
             else => "worktree create failed",
         }) catch {};
+        e.roster.unclaimId(id); // TD35: reclaim leaked ID slot
         return 0xFFFFFFFF;
     };
 
@@ -467,6 +468,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     const entry = e.wt_registry.get(id) orelse {
         e.setError("worktree created but not found in registry — internal error") catch {};
         worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        e.roster.unclaimId(id); // TD35: reclaim leaked ID slot
         return 0xFFFFFFFF;
     };
 
@@ -474,6 +476,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     e.roster.spawn(id, ab, at, wn, td, entry.path, entry.branch) catch |err| {
         e.setError(switch (err) { else => "worker roster registration failed" }) catch {};
         worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        e.roster.unclaimId(id); // TD35: reclaim leaked ID slot
         return 0xFFFFFFFF;
     };
 
@@ -483,6 +486,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
         e.setError("worker spawn failed: could not write context file") catch {};
         e.roster.dismiss(id) catch {};
         worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        e.roster.unclaimId(id); // TD35: reclaim leaked ID slot
         return 0xFFFFFFFF;
     };
 
