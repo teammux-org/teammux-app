@@ -1188,3 +1188,89 @@ test "history - async flush drains queue before load" {
     try std.testing.expect(entries.items.len == 1);
     try std.testing.expectEqualStrings("async test", entries.items[0].content);
 }
+
+test "history - async queue overflow drops oldest entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var logger = try HistoryLogger.init(std.testing.allocator, root);
+    defer logger.deinit();
+
+    // Fill queue beyond capacity without a writer thread draining it.
+    // startWriter NOT called — append uses sync path, so entries go to disk.
+    // To test the enqueue overflow, call enqueue() directly with a running writer
+    // that we immediately shut down before it drains.
+    try logger.startWriter();
+
+    // Stop writer immediately so entries accumulate in queue
+    logger.queue_stop.store(true, .release);
+    if (logger.writer_thread) |t| {
+        t.join();
+        logger.writer_thread = null;
+    }
+
+    // Now enqueue more than capacity (queue_capacity = 256)
+    const overflow_count = queue_capacity + 10;
+    for (0..overflow_count) |i| {
+        try logger.enqueue(.{
+            .entry_type = .completion,
+            .worker_id = @intCast(i),
+            .role_id = "",
+            .content = "overflow test",
+            .git_commit = null,
+            .timestamp = @intCast(i),
+        });
+    }
+
+    // Queue should be at capacity, 10 oldest dropped
+    try std.testing.expect(logger.queue_count == queue_capacity);
+    try std.testing.expect(logger.queue_dropped == 10);
+
+    // Verify newest entries survived (worker_id 10..265, not 0..9)
+    logger.queue_mutex.lock();
+    const first_entry = logger.queue_entries[logger.queue_tail].?;
+    try std.testing.expect(first_entry.worker_id == 10);
+    logger.queue_mutex.unlock();
+
+    // Clean up queue entries to avoid leaks
+    for (&logger.queue_entries) |*slot| {
+        if (slot.*) |e| {
+            e.deinit(std.testing.allocator);
+            slot.* = null;
+        }
+    }
+}
+
+test "history - async drain preserves entry order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    {
+        var logger = try HistoryLogger.init(std.testing.allocator, root);
+        try logger.startWriter();
+        for (0..5) |i| {
+            try logger.append(.{ .entry_type = .completion, .worker_id = @intCast(i), .role_id = "", .content = "ordered", .git_commit = null, .timestamp = 100 + @as(u64, @intCast(i)) });
+        }
+        logger.deinit();
+    }
+
+    {
+        var logger = try HistoryLogger.init(std.testing.allocator, root);
+        defer logger.deinit();
+        var entries = try logger.load();
+        defer {
+            for (entries.items) |e| e.deinit(std.testing.allocator);
+            entries.deinit(std.testing.allocator);
+        }
+        try std.testing.expect(entries.items.len == 5);
+        // Verify ordering: worker_id 0,1,2,3,4 and timestamps 100,101,102,103,104
+        for (entries.items, 0..) |entry, i| {
+            try std.testing.expect(entry.worker_id == @as(u32, @intCast(i)));
+            try std.testing.expect(entry.timestamp == 100 + @as(u64, @intCast(i)));
+        }
+    }
+}
