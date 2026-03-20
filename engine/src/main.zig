@@ -535,6 +535,10 @@ pub const Engine = struct {
                         if (stalled_count < 64) {
                             stalled_ids[stalled_count] = w.id;
                             stalled_count += 1;
+                        } else {
+                            // Revert stall so this worker is re-checked next cycle
+                            // (avoids permanent notification loss for overflow workers)
+                            w.health_status = .healthy;
                         }
                     }
                 }
@@ -546,7 +550,10 @@ pub const Engine = struct {
                     for (stalled_ids[0..stalled_count]) |wid| {
                         const payload = std.fmt.allocPrint(self.allocator,
                             \\{{"worker_id":{d},"threshold_secs":{d}}}
-                        , .{ wid, threshold }) catch continue;
+                        , .{ wid, threshold }) catch {
+                            std.log.err("[teammux] health monitor: OOM allocating stall payload for worker {d}", .{wid});
+                            continue;
+                        };
                         defer self.allocator.free(payload);
                         b.send(0, wid, .health_stalled, payload) catch |err| {
                             std.log.warn("[teammux] health stall event failed for worker {d}: {}", .{ wid, err });
@@ -676,6 +683,8 @@ export fn tm_session_start(engine: ?*Engine) c_int {
     e.health_monitor_running.store(true, .release);
     e.health_monitor_thread = std.Thread.spawn(.{}, Engine.healthMonitorLoop, .{e}) catch |err| blk: {
         std.log.warn("[teammux] health monitor thread failed to start: {}", .{err});
+        e.health_monitor_running.store(false, .release);
+        e.setError("health monitoring unavailable — background thread failed to start") catch {};
         break :blk null;
     };
 
@@ -852,14 +861,18 @@ export fn tm_worker_monitor_pid(engine: ?*Engine, worker_id: u32, pid: c_int) c_
 
 export fn tm_worker_restart(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
-    e.roster.mutex.lock();
-    defer e.roster.mutex.unlock();
-    const w = e.roster.workers.getPtr(worker_id) orelse {
+    const found = blk: {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        const w = e.roster.workers.getPtr(worker_id) orelse break :blk false;
+        w.health_status = .healthy;
+        w.last_activity_ts = std.time.timestamp();
+        break :blk true;
+    };
+    if (!found) {
         e.setError("tm_worker_restart: worker not found") catch {};
         return 12; // TM_ERR_INVALID_WORKER
-    };
-    w.health_status = .healthy;
-    w.last_activity_ts = std.time.timestamp();
+    }
     return 0;
 }
 

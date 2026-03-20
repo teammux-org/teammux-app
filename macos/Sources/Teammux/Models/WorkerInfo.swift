@@ -129,10 +129,16 @@ enum HealthStatus: Int, CaseIterable, Sendable {
         }
     }
 
+    private static let logger = Logger(subsystem: "com.teammux.app", category: "HealthStatus")
+
     init(fromCValue value: Int32) {
         if let known = HealthStatus(rawValue: Int(value)) {
             self = known
         } else {
+            #if DEBUG
+            assertionFailure("Unknown HealthStatus C value: \(value)")
+            #endif
+            Self.logger.warning("Unknown HealthStatus C value: \(value), defaulting to .healthy")
             self = .healthy
         }
     }

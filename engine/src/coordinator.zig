@@ -636,3 +636,72 @@ test "health monitor - stalled worker resets on activity" {
         try std.testing.expect(w.health_status == .healthy);
     }
 }
+
+test "health monitor - restart resets stalled worker" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    const worker = try makeTestWorker(alloc, 1);
+    try roster.workers.put(1, worker);
+
+    // Stall the worker
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        if (roster.workers.getPtr(1)) |w| {
+            w.last_activity_ts = std.time.timestamp() - 400;
+        }
+    }
+    checkWorkerHealth(&roster, 300);
+
+    // Verify stalled
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .stalled);
+    }
+
+    // Simulate restart (same logic as tm_worker_restart)
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        if (roster.workers.getPtr(1)) |w| {
+            w.health_status = .healthy;
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
+
+    // Re-check — should stay healthy
+    checkWorkerHealth(&roster, 300);
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .healthy);
+    }
+}
+
+test "health monitor - skips completed workers" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    var worker = try makeTestWorker(alloc, 1);
+    worker.status = .complete;
+    worker.last_activity_ts = std.time.timestamp() - 400;
+    try roster.workers.put(1, worker);
+
+    // Completed worker should NOT be stalled even with old timestamp
+    checkWorkerHealth(&roster, 300);
+
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .healthy);
+    }
+}
