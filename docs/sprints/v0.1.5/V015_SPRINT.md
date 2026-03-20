@@ -1,8 +1,9 @@
 # Teammux v0.1.5 — Sprint Master Spec
 
 **Theme:** Polish & Stability
-**Status:** In Progress
+**Status:** Complete — tagged v0.1.5
 **Baseline:** audit-address-v014 tag, engine tests passing
+**Final test count:** 388 engine tests
 
 ## Objective
 
@@ -39,16 +40,16 @@ well-documented codebase as the foundation for v0.2.
 
 ## Stream Registry
 
-| Stream | Branch | Owns | Layer | Wave | Complexity |
-|--------|--------|------|-------|------|------------|
-| S1 | fix/v015-s1-updaterepo-threadsafety | updateRepo mutex (TODO AA2) | Engine | 1 | small |
-| S2 | fix/v015-s2-merge-diagnostics | TD31, TD32 | Engine | 1 | small |
-| S3 | fix/v015-s3-interceptor-errors | TD36, TD37 | Engine | 1 | small |
-| S4 | fix/v015-s4-session-restore-ownership | TD22 | Engine + Swift | 2 | medium |
-| S5 | fix/v015-s5-github-diff | Diff tab backend | Engine + Swift | 2 | medium |
-| S6 | fix/v015-s6-ux-polish | TD23, TD26, TD27, TD28 | Swift | 2 | medium |
-| S7 | fix/v015-s7-oss-docs | README, CONTRIBUTING, guide | Docs | 2 | medium |
-| S8 | fix/v015-s8-integration | Tests, TD resolved, tag | Engine + Docs | 3 | medium |
+| Stream | Branch | Owns | Layer | Wave | Complexity | Status |
+|--------|--------|------|-------|------|------------|--------|
+| S1 | fix/v015-s1-updaterepo-threadsafety | updateRepo mutex (TODO AA2) | Engine | 1 | small | Complete |
+| S2 | fix/v015-s2-merge-diagnostics | TD31, TD32 | Engine | 1 | small | Complete |
+| S3 | fix/v015-s3-interceptor-errors | TD36, TD37 | Engine | 1 | small | Complete |
+| S4 | fix/v015-s4-session-restore-ownership | TD22 | Engine + Swift | 2 | medium | Complete |
+| S5 | fix/v015-s5-github-diff | Diff tab backend | Engine + Swift | 2 | medium | Complete |
+| S6 | fix/v015-s6-ux-polish | TD23, TD26, TD27, TD28 | Swift | 2 | medium | Complete |
+| S7 | fix/v015-s7-oss-docs | README, CONTRIBUTING, guide | Docs | 2 | medium | Complete |
+| S8 | fix/v015-s8-integration | Tests, TD resolved, tag | Engine + Docs | 3 | medium | Complete |
 
 ## Wave Structure
 

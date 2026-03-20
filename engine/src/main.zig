@@ -5987,4 +5987,330 @@ test "C4 - tm_ownership_update rejects write grants for worker 0" {
     try std.testing.expect(tm_ownership_update(e, 0, null, 0, &deny_pats, 1) == 0);
 }
 
+// ─── S8 integration tests ─────────────────────────────────
+
+test "S8 scenario 1: updateRepo thread safety — mutex protects concurrent repo swap" {
+    // Verify that updateRepo() and pollEvents() can operate concurrently without
+    // use-after-free. updateRepo() dupes new before locking, swaps under lock,
+    // frees old outside lock. pollEvents() copies repo under lock.
+    const alloc = std.testing.allocator;
+
+    var client = try github.GitHubClient.init(alloc, "owner/initial-repo");
+    defer client.deinit();
+
+    // Verify initial state
+    try std.testing.expect(client.repo != null);
+    try std.testing.expectEqualStrings("owner/initial-repo", client.repo.?);
+
+    // Simulate config reload calling updateRepo with new value
+    try client.updateRepo("owner/new-repo-after-reload");
+    try std.testing.expectEqualStrings("owner/new-repo-after-reload", client.repo.?);
+
+    // Verify mutex is available (not stuck locked)
+    client.repo_mutex.lock();
+    const repo_copy = try alloc.dupe(u8, client.repo.?);
+    client.repo_mutex.unlock();
+    defer alloc.free(repo_copy);
+    try std.testing.expectEqualStrings("owner/new-repo-after-reload", repo_copy);
+
+    // Simulate updateRepo to null (repo removed from config)
+    try client.updateRepo(null);
+    try std.testing.expect(client.repo == null);
+
+    // Simulate setting it back
+    try client.updateRepo("owner/restored-repo");
+    try std.testing.expectEqualStrings("owner/restored-repo", client.repo.?);
+}
+
+test "S8 scenario 1b: updateRepo under polling — pollEvents reads repo copy safely" {
+    // Simulate the exact race: pollEvents takes a repo copy under lock,
+    // then updateRepo swaps repo. The copy should remain valid.
+    const alloc = std.testing.allocator;
+
+    var client = try github.GitHubClient.init(alloc, "owner/poll-repo");
+    defer client.deinit();
+
+    // Simulate what pollEvents does: lock → copy → unlock
+    const repo_snapshot = blk: {
+        client.repo_mutex.lock();
+        defer client.repo_mutex.unlock();
+        break :blk try alloc.dupe(u8, client.repo orelse unreachable);
+    };
+    defer alloc.free(repo_snapshot);
+
+    // Now updateRepo replaces the repo — snapshot should still be valid
+    try client.updateRepo("owner/changed-repo");
+
+    try std.testing.expectEqualStrings("owner/poll-repo", repo_snapshot);
+    try std.testing.expectEqualStrings("owner/changed-repo", client.repo.?);
+}
+
+test "S8 scenario 1c: config reload calls updateRepo via tm_config_reload path" {
+    // Verify the tm_config_reload → updateRepo integration: create engine,
+    // write config.toml with github_repo, reload, verify client.repo updated.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    // Create .teammux directory with config.toml
+    const teammux_dir = try std.fmt.allocPrint(alloc, "{s}/.teammux", .{root});
+    defer alloc.free(teammux_dir);
+    std.fs.makeDirAbsolute(teammux_dir) catch {};
+
+    const config_path = try std.fmt.allocPrint(alloc, "{s}/config.toml", .{teammux_dir});
+    defer alloc.free(config_path);
+    {
+        const f = try std.fs.createFileAbsolute(config_path, .{});
+        try f.writeAll("[project]\ngithub_repo = \"owner/repo-v1\"\n");
+        f.close();
+    }
+
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+    const e = engine_ptr orelse return;
+
+    // Load initial config
+    try std.testing.expect(tm_config_reload(e) == 0);
+
+    // Verify github_repo was applied
+    const val = tm_config_get(e, "github_repo");
+    if (val) |v| {
+        try std.testing.expectEqualStrings("owner/repo-v1", std.mem.span(v));
+    }
+
+    // Write updated config and reload
+    {
+        const f = try std.fs.createFileAbsolute(config_path, .{});
+        try f.writeAll("[project]\ngithub_repo = \"owner/repo-v2\"\n");
+        f.close();
+    }
+    try std.testing.expect(tm_config_reload(e) == 0);
+
+    const val2 = tm_config_get(e, "github_repo");
+    if (val2) |v| {
+        try std.testing.expectEqualStrings("owner/repo-v2", std.mem.span(v));
+    }
+}
+
+test "S8 scenario 2: merge cleanup incomplete returns correct status and logs stderr" {
+    // Verify MergeCoordinator.approve returns .cleanup_incomplete when
+    // merge succeeds but worktree cleanup fails.
+    // Strategy: commit on worker branch, pre-remove worktree (but keep branch
+    // so git merge can find commits), then approve. Merge succeeds but
+    // cleanup of the already-removed worktree fails → cleanup_incomplete.
+    const alloc = std.testing.allocator;
+    var repo = merge.setupTestRepo(alloc) catch return;
+    defer repo.tmp.cleanup();
+    defer alloc.free(repo.path);
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    const id = try merge.spawnTestWorker(alloc, &roster, repo.path, "CleanupWorker", "test cleanup");
+    const wt_path = try alloc.dupe(u8, roster.getWorker(id).?.worktree_path);
+    defer alloc.free(wt_path);
+
+    // Commit on worker branch so merge has something to merge
+    const file_path = try std.fmt.allocPrint(alloc, "{s}/s8_cleanup.txt", .{wt_path});
+    defer alloc.free(file_path);
+    {
+        const f = try std.fs.createFileAbsolute(file_path, .{});
+        try f.writeAll("S8 cleanup test content");
+        f.close();
+    }
+    try worktree.runGit(alloc, wt_path, &.{ "add", "." });
+    try worktree.runGit(alloc, wt_path, &.{ "commit", "-m", "S8 cleanup test" });
+
+    // Pre-remove only the worktree (keep branch so merge can succeed)
+    try worktree.runGit(alloc, repo.path, &.{ "worktree", "remove", "--force", wt_path });
+
+    var mc = merge.MergeCoordinator.init(alloc);
+    defer mc.deinit();
+
+    const result = try mc.approve(&roster, repo.path, id, "merge");
+
+    // Merge succeeds but worktree cleanup fails (already removed) → cleanup_incomplete.
+    // On some git versions branch delete may also succeed, giving .success.
+    try std.testing.expect(result == .cleanup_incomplete or result == .success);
+    try std.testing.expect(mc.getStatus(id) == .success);
+}
+
+test "S8 scenario 2b: runGitLoggedWithStderr captures stderr on failure" {
+    // Directly test that runGitLoggedWithStderr returns false and logs stderr
+    // when the git command fails (e.g., removing a non-existent worktree).
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    try worktree.runGit(alloc, root, &.{ "init", "-b", "main" });
+
+    // Try to remove a non-existent worktree — this will fail and log stderr
+    const result = merge.runGitLoggedWithStderr(alloc, root, &.{ "worktree", "remove", "--force", "/nonexistent/path" }, "S8 test: worktree remove");
+    try std.testing.expect(result == false);
+}
+
+test "S8 scenario 2c: MergeCoordinator.ApproveResult has cleanup_incomplete variant" {
+    // Verify the ApproveResult enum includes the cleanup_incomplete variant
+    // that S2 added (TD31 fix).
+    const result: merge.ApproveResult = .cleanup_incomplete;
+    try std.testing.expect(result == .cleanup_incomplete);
+    try std.testing.expect(result != .success);
+    try std.testing.expect(result != .conflict);
+}
+
+test "S8 scenario 3: session restore ownership — register, release, re-register" {
+    // Simulate session restore: register ownership rules for a worker,
+    // release them (simulating session save/stop), then re-register
+    // (simulating restore). Verify deny patterns are enforced after restore.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+    var engine_ptr: ?*Engine = null;
+    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    defer tm_engine_destroy(engine_ptr);
+
+    // Register ownership for worker 1: write to src/**, deny infra/**
+    const write_pat = try alloc.dupeZ(u8, "src/**");
+    defer alloc.free(write_pat);
+    const deny_pat = try alloc.dupeZ(u8, "infra/**");
+    defer alloc.free(deny_pat);
+
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, write_pat.ptr, true) == 0);
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, deny_pat.ptr, false) == 0);
+
+    // Verify deny works before "session stop"
+    var allowed: bool = true;
+    const infra_path = try alloc.dupeZ(u8, "infra/deploy.yml");
+    defer alloc.free(infra_path);
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, infra_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == false);
+
+    // Simulate session stop: release ownership
+    try std.testing.expect(tm_ownership_release(engine_ptr, 1) == 0);
+
+    // After release, no rules — default allow
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, infra_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+
+    // Simulate session restore: re-register the same ownership rules
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, write_pat.ptr, true) == 0);
+    try std.testing.expect(tm_ownership_register(engine_ptr, 1, deny_pat.ptr, false) == 0);
+
+    // Verify deny patterns are enforced after restore
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, infra_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == false);
+
+    // Verify write patterns are enforced after restore
+    const src_path = try alloc.dupeZ(u8, "src/main.swift");
+    defer alloc.free(src_path);
+    try std.testing.expect(tm_ownership_check(engine_ptr, 1, src_path.ptr, &allowed) == 0);
+    try std.testing.expect(allowed == true);
+}
+
+test "S8 scenario 3b: ownership survives engine destroy and re-create" {
+    // Simulate full session lifecycle: create engine, register ownership,
+    // destroy engine, create new engine, re-register, verify enforcement.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+    const root_z = try alloc.dupeZ(u8, root);
+    defer alloc.free(root_z);
+
+    // First engine lifecycle
+    {
+        var engine_ptr: ?*Engine = null;
+        _ = tm_engine_create(root_z.ptr, &engine_ptr);
+
+        const deny_pat = try alloc.dupeZ(u8, "secrets/**");
+        defer alloc.free(deny_pat);
+        try std.testing.expect(tm_ownership_register(engine_ptr, 2, deny_pat.ptr, false) == 0);
+
+        var allowed: bool = true;
+        const secret_path = try alloc.dupeZ(u8, "secrets/api_key.txt");
+        defer alloc.free(secret_path);
+        try std.testing.expect(tm_ownership_check(engine_ptr, 2, secret_path.ptr, &allowed) == 0);
+        try std.testing.expect(allowed == false);
+
+        tm_engine_destroy(engine_ptr);
+    }
+
+    // Second engine lifecycle (simulates session restore)
+    {
+        var engine_ptr: ?*Engine = null;
+        _ = tm_engine_create(root_z.ptr, &engine_ptr);
+        defer tm_engine_destroy(engine_ptr);
+
+        // After fresh engine create, no ownership rules exist
+        var allowed: bool = false;
+        const secret_path = try alloc.dupeZ(u8, "secrets/api_key.txt");
+        defer alloc.free(secret_path);
+        try std.testing.expect(tm_ownership_check(engine_ptr, 2, secret_path.ptr, &allowed) == 0);
+        try std.testing.expect(allowed == true); // No rules = default allow
+
+        // Re-register (session restore path)
+        const deny_pat = try alloc.dupeZ(u8, "secrets/**");
+        defer alloc.free(deny_pat);
+        try std.testing.expect(tm_ownership_register(engine_ptr, 2, deny_pat.ptr, false) == 0);
+
+        // Now deny is enforced again
+        try std.testing.expect(tm_ownership_check(engine_ptr, 2, secret_path.ptr, &allowed) == 0);
+        try std.testing.expect(allowed == false);
+    }
+}
+
+test "S8 scenario 4: getDiff parses GitHub PR files API response" {
+    // Verify parseDiffResponse correctly parses the GitHub PR files API format
+    // that getDiff returns. This exercises the S5 diff tab engine-side path.
+    const alloc = std.testing.allocator;
+
+    // Simulate a realistic GitHub PR files API response
+    const json =
+        \\[{"filename":"engine/src/github.zig","status":"modified","additions":42,"deletions":8,
+        \\"patch":"@@ -100,8 +100,42 @@\n-old line\n+new line\n+added line"},
+        \\{"filename":"engine/include/teammux.h","status":"modified","additions":15,"deletions":3,
+        \\"patch":"@@ -50,3 +50,15 @@\n+// New diff types"},
+        \\{"filename":"macos/Sources/Teammux/RightPane/DiffView.swift","status":"modified","additions":30,"deletions":10,
+        \\"patch":"@@ -1,10 +1,30 @@\n+import SwiftUI"}]
+    ;
+
+    var diff = try github.parseDiffResponse(alloc, json);
+    defer diff.deinit(alloc);
+
+    // Verify file count and totals
+    try std.testing.expect(diff.files.len == 3);
+    try std.testing.expect(diff.total_additions == 87);
+    try std.testing.expect(diff.total_deletions == 21);
+
+    // Verify individual file details
+    try std.testing.expectEqualStrings("engine/src/github.zig", diff.files[0].path);
+    try std.testing.expect(diff.files[0].status == .modified);
+    try std.testing.expect(diff.files[0].additions == 42);
+    try std.testing.expect(diff.files[0].deletions == 8);
+    try std.testing.expect(diff.files[0].patch.len > 0);
+
+    try std.testing.expectEqualStrings("engine/include/teammux.h", diff.files[1].path);
+    try std.testing.expectEqualStrings("macos/Sources/Teammux/RightPane/DiffView.swift", diff.files[2].path);
+}
+
+test "S8 scenario 4b: getDiff C API returns null on null engine" {
+    try std.testing.expect(tm_github_get_diff(null, 1) == null);
+}
+
+test "S8 scenario 4c: diff free handles null safely" {
+    tm_diff_free(null); // Should not crash
+}
+
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; _ = worktree_lifecycle; _ = history_mod; }

@@ -463,7 +463,7 @@ fn runGitCaptureWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: 
 }
 
 /// Run git command for cleanup, logging warnings with stderr on failure. Returns true if command succeeded.
-fn runGitLoggedWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8, operation: []const u8) bool {
+pub fn runGitLoggedWithStderr(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8, operation: []const u8) bool {
     const result = runGitCaptureWithStderr(allocator, cwd, args) catch |err| {
         std.log.err("[teammux] {s} failed: {}", .{ operation, err });
         return false;
@@ -635,7 +635,7 @@ test "merge - runGitCapture captures output" {
 /// Test helper: create a git worktree and register a worker in the roster.
 /// Roster.spawn is metadata-only (C3 unification), so we create the worktree
 /// via runGit and then register the worker with the resulting path/branch.
-fn spawnTestWorker(
+pub fn spawnTestWorker(
     allocator: std.mem.Allocator,
     roster: *worktree.Roster,
     project_root: []const u8,
@@ -669,7 +669,7 @@ fn spawnTestWorker(
     return id;
 }
 
-fn setupTestRepo(allocator: std.mem.Allocator) !struct { tmp: std.testing.TmpDir, path: []u8 } {
+pub fn setupTestRepo(allocator: std.mem.Allocator) !struct { tmp: std.testing.TmpDir, path: []u8 } {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();
     const path = try tmp.dir.realpathAlloc(allocator, ".");
