@@ -1,6 +1,7 @@
 const std = @import("std");
 const worktree = @import("worktree.zig");
 const bus = @import("bus.zig");
+const ownership = @import("ownership.zig");
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -129,6 +130,31 @@ pub const Coordinator = struct {
         });
     }
 };
+
+// ─────────────────────────────────────────────────────────
+// PTY death state reconciliation
+// ─────────────────────────────────────────────────────────
+
+/// PTY death state reconciliation. Called when a worker's PTY process
+/// dies unexpectedly. Marks the worker as errored and releases all
+/// ownership entries. Does NOT remove the worktree — preserves the
+/// worker's in-progress work for Team Lead inspection.
+/// Returns true if worker was found and state updated, false otherwise.
+pub fn ptyDiedCallback(
+    roster: *worktree.Roster,
+    ownership_registry: *ownership.FileOwnershipRegistry,
+    worker_id: worktree.WorkerId,
+) bool {
+    // Mark worker status as errored (getWorker returns raw pointer — TD33)
+    const w = roster.getWorker(worker_id) orelse return false;
+    w.status = .err;
+
+    // Release all ownership entries for the dead worker
+    ownership_registry.release(worker_id);
+
+    // Worktree is intentionally preserved — Team Lead can inspect or salvage work
+    return true;
+}
 
 // ─────────────────────────────────────────────────────────
 // Tests
@@ -407,4 +433,77 @@ test "coordinator - dispatchResponse delivery failure returns DeliveryFailed (I7
     try std.testing.expect(history[0].delivered == false);
     try std.testing.expect(history[0].kind == .response);
     try std.testing.expectEqualStrings("answer will fail", history[0].instruction);
+}
+
+test "ptyDiedCallback marks worker errored and releases ownership" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
+
+    var ownership_reg = ownership.FileOwnershipRegistry.init(alloc);
+    defer ownership_reg.deinit();
+    try ownership_reg.register(1, "src/**/*.zig", true);
+
+    // Preconditions: worker idle, ownership registered
+    try std.testing.expect(roster.getWorker(1).?.status == .idle);
+    try std.testing.expect(ownership_reg.rules.contains(1));
+
+    // Fire ptyDiedCallback
+    const result = ptyDiedCallback(&roster, &ownership_reg, 1);
+    try std.testing.expect(result);
+
+    // Worker marked errored
+    try std.testing.expect(roster.getWorker(1).?.status == .err);
+    // Ownership released
+    try std.testing.expect(!ownership_reg.rules.contains(1));
+}
+
+test "ptyDiedCallback returns false for missing worker" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    var ownership_reg = ownership.FileOwnershipRegistry.init(alloc);
+    defer ownership_reg.deinit();
+
+    const result = ptyDiedCallback(&roster, &ownership_reg, 99);
+    try std.testing.expect(!result);
+}
+
+test "ptyDiedCallback is idempotent" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
+
+    var ownership_reg = ownership.FileOwnershipRegistry.init(alloc);
+    defer ownership_reg.deinit();
+
+    // Call twice — should be safe
+    const r1 = ptyDiedCallback(&roster, &ownership_reg, 1);
+    const r2 = ptyDiedCallback(&roster, &ownership_reg, 1);
+    try std.testing.expect(r1);
+    try std.testing.expect(r2);
+    try std.testing.expect(roster.getWorker(1).?.status == .err);
+}
+
+test "ptyDiedCallback preserves worker in roster (does not dismiss)" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+    try roster.workers.put(1, try makeTestWorker(alloc, 1));
+
+    var ownership_reg = ownership.FileOwnershipRegistry.init(alloc);
+    defer ownership_reg.deinit();
+
+    _ = ptyDiedCallback(&roster, &ownership_reg, 1);
+
+    // Worker should still be in roster (errored but not dismissed)
+    try std.testing.expect(roster.getWorker(1) != null);
+    try std.testing.expect(roster.count() == 1);
 }
