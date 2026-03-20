@@ -40,53 +40,59 @@
 | TD19 | interceptor.zig             | Interceptor exit code indistinguishable from git errors            | T3     | NO       | RESOLVED |
 | TD20 | EngineClient                | lastError is shared mutable state — stale errors bleed across calls| T6     | NO       | RESOLVED |
 
-## v0.1.4 — New debt introduced this sprint
+## v0.1.4 — Open debt (target updated to v0.1.6)
 
-| ID   | Module                   | Issue                                                            | Target | Breaking | Status |
-|------|--------------------------|------------------------------------------------------------------|--------|----------|--------|
-| TD21 | worktree_lifecycle.zig   | Dangling worktrees if engine crashes mid-spawn                   | v0.2   | NO       | OPEN   |
+| ID   | Module                   | Issue                                                            | Target | Breaking | Status  |
+|------|--------------------------|------------------------------------------------------------------|--------|----------|---------|
+| TD21 | worktree_lifecycle.zig   | Dangling worktrees if engine crashes mid-spawn                   | v0.1.6 | NO       | OPEN    |
 | TD22 | SessionState.swift       | Session restore does not re-establish ownership registry state   | v0.2   | NO       | PARTIAL |
-| TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown              | v0.1.5 | NO       | RESOLVED |
-| TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.2   | NO       | OPEN   |
-| TD25 | interceptor.zig          | Push-to-main block does not parse refspecs (HEAD:main bypasses)  | AA3    | NO       | RESOLVED |
-| TD26 | TeamMessage / CoordTypes | PRState and PRStatus model same concept with divergent colors    | v0.1.5 | NO       | RESOLVED |
-| TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange      | v0.1.5 | NO       | RESOLVED |
-| TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff   | v0.1.5 | NO       | RESOLVED |
-## Audit-address sprint — New debt introduced
+| TD24 | history.zig              | JSONL log grows unbounded across sessions, no rotation           | v0.1.6 | NO       | OPEN    |
+
+## v0.1.5 — Resolved
+
+| ID   | Module                   | Issue                                                         | Stream | Breaking | Status   |
+|------|--------------------------|---------------------------------------------------------------|--------|----------|----------|
+| TD23 | ContextView.swift        | CLAUDE.md rendered as plain text, not true markdown           | S6     | NO       | RESOLVED |
+| TD25 | interceptor.zig          | Push-to-main block does not parse refspecs                    | AA3    | NO       | RESOLVED |
+| TD26 | TeamMessage / CoordTypes | PRState and PRStatus model same concept with divergent colors  | S6     | NO       | RESOLVED |
+| TD27 | ContextView.swift        | Hot-reload repeat within 3s window not detected by onChange   | S6     | NO       | RESOLVED |
+| TD28 | ContextView.swift        | Diff highlight uses positional comparison, not LCS/Myers diff | S6     | NO       | RESOLVED |
+| TD31 | EngineClient.swift       | approveMerge/rejectMerge treat CLEANUP_INCOMPLETE as failure  | S2     | NO       | RESOLVED |
+| TD32 | merge.zig                | runGitLogged does not capture stderr for diagnostics          | S2     | NO       | RESOLVED |
+| TD36 | main.zig                 | tm_interceptor_path worker 0 OOM returns null without setError| S3     | NO       | RESOLVED |
+| TD37 | main.zig                 | sessionStop TL interceptor cleanup failure not surfaced       | S3     | NO       | RESOLVED |
+
+## Audit-address sprint — Open debt (target updated to v0.1.6)
+
+| ID   | Module                      | Issue                                                                              | Target | Breaking | Status |
+|------|-----------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
+| TD29 | teammux.h                   | 15 dead C exports have no deprecation annotation in the header                     | v0.1.6 | NO       | OPEN   |
+| TD30 | teammux.h                   | TM_ERR_PTY (6) is defined but no function returns it after PTY removal             | v0.1.6 | NO       | OPEN   |
+| TD33 | merge.zig / coordinator.zig | getWorker() returns raw pointer without lock in production paths                   | v0.1.6 | NO       | OPEN   |
+| TD34 | main.zig (tm_roster_get)    | Roster iteration uses raw pointers without holding roster mutex                    | v0.1.6 | NO       | OPEN   |
+| TD35 | worktree.zig                | Roster.claimNextId leaks ID slot when subsequent spawn step fails                  | v0.1.6 | NO       | OPEN   |
+
+## v0.1.5 S2 — Open debt (target updated to v0.1.6)
+
+| ID   | Module                   | Issue                                                                                    | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------------------------------|--------|----------|--------|
+| TD38 | GitView / ConflictView   | UI callers don't surface CLEANUP_INCOMPLETE warning — lastError only checked on !success | v0.1.6 | NO       | OPEN   |
+| TD39 | merge.zig (test)         | cleanup_incomplete integration test is non-deterministic                                  | v0.2   | NO       | OPEN   |
+
+## v0.1.5 S5 — Open debt (target updated to v0.1.6)
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
-| TD29 | teammux.h                | 15 dead C exports have no deprecation annotation in the header                     | v0.2   | NO       | OPEN   |
-| TD30 | teammux.h                | TM_ERR_PTY (6) is defined but no function returns it after PTY removal             | v0.2   | NO       | OPEN   |
-| TD31 | EngineClient.swift       | approveMerge/rejectMerge treat TM_ERR_CLEANUP_INCOMPLETE as hard failure           | v0.1.5 | NO       | RESOLVED |
-| TD32 | merge.zig                | runGitLogged captures exit code but not git stderr for cleanup failure diagnostics  | v0.1.5 | NO       | RESOLVED |
-| TD33 | merge.zig / coordinator.zig | getWorker() returns raw pointer without lock in production paths                | v0.2   | NO       | OPEN   |
-| TD34 | main.zig (tm_roster_get) | Roster iteration uses raw pointers without holding roster mutex                    | v0.2   | NO       | OPEN   |
-| TD35 | worktree.zig             | Roster.claimNextId leaks ID slot when subsequent spawn step fails                  | v0.2   | NO       | OPEN   |
-| TD36 | main.zig                 | tm_interceptor_path worker 0 OOM returns null without setError                     | v0.1.5 | NO       | RESOLVED |
-| TD37 | main.zig                 | sessionStop Team Lead interceptor cleanup failure not surfaced                     | v0.1.5 | NO       | RESOLVED |
+| TD40 | github.zig               | getDiff limited to 100 files (no pagination), 1 MiB buffer cap                    | v0.1.6 | NO       | OPEN   |
+| TD41 | DiffView.swift           | loadDiff calls engine.getDiff synchronously on MainActor, blocking UI              | v0.1.6 | NO       | OPEN   |
 
-## v0.1.5 S2 — New debt introduced (TD31/TD32 fix)
+## v0.1.5 S6 — Open debt (target updated to v0.1.6)
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
-| TD38 | GitView / ConflictView   | UI callers don't surface CLEANUP_INCOMPLETE warning — lastError only checked on !success | v0.2   | NO       | OPEN   |
-| TD39 | merge.zig (test)         | cleanup_incomplete integration test is non-deterministic — accepts both outcomes    | v0.2   | NO       | OPEN   |
-
-## v0.1.5 S5 — New debt introduced
-
-| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
-|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
-| TD40 | github.zig               | getDiff limited to 100 files (no pagination), 1 MiB buffer cap in runGhCommand     | v0.2   | NO       | OPEN   |
-| TD41 | DiffView.swift           | loadDiff calls engine.getDiff synchronously on MainActor, blocking UI during fetch  | v0.2   | NO       | OPEN   |
-
-## v0.1.5 S6 — New debt from PR review
-
-| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
-|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
-| TD42 | ContextView.swift        | LCS changedLineIndices has no unit tests — pure static function needs @testable    | v0.2   | NO       | OPEN   |
-| TD43 | hotreload.zig            | reload_count value never asserted in Zig tests — callbacks discard the u64         | v0.2   | NO       | OPEN   |
-| TD44 | ContextView.swift        | LCS DP table uses O(m*n) memory — two-row optimization for large CLAUDE.md files   | v0.2   | NO       | OPEN   |
+| TD42 | ContextView.swift        | LCS changedLineIndices has no unit tests                                           | v0.1.6 | NO       | OPEN   |
+| TD43 | hotreload.zig            | reload_count value never asserted in Zig tests                                     | v0.1.6 | NO       | OPEN   |
+| TD44 | ContextView.swift        | LCS DP table uses O(m*n) memory — two-row optimization deferred                    | v0.1.6 | NO       | OPEN   |
 
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
@@ -95,31 +101,31 @@
 - TD18: Role TOML hot-reload updates CLAUDE.md but not FileOwnershipRegistry. T4 extends hotreload.zig callback to call ownership_update and re-installs interceptor with new deny patterns atomically.
 - TD19: Interceptor wrapper uses exit 1 for enforcement — indistinguishable from real git errors. T3 changes all enforcement blocks to exit 126 (POSIX reserved for "command cannot execute").
 - TD20: EngineClient.lastError written by 50+ methods — stale errors bleed. T6 adds clear at method entry (minimal correct fix). Full Result<T, EngineError> migration deferred to future sprint.
-- TD21: tm_worktree_create creates directory and branch. On engine crash mid-spawn, worktree directory and branch may be left on disk. Recovery scan at engine init deferred to v0.2.
-- TD22: PARTIALLY RESOLVED (v0.1.5-S4). Role-based ownership is correctly restored — restoreSession() calls spawnWorker() with the saved roleId, which resolves the role from disk and registers all write/deny patterns via tm_ownership_register. No code path in v0.1.4 makes runtime ownership changes outside the role file, so this covers all current scenarios. Remaining gap: runtime ownership changes made via direct tm_ownership_register calls (not from the role file) are not persisted or restored. Full registry snapshot deferred to v0.2.
-- TD23: RESOLVED (v0.1.5-S6). ContextView now uses AttributedString(markdown:) with header-to-bold pre-processing and fenced code block preservation. No external dependency needed.
-- TD24: completion_history.jsonl is append-only and grows across all sessions. Log rotation (max size, archive old entries) deferred to v0.2. Risk is low for initial usage.
-- TD25: Push-to-main interceptor matches literal "main"/"master" tokens in $@. Refspec syntax (git push origin HEAD:main, refs/heads/feature:refs/heads/master) bypasses the check. Defense-in-depth only — workers operate in isolated worktrees on teammux/* branches. Full refspec destination parsing deferred to v0.2.
-- TD26: RESOLVED (v0.1.5-S6). Unified to single PRStatus type in CoordinationTypes.swift with color property (open=green, merged=purple, closed=secondary). TeamMessage.swift GitHubPR.state now uses PRStatus.
-- TD27: RESOLVED (v0.1.5-S6). Engine exposes reload_count (u64) in the hot-reload callback. Swift stores per-worker reload sequence in hotReloadedWorkers dictionary, ensuring onChange fires on every reload including rapid repeats.
-- TD28: RESOLVED (v0.1.5-S6). applyDiffHighlight now uses LCS (longest common subsequence) via changedLineIndices to identify truly changed lines. Insertions at the top no longer mark all subsequent shifted lines as changed.
-- TD29: AA6 marked 15 exports in main.zig with "NO SWIFT CALLER — candidate for removal in v0.2" but the authoritative header (teammux.h) still declares them without any deprecation annotation. Add matching comments in the header so consumers of the C API are aware. Exports: tm_worktree_create, tm_worktree_remove, tm_peer_question, tm_peer_delegate, tm_worker_complete, tm_worker_question, tm_completion_free, tm_question_free, tm_history_clear, tm_ownership_get, tm_ownership_free, tm_ownership_update, tm_interceptor_remove, tm_agent_resolve, tm_result_to_string.
-- TD30: AA6 removed tm_pty_send and tm_pty_fd (I18). TM_ERR_PTY=6 remains in tm_result_t and tm_result_to_string but is no longer returned by any function. Remove or mark as reserved in v0.2.
-- TD31: RESOLVED (v0.1.5-S2). EngineClient.swift approveMerge/rejectMerge now treat TM_ERR_CLEANUP_INCOMPLETE (15) as partial success, returning true with a logged warning.
-- TD32: RESOLVED (v0.1.5-S2). Cleanup commands now use runGitLoggedWithStderr which captures stderr via runGitCaptureWithStderr. Failure logs include git's actual error message.
-- TD33: merge.zig approve/reject (lines 84, 143, 219) and coordinator.zig dispatchTask (line 87) call roster.getWorker() without lock protection. Same race as audit finding I3 — concurrent dismiss can free worker strings while these functions read them. Line 143 is a write through the raw pointer (status mutation). AA2 stream scoped I3 fix to main.zig callers only. Migrate these to copyWorkerFields/hasWorker in v0.2.
-- TD34: tm_roster_get iterates e.roster.workers via .iterator() and passes entry.value_ptr (raw internal pointer) to fillCWorkerInfo without holding the roster mutex. A concurrent dismiss during iteration can free worker strings mid-copy. Either hold the mutex for the full iteration or copy all workers via copyWorkerFields first.
-- TD35: Roster.claimNextId() permanently increments next_id. If worktree_lifecycle.create or roster.spawn fails afterward, the ID slot is consumed with no worker registered. Over repeated failures, IDs increment without bound and gaps appear in the sequence. Fix: add an unclaimId() method or defer ID claim until after worktree creation succeeds. Low risk — IDs are u32, gaps are cosmetic.
-- TD36: RESOLVED (v0.1.5-S3). tm_interceptor_path for worker 0 now calls setError before returning null on OOM. Swift can distinguish "no interceptor" from "allocation failed".
-- TD37: RESOLVED (v0.1.5-S3). sessionStop now calls setError when Team Lead interceptor cleanup fails, allowing Swift to surface a notification about the orphaned .git-wrapper directory.
-- TD38: S2 TD31 fix sets lastError on the CLEANUP_INCOMPLETE path (code 15) so the UI can surface it, but GitView.approveMerge (line 411), GitView.rejectMerge (line 422), GitView PREventCard.approveMerge (line 562), PREventCard.rejectMerge (line 576), and ConflictView.forceMerge (line 128) all only read lastError inside `if !success`. Since code 15 returns true, the warning is never displayed. Fix: check lastError on the success path too and show it as a non-fatal banner/toast.
-- TD39: merge.zig test "approve returns cleanup_incomplete when worktree already removed" (line ~810) asserts `result == .cleanup_incomplete or result == .success`. The pre-removed worktree may or may not cause branch delete to also fail, making the test non-deterministic. It does not reliably exercise the cleanup_incomplete return path. Fix: also pre-delete the branch before approve to guarantee cleanup failure, or split into two deterministic tests.
-- TD40: getDiff calls `gh api repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100` without `--paginate`. PRs with >100 files silently return only the first 100. GitHub caps at 3000 files per PR. Adding `--paginate` requires handling concatenated JSON arrays (gh outputs one array per page) — either use `--paginate --slurp` and flatten the nested array, or loop with `page=N` manually. Also, `runGhCommand` caps stdout at 1 MiB (`readToEndAlloc(allocator, 1024 * 1024)`) which may be insufficient for very large PRs with full patch content. Fix: add `--paginate` support and increase or remove the buffer cap.
-- TD41: DiffView.loadDiff wraps `engine.getDiff(for:)` in `Task { @MainActor in }`. Since getDiff calls through the C API into `runGhCommand` which spawns and waits for a `gh` subprocess, the main thread is blocked for 1-5 seconds during the network call. The loading spinner may not render because SwiftUI cannot process the render pass while blocked. Fix: move the engine call to `Task.detached` or `Task { }` (without @MainActor) and dispatch results back to MainActor on completion.
-- TD42: changedLineIndices(old:new:) is a private static LCS function in ContextView.swift with multiple code paths (empty-old, empty-new, insertion, deletion, mixed, identical, complete replacement) and a backtracking loop with tie-breaking. Zero unit tests exist. Make internal static via @testable import and add at least 5 cases: identical content, single-edit, insertion-in-middle (the TD28 motivating case), deletion, both-empty.
-- TD43: All 10 Zig test callbacks in hotreload.zig and both in main.zig accept the u64 reload_seq parameter but discard it (`_: u64`). No test verifies that reload_count starts at 0, increments monotonically, or increments on parse failure. The existing "watcher detects NOTE_WRITE" test could capture and assert the value.
-- TD44: LCS DP table allocates Array(repeating: Array(repeating: 0, count: n+1), count: m+1) — O(m*n) memory. For typical CLAUDE.md files (< 200 lines) this is negligible. For 1000+ line files the allocation pressure could cause brief UI stutter on the main thread. Standard two-row optimization reduces space to O(n) but requires modified backtrack. Low priority unless CLAUDE.md files grow large.
-- updateRepo TODO(AA2): RESOLVED (v0.1.5-S1). GitHubClient.updateRepo now uses repo_mutex to serialize repo string swaps with pollEvents reads. Dupe-before-lock/free-after-unlock pattern prevents use-after-free.
-- Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
+- TD21: tm_worktree_create creates directory and branch. On engine crash mid-spawn, worktree directory and branch may be left on disk. Recovery scan at engine init deferred from v0.2 → v0.1.6.
+- TD22: PARTIALLY RESOLVED (v0.1.5-S4). Role-based ownership is correctly restored on session restore. Remaining gap: runtime ownership changes via direct tm_ownership_register (outside role file) not persisted. Full registry snapshot deferred to v0.2.
+- TD23: RESOLVED (v0.1.5-S6). ContextView now uses AttributedString(markdown:) with header-to-bold pre-processing and fenced code block preservation.
+- TD24: completion_history.jsonl is append-only and grows across all sessions. Log rotation (max size, archive old entries) deferred from v0.2 → v0.1.6.
+- TD25: RESOLVED (AA3). Refspec syntax patterns now intercepted.
+- TD26: RESOLVED (v0.1.5-S6). Unified to single PRStatus type with color property.
+- TD27: RESOLVED (v0.1.5-S6). Engine exposes reload_count (u64). Swift stores per-worker reload sequence in dictionary.
+- TD28: RESOLVED (v0.1.5-S6). LCS-based diff highlight via changedLineIndices.
+- TD29: 15 dead exports in main.zig marked in code but header (teammux.h) still declares them without deprecation annotation. Target moved v0.2 → v0.1.6.
+- TD30: TM_ERR_PTY=6 defined but no function returns it. Target moved v0.2 → v0.1.6.
+- TD31: RESOLVED (v0.1.5-S2). CLEANUP_INCOMPLETE treated as partial success.
+- TD32: RESOLVED (v0.1.5-S2). Cleanup commands capture stderr via runGitLoggedWithStderr.
+- TD33: merge.zig/coordinator.zig getWorker() raw pointer calls without lock. Target moved v0.2 → v0.1.6. Migrate to copyWorkerFields/hasWorker.
+- TD34: tm_roster_get iterates without mutex. Target moved v0.2 → v0.1.6.
+- TD35: claimNextId leaks ID slot on spawn failure. Target moved v0.2 → v0.1.6.
+- TD36: RESOLVED (v0.1.5-S3). setError on OOM for worker 0 interceptor path.
+- TD37: RESOLVED (v0.1.5-S3). setError on sessionStop interceptor cleanup failure.
+- TD38: UI callers never display CLEANUP_INCOMPLETE warning — only checked on !success path. GitView.approveMerge, rejectMerge, PREventCard.approveMerge, rejectMerge, ConflictView.forceMerge all affected. Target moved v0.2 → v0.1.6.
+- TD39: merge.zig cleanup_incomplete test non-deterministic. Remains v0.2.
+- TD40: getDiff uses ?per_page=100 without --paginate. PRs >100 files silently truncated. runGhCommand caps at 1 MiB. Target moved v0.2 → v0.1.6.
+- TD41: DiffView.loadDiff wraps getDiff in Task { @MainActor in } — blocks main thread 1-5s during gh subprocess. Target moved v0.2 → v0.1.6.
+- TD42: changedLineIndices has no unit tests. Target moved v0.2 → v0.1.6.
+- TD43: reload_count value never asserted in Zig tests. Target moved v0.2 → v0.1.6.
+- TD44: LCS DP table O(m*n) memory. Two-row optimization deferred. Target moved v0.2 → v0.1.6.
+- updateRepo TODO(AA2): RESOLVED (v0.1.5-S1). repo_mutex added to GitHubClient.
+- Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.

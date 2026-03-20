@@ -40,7 +40,7 @@ transiently — retry once before treating as a code issue.
 
 - engine/include/teammux.h              — C API contract (source of truth)
 - docs/TECH_DEBT.md                     — all known tech debt with target versions
-- docs/sprints/v0.1.5/V015_SPRINT.md   — current sprint master spec
+- docs/sprints/v0.1.6/V016_SPRINT.md   — current sprint master spec
 - docs/codex-audits/audit-001-post-v014/ACTION-PLAN.md — audit findings
 
 ## Directory Structure
@@ -50,7 +50,7 @@ engine/src/          — Zig coordination engine
 engine/include/      — C API header (teammux.h)
 macos/Sources/Teammux/Engine/    — EngineClient.swift (sole tm_* caller)
 macos/Sources/Teammux/Models/    — CoordinationTypes, TeamMessage
-macos/Sources/Teammux/RightPane/ — Git, Diff, LiveFeed, Dispatch, Context tabs
+macos/Sources/Teammux/RightPane/ — Right pane views (vertical icon rail nav)
 macos/Sources/Teammux/Workspace/ — RosterView, WorkerDetailDrawer, WorkerRow
 macos/Sources/Teammux/Setup/     — SetupView, SessionState
 macos/Sources/Teammux/App/       — AppDelegate
@@ -59,6 +59,21 @@ docs/codex-audits/               — Codex audit reports and action plans
 src/                             — Ghostty upstream (DO NOT TOUCH)
 ```
 
+## Right Pane Navigation
+
+The right pane uses a vertical scrollable icon rail on the far
+right edge of the screen. Each icon selects a pane view. Icons
+are stacked vertically, scrollable, with tooltip on hover and
+active state highlight. Current panes:
+
+1. Team Lead terminal (PTY surface — worker 0)
+2. Git (PR review, branch list, merge coordinator)
+3. Diff (GitHub PR files diff)
+4. Live Feed (message bus events, completion history)
+5. Dispatch (task dispatch, autonomous dispatch feed)
+6. Context (CLAUDE.md viewer, hot-reload diff)
+7. You (user's own Claude Code PTY session)
+
 ## Sprint Workflow
 
 - Main thread: orchestrator only — no feature code
@@ -66,7 +81,7 @@ src/                             — Ghostty upstream (DO NOT TOUCH)
 - Every stream raises a PR, main thread reviews, then merges
 - Merge order defined in the active sprint master spec
 - No stream merges without main thread approval
-- Stream task files live in docs/sprints/{version}/streams/
+- Stream task files live in docs/sprints/{version}/
 
 ## C API Conventions
 
@@ -78,6 +93,8 @@ src/                             — Ghostty upstream (DO NOT TOUCH)
   succeeded, worktree/branch cleanup failed. Not a hard error.
 - Worker ID 0 is always Team Lead. Never in roster. Deny-all
   interceptor installed at session start.
+- Dead exports in header: see TD29 — 15 exports annotated as
+  deprecated candidates. Do not add new callers.
 
 ## Version History
 
@@ -102,6 +119,10 @@ src/                             — Ghostty upstream (DO NOT TOUCH)
   resolved, diff tab backend via GitHub PR files API,
   updateRepo thread safety (repo_mutex), PRStatus color
   unification, LCS diff highlighting, markdown rendering,
-  hot-reload repeat detection, OSS docs (README,
-  CONTRIBUTING, getting-started, architecture). 388 engine
-  tests.
+  hot-reload repeat detection, OSS docs. 388 engine tests.
+- v0.1.6 — in progress: depth and polish sprint.
+  All remaining TD items (TD21/TD24/TD29/TD30/TD33/TD34/TD35/
+  TD38/TD40/TD41/TD42/TD43/TD44), all remaining audit-001
+  findings (I6/I7/I8/I11/I13/I15), MergeCoordinator full
+  workflow, worker health monitoring, User terminal pane,
+  agent memory, premium UI/UX with vertical icon rail.
