@@ -195,7 +195,7 @@ pub const GitHubClient = struct {
         const endpoint = try std.fmt.allocPrint(allocator, "repos/{s}/pulls/{d}/files?per_page=100", .{ repo, pr_number });
         defer allocator.free(endpoint);
 
-        const result = try runGhCommand(allocator, &.{ "api", "--paginate", "--slurp", endpoint }, 10 * 1024 * 1024);
+        const result = try runGhCommand(allocator, &.{ "api", "--paginate", "--slurp", "--jq", "add // []", endpoint }, 10 * 1024 * 1024);
         defer allocator.free(result);
 
         const diff = try parseDiffResponse(allocator, result);
