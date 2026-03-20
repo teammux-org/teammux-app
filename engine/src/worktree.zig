@@ -153,6 +153,17 @@ pub const Roster = struct {
         return self.workers.getPtr(worker_id);
     }
 
+    /// Thread-safe: set a worker's status. Returns false if worker not found.
+    pub fn setWorkerStatus(self: *Roster, worker_id: WorkerId, status: WorkerStatus) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.workers.getPtr(worker_id)) |w| {
+            w.status = status;
+            return true;
+        }
+        return false;
+    }
+
     /// Thread-safe: check whether a worker exists in the roster.
     pub fn hasWorker(self: *Roster, worker_id: WorkerId) bool {
         self.mutex.lock();

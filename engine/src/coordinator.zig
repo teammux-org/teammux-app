@@ -84,7 +84,8 @@ pub const Coordinator = struct {
         kind: DispatchKind,
         content: []const u8,
     ) !void {
-        if (roster.getWorker(worker_id) == null) return error.WorkerNotFound;
+        // TD33: thread-safe existence check via hasWorker
+        if (!roster.hasWorker(worker_id)) return error.WorkerNotFound;
 
         var delivered = true;
         message_bus.send(worker_id, 0, msg_type, content) catch |err| {
