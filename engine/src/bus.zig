@@ -20,6 +20,8 @@ pub const MessageType = enum(c_int) {
     delegation = 13,
     pr_ready = 14,
     pr_status = 15,
+    // 16 reserved for TM_MSG_HEALTH_STALLED (S11)
+    pty_died = 17, // Worker PTY process died unexpectedly
 
     pub fn toString(self: MessageType) []const u8 {
         return switch (self) {
@@ -36,6 +38,7 @@ pub const MessageType = enum(c_int) {
             .delegation => "delegation",
             .pr_ready => "pr_ready",
             .pr_status => "pr_status",
+            .pty_died => "pty_died",
         };
     }
 };
