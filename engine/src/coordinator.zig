@@ -45,9 +45,8 @@ pub const Coordinator = struct {
 
     /// Dispatch a task instruction to a specific worker.
     /// Validates worker exists in roster, routes through bus, records in history.
-    /// If bus delivery fails, the event is still recorded with delivered=false
-    /// and a warning is logged. The function returns success in this case —
-    /// callers should check dispatch history for delivery status.
+    /// If bus delivery fails, the event is recorded with delivered=false
+    /// and error.DeliveryFailed is returned so callers can surface the failure.
     pub fn dispatchTask(
         self: *Coordinator,
         roster: *worktree.Roster,
@@ -97,6 +96,9 @@ pub const Coordinator = struct {
         };
 
         try self.recordEvent(worker_id, content, delivered, kind);
+
+        // I7: Propagate delivery failure so callers can surface it
+        if (!delivered) return error.DeliveryFailed;
     }
 
     fn recordEvent(
@@ -331,7 +333,7 @@ test "coordinator - deinit frees all history strings" {
     // If deinit fails to free, testing allocator will panic with leak report
 }
 
-test "coordinator - delivery failure records event with delivered=false" {
+test "coordinator - delivery failure returns DeliveryFailed and records event (I7)" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -357,8 +359,10 @@ test "coordinator - delivery failure records event with delivered=false" {
     var coord = Coordinator.init(alloc);
     defer coord.deinit();
 
-    try coord.dispatchTask(&roster, &message_bus, 1, "will fail delivery");
+    // I7: DeliveryFailed is now propagated to caller
+    try std.testing.expectError(error.DeliveryFailed, coord.dispatchTask(&roster, &message_bus, 1, "will fail delivery"));
 
+    // Event still recorded with delivered=false
     const history = coord.getHistory();
     try std.testing.expect(history.len == 1);
     try std.testing.expect(history[0].delivered == false);

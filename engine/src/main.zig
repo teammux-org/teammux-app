@@ -163,6 +163,10 @@ pub const Engine = struct {
         cmd_watcher.bus_send_fn = busSendBridge;
         cmd_watcher.bus_send_userdata = self;
 
+        // I6: Wire error callback so command failures surface via setError
+        cmd_watcher.error_cb = commandErrorCallback;
+        cmd_watcher.error_cb_userdata = self;
+
         var hist_logger = history_mod.HistoryLogger.init(self.allocator, self.project_root) catch |err| {
             self.setError("history logger init failed") catch {};
             return err;
@@ -785,6 +789,14 @@ export fn tm_github_webhooks_stop(engine: ?*Engine, sub: u32) void { _ = sub; if
 
 // ─── Commands ────────────────────────────────────────────
 
+/// I6: Error callback for CommandWatcher — surfaces command processing errors via setError.
+fn commandErrorCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
+    const engine: *Engine = @ptrCast(@alignCast(userdata orelse return));
+    if (msg) |m| {
+        engine.setError(std.mem.span(m)) catch {};
+    }
+}
+
 // Command routing wrapper — add new /teammux-* command handlers as additional branches below.
 fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
     const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
@@ -1127,6 +1139,10 @@ export fn tm_dispatch_task(engine: ?*Engine, target_worker_id: u32, instruction:
             e.setError("tm_dispatch_task: worker not found") catch {};
             return 12; // TM_ERR_INVALID_WORKER
         }
+        if (err == error.DeliveryFailed) {
+            e.setError("tm_dispatch_task: delivery failed after retries") catch {};
+            return 16; // TM_ERR_DELIVERY_FAILED
+        }
         e.setError("tm_dispatch_task: dispatch failed") catch {};
         return 8;
     };
@@ -1146,6 +1162,10 @@ export fn tm_dispatch_response(engine: ?*Engine, target_worker_id: u32, response
         if (err == error.WorkerNotFound) {
             e.setError("tm_dispatch_response: worker not found") catch {};
             return 12; // TM_ERR_INVALID_WORKER
+        }
+        if (err == error.DeliveryFailed) {
+            e.setError("tm_dispatch_response: delivery failed after retries") catch {};
+            return 16; // TM_ERR_DELIVERY_FAILED
         }
         e.setError("tm_dispatch_response: dispatch failed") catch {};
         return 8;
