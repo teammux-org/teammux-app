@@ -30,7 +30,7 @@ a multi-agent coordination engine.
 ```bash
 ./build.sh                    # full build (engine + Swift + Ghostty)
 cd engine && zig build        # engine only
-cd engine && zig build test   # engine tests (baseline: see version history)
+cd engine && zig build test   # engine tests (baseline: 475)
 ```
 
 Note: Zig 0.15.2 (nightly) in use. Build runner may crash
@@ -120,9 +120,10 @@ active state highlight. Current panes:
   updateRepo thread safety (repo_mutex), PRStatus color
   unification, LCS diff highlighting, markdown rendering,
   hot-reload repeat detection, OSS docs. 388 engine tests.
-- v0.1.6 — in progress: depth and polish sprint.
+- v0.1.6 — shipped: depth and polish sprint.
   All remaining TD items (TD21/TD24/TD29/TD30/TD33/TD34/TD35/
   TD38/TD40/TD41/TD42/TD43/TD44), all remaining audit-001
   findings (I6/I7/I8/I11/I13/I15), MergeCoordinator full
-  workflow, worker health monitoring, User terminal pane,
-  agent memory, premium UI/UX with vertical icon rail.
+  conflict workflow, worker health monitoring, User terminal
+  pane, agent memory, premium UI/UX with vertical icon rail.
+  475 engine tests.
