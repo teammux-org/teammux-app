@@ -395,6 +395,15 @@ pub const Engine = struct {
             return 8;
         };
 
+        // Update sender's last activity timestamp for health monitoring
+        {
+            self.roster.mutex.lock();
+            defer self.roster.mutex.unlock();
+            if (self.roster.workers.getPtr(from)) |w| {
+                w.last_activity_ts = std.time.timestamp();
+            }
+        }
+
         // History write for command-file path (workers writing /teammux-complete files).
         // The C API path (tm_worker_complete/tm_worker_question) has its own history write.
         if (msg_enum == .completion or msg_enum == .question) {
@@ -881,6 +890,16 @@ export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_i
         e.setError(if (err == error.DeliveryFailed) "message delivery failed after 4 attempts" else "message send failed") catch {};
         return 8;
     };
+
+    // Update target worker's last activity timestamp (receiving a message = activity)
+    {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        if (e.roster.workers.getPtr(target_worker_id)) |w| {
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
+
     return 0;
 }
 export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0]const u8) c_int {
@@ -1671,6 +1690,15 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
         return 8;
     });
 
+    // Update worker activity timestamp
+    {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        if (e.roster.workers.getPtr(worker_id)) |w| {
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
+
     b.send(0, worker_id, .completion, payload) catch |err| {
         e.setError(if (err == error.DeliveryFailed) "completion delivery failed after retries exhausted" else "completion bus send failed") catch {};
         return 8;
@@ -1741,6 +1769,15 @@ export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]c
         e.setError("tm_worker_question: message bus not initialized (call tm_session_start first)") catch {};
         return 8;
     });
+
+    // Update worker activity timestamp
+    {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        if (e.roster.workers.getPtr(worker_id)) |w| {
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
 
     b.send(0, worker_id, .question, payload) catch |err| {
         e.setError(if (err == error.DeliveryFailed) "question delivery failed after retries exhausted" else "question bus send failed") catch {};
