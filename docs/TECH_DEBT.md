@@ -76,7 +76,7 @@
 
 | ID   | Module                   | Issue                                                                                    | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------------|--------|----------|--------|
-| TD38 | GitView / ConflictView   | UI callers don't surface CLEANUP_INCOMPLETE warning — lastError only checked on !success | v0.1.6 | NO       | OPEN   |
+| TD38 | GitView / ConflictView   | UI callers don't surface CLEANUP_INCOMPLETE warning — lastError only checked on !success | v0.1.6 | NO       | RESOLVED |
 | TD39 | merge.zig (test)         | cleanup_incomplete integration test is non-deterministic                                  | v0.2   | NO       | OPEN   |
 
 ## v0.1.5 S5 — Open debt (target updated to v0.1.6)
@@ -117,6 +117,13 @@
 | TD51 | github.zig               | runGhCommand discards stderr — gh failures produce opaque GhCommandFailed errors   | v0.2   | NO       | OPEN   |
 | TD52 | github.zig               | readToEndAlloc StreamTooLong leaves child process un-waited (potential zombie)      | v0.2   | NO       | OPEN   |
 
+## v0.1.6 S8 — Open debt
+
+| ID   | Module                      | Issue                                                                                          | Target | Breaking | Status |
+|------|-----------------------------|------------------------------------------------------------------------------------------------|--------|----------|--------|
+| TD53 | GitWorkerRow / ConflictView | No os.Logger — merge action warnings/errors not logged, unlike PRCardView                      | v0.1.7 | NO       | OPEN   |
+| TD54 | EngineClient.swift          | getMergeStatus() clears lastError as side effect — compound methods lose intermediate warnings  | v0.1.7 | NO       | OPEN   |
+
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
 - TD16: CompletionReport and QuestionRequest cards ephemeral across sessions. T5 adds history.zig JSONL persistence, T10 adds Swift bridge loading on sessionStart with collapsible history section in LiveFeedView.
@@ -141,7 +148,7 @@
 - TD35: claimNextId leaks ID slot on spawn failure. Target moved v0.2 → v0.1.6.
 - TD36: RESOLVED (v0.1.5-S3). setError on OOM for worker 0 interceptor path.
 - TD37: RESOLVED (v0.1.5-S3). setError on sessionStop interceptor cleanup failure.
-- TD38: UI callers never display CLEANUP_INCOMPLETE warning — only checked on !success path. GitView.approveMerge, rejectMerge, PREventCard.approveMerge, rejectMerge, ConflictView.forceMerge all affected. Target moved v0.2 → v0.1.6.
+- TD38: RESOLVED (v0.1.6-S8). All 6 call sites (GitWorkerRow approve/reject, PRCardView approve/reject, ConflictView forceMerge/reject) now check lastError on success path. Orange warning banner shown. getMergeStatus() lastError race fixed in EngineClient.approveMerge() (see TD54).
 - TD39: merge.zig cleanup_incomplete test non-deterministic. Remains v0.2.
 - TD40: RESOLVED (v0.1.6-S7). getDiff uses --paginate --slurp --jq 'add // []' for full pagination. runGhCommand accepts configurable max_output (10 MiB for getDiff). Page count logged.
 - TD41: RESOLVED (v0.1.6-S7). loadDiff uses Task.detached with engine captured before detach and result dispatched via await MainActor.run. Loading spinner renders during fetch.
@@ -149,6 +156,8 @@
 - TD43: reload_count value never asserted in Zig tests. Target moved v0.2 → v0.1.6.
 - TD44: LCS DP table O(m*n) memory. Two-row optimization deferred. Target moved v0.2 → v0.1.6.
 - updateRepo TODO(AA2): RESOLVED (v0.1.5-S1). repo_mutex added to GitHubClient.
+- TD53: GitWorkerRow and ConflictView have no os.Logger. PRCardView logs merge action warnings at .warning level and errors at .error level with worker ID for correlation. GitWorkerRow and ConflictView perform the same operations silently. Add loggers for debugging parity.
+- TD54: getMergeStatus() unconditionally sets lastError=nil on entry. When called internally by approveMerge() after setting a CLEANUP_INCOMPLETE warning, it erases the warning before the method returns. Surgical save/restore applied in approveMerge() (v0.1.6-S8). The broader pattern of every EngineClient method clearing lastError on entry is fragile for compound methods. Related to TD20 (Result<T, EngineError> migration).
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - TD45: recoverOrphans() and cleanupOrphanBranches() added in v0.1.6-S2 have no unit tests. Integration test would need to create a git repo, spawn a worktree via lifecycle, remove the registry entry without git cleanup, then call recoverOrphans and assert directory/branch removal. Target v0.1.7.
