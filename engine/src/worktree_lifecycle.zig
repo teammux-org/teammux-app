@@ -202,8 +202,9 @@ pub fn create(
 /// Ordered cleanup: git operations run before registry drop to avoid orphans.
 /// 1. git worktree remove --force
 /// 2. git branch -D
-/// 3. Drop registry entry and free memory
-/// Logs but does not fail if git operations fail (fire-and-forget cleanup).
+/// 3. Drop registry entry and free memory (only if git ops succeeded)
+/// If either git step fails, the registry entry is retained so that
+/// the TD21 startup recovery sweep can retry on next engine init.
 pub fn removeWorker(
     registry: *WorktreeRegistry,
     project_path: []const u8,
@@ -212,7 +213,7 @@ pub fn removeWorker(
     const entry = registry.entries.get(worker_id) orelse return;
 
     // Step 1: git worktree remove --force (before dropping registry entry)
-    _ = merge.runGitLoggedWithStderr(
+    const worktree_removed = merge.runGitLoggedWithStderr(
         registry.allocator,
         project_path,
         &.{ "worktree", "remove", "--force", entry.path },
@@ -220,15 +221,17 @@ pub fn removeWorker(
     );
 
     // Step 2: git branch -D (before dropping registry entry)
-    _ = merge.runGitLoggedWithStderr(
+    const branch_removed = merge.runGitLoggedWithStderr(
         registry.allocator,
         project_path,
         &.{ "branch", "-D", entry.branch },
         "lifecycle branch delete",
     );
 
-    // Step 3: ONLY NOW drop registry entry and free memory
-    // Entry guaranteed present (guarded by get() above)
+    // Step 3: drop registry entry ONLY if both git ops succeeded.
+    // On failure, retain the entry so recoverOrphans can retry at next startup.
+    if (!worktree_removed or !branch_removed) return;
+
     const kv = registry.entries.fetchRemove(worker_id).?;
     registry.allocator.free(kv.value.path);
     registry.allocator.free(kv.value.branch);
@@ -251,7 +254,11 @@ pub fn recoverOrphans(
     };
     defer allocator.free(root);
 
-    var dir = std.fs.openDirAbsolute(root, .{ .iterate = true }) catch |err| {
+    // Support both absolute and relative worktree_root (matches create() behavior)
+    var dir = (if (root.len > 0 and root[0] == '/')
+        std.fs.openDirAbsolute(root, .{ .iterate = true })
+    else
+        std.fs.cwd().openDir(root, .{ .iterate = true })) catch |err| {
         if (err == error.FileNotFound) return 0; // No worktree root — nothing to recover
         std.log.err("[teammux] recovery: cannot open worktree root {s}: {}", .{ root, err });
         return 0;
