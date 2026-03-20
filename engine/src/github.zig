@@ -766,7 +766,7 @@ fn extractJsonStringSimple(json: []const u8, key: []const u8) ?[]const u8 {
 
 /// Parse the JSON response from GitHub's PR files API into a Diff.
 /// Caller must call result.deinit(allocator) when done.
-fn parseDiffResponse(allocator: std.mem.Allocator, json_data: []const u8) !Diff {
+pub fn parseDiffResponse(allocator: std.mem.Allocator, json_data: []const u8) !Diff {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_data, .{});
     defer parsed.deinit();
 

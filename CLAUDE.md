@@ -97,6 +97,11 @@ src/                             — Ghostty upstream (DO NOT TOUCH)
   resolved. Lifetime safety, concurrency, Team Lead structural
   enforcement, C API contracts, performance hot path, dead code.
   Tag: audit-address-v014
-- v0.1.5 — in progress: polish and stability sprint.
-  TD22/TD23/TD26/TD27/TD28/TD31/TD32/TD36/TD37 + diff tab
-  backend + updateRepo thread safety + OSS docs.
+- v0.1.5 — shipped: polish and stability sprint.
+  TD22(partial)/TD23/TD26/TD27/TD28/TD31/TD32/TD36/TD37
+  resolved, diff tab backend via GitHub PR files API,
+  updateRepo thread safety (repo_mutex), PRStatus color
+  unification, LCS diff highlighting, markdown rendering,
+  hot-reload repeat detection, OSS docs (README,
+  CONTRIBUTING, getting-started, architecture). 388 engine
+  tests.
