@@ -643,6 +643,157 @@ test "hotreload - destroyAll cleans up map" {
 }
 
 // ─────────────────────────────────────────────────────────
+// Tests — TD43: reload_count assertions
+// ─────────────────────────────────────────────────────────
+
+test "hotreload TD43 - reload_count initialized to 0" {
+    const alloc = std.testing.allocator;
+    const watcher = try RoleWatcher.create(
+        alloc,
+        1,
+        "test-role",
+        "/tmp/nonexistent.toml",
+        "task",
+        "branch",
+        "/tmp",
+        "",
+        "",
+        null,
+        &struct {
+            fn cb(_: u32, _: ?[*:0]const u8, _: u64, _: ?*anyopaque) callconv(.c) void {}
+        }.cb,
+        null,
+    );
+    defer watcher.destroy();
+    try std.testing.expect(watcher.reload_count == 0);
+}
+
+test "hotreload TD43 - reload_count starts at 1, increments monotonically, increments on parse failure" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Seq Test");
+
+    const role_path = try std.fmt.allocPrint(alloc, "{s}/test-role.toml", .{tmp_path});
+    defer alloc.free(role_path);
+
+    // Phase-based state to handle kqueue delivering multiple events per file write
+    // (createFile truncation + writeAll can trigger two NOTE_WRITE events).
+    // Content-match ensures we capture seq only for the intended reload.
+    const SeqState = struct {
+        phase: std.atomic.Value(u32), // 0=waiting for V2, 1=waiting for V3, 2=waiting for parse failure
+        v2_seq: std.atomic.Value(u64),
+        v2_seen: std.atomic.Value(bool),
+        v3_seq: std.atomic.Value(u64),
+        v3_seen: std.atomic.Value(bool),
+        fail_seq: std.atomic.Value(u64),
+        fail_seen: std.atomic.Value(bool),
+    };
+    var state = SeqState{
+        .phase = std.atomic.Value(u32).init(0),
+        .v2_seq = std.atomic.Value(u64).init(0),
+        .v2_seen = std.atomic.Value(bool).init(false),
+        .v3_seq = std.atomic.Value(u64).init(0),
+        .v3_seen = std.atomic.Value(bool).init(false),
+        .fail_seq = std.atomic.Value(u64).init(0),
+        .fail_seen = std.atomic.Value(bool).init(false),
+    };
+
+    const watcher = try RoleWatcher.create(
+        alloc,
+        1,
+        "test-role",
+        role_path,
+        "seq test",
+        "test-branch",
+        tmp_path,
+        "",
+        "",
+        null,
+        &struct {
+            fn cb(_: u32, content: ?[*:0]const u8, seq: u64, ud: ?*anyopaque) callconv(.c) void {
+                const s: *SeqState = @ptrCast(@alignCast(ud));
+                const phase = s.phase.load(.acquire);
+                if (phase == 0) {
+                    if (content) |c| {
+                        const str = std.mem.span(c);
+                        if (std.mem.indexOf(u8, str, "Seq V2") != null) {
+                            s.v2_seq.store(seq, .release);
+                            s.v2_seen.store(true, .release);
+                        }
+                    }
+                } else if (phase == 1) {
+                    if (content) |c| {
+                        const str = std.mem.span(c);
+                        if (std.mem.indexOf(u8, str, "Seq V3") != null) {
+                            s.v3_seq.store(seq, .release);
+                            s.v3_seen.store(true, .release);
+                        }
+                    }
+                } else if (phase == 2) {
+                    // Parse failure phase — null content with seq > v3_seq
+                    if (content == null) {
+                        s.fail_seq.store(seq, .release);
+                        s.fail_seen.store(true, .release);
+                    }
+                }
+            }
+        }.cb,
+        @ptrCast(&state),
+    );
+    defer watcher.destroy();
+
+    try watcher.start();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // --- First reload: write "Seq V2", seq must be >= 1 ---
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Seq V2");
+
+    var waited: usize = 0;
+    while (waited < 30) : (waited += 1) {
+        if (state.v2_seen.load(.acquire)) break;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(state.v2_seen.load(.acquire));
+    const v2_seq = state.v2_seq.load(.acquire);
+    try std.testing.expect(v2_seq >= 1);
+
+    // --- Second reload: write "Seq V3", seq must be > v2_seq (monotonic) ---
+    state.phase.store(1, .release);
+    try writeTestRole(alloc, tmp.dir, "test-role.toml", "Seq V3");
+
+    waited = 0;
+    while (waited < 30) : (waited += 1) {
+        if (state.v3_seen.load(.acquire)) break;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(state.v3_seen.load(.acquire));
+    const v3_seq = state.v3_seq.load(.acquire);
+    try std.testing.expect(v3_seq > v2_seq);
+
+    // --- Parse failure: seq must still increment past v3_seq ---
+    state.phase.store(2, .release);
+    {
+        const invalid = try tmp.dir.createFile("test-role.toml", .{});
+        defer invalid.close();
+        try invalid.writeAll("this is not valid toml\n");
+    }
+
+    waited = 0;
+    while (waited < 30) : (waited += 1) {
+        if (state.fail_seen.load(.acquire)) break;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(state.fail_seen.load(.acquire));
+    const fail_seq = state.fail_seq.load(.acquire);
+    try std.testing.expect(fail_seq > v3_seq);
+}
+
+// ─────────────────────────────────────────────────────────
 // Tests — TD18: ownership + interceptor sync on hot-reload
 // ─────────────────────────────────────────────────────────
 
