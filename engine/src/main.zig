@@ -2463,6 +2463,7 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         11 => "TM_ERR_TIMEOUT", 12 => "TM_ERR_INVALID_WORKER", 13 => "TM_ERR_ROLE",
         14 => "TM_ERR_OWNERSHIP",
         15 => "TM_ERR_CLEANUP_INCOMPLETE",
+        16 => "TM_ERR_DELIVERY_FAILED",
         else => "TM_ERR_UNKNOWN",
     };
 }

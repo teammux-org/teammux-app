@@ -198,7 +198,11 @@ pub const CommandWatcher = struct {
             // I6: Write error response for malformed files
             _ = self.writeErrorResponse(dir, "unknown", "malformed command JSON: parse failed");
             self.notifyError("command file parse failed");
-            // Do NOT delete malformed files — leave for debugging
+            // Rename to .json.failed so it's skipped on future scans but kept for debugging.
+            // Build the new name: "{filename}.failed"
+            const new_name = std.fmt.allocPrint(self.allocator, "{s}.failed", .{filename}) catch return;
+            defer self.allocator.free(new_name);
+            dir.rename(filename, new_name) catch {};
             return;
         };
         defer self.allocator.free(parsed.command);
@@ -743,12 +747,10 @@ test "commands - I6 parse failure writes .teammux-error" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "parse failed") != null);
 
-    // Original file should NOT be deleted (left for debugging)
-    const original = tmp.dir.openFile("malformed.json", .{}) catch |err| {
-        try std.testing.expect(err != error.FileNotFound);
-        return;
-    };
-    original.close();
+    // Original file renamed to .json.failed (kept for debugging, skipped on future scans)
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("malformed.json", .{}));
+    const renamed = try tmp.dir.openFile("malformed.json.failed", .{});
+    renamed.close();
 }
 
 test "commands - I6 unhandled command writes error when no callback" {
