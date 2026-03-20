@@ -72,9 +72,11 @@ final class EngineClient: ObservableObject {
     /// overwrites the first.
     @Published var workerQuestions: [UInt32: QuestionRequest] = [:]
 
-    /// Workers that received a role hot-reload within the last 3 seconds.
-    /// `WorkerTerminalView` uses this to show a transient banner overlay.
-    @Published var hotReloadedWorkers: Set<UInt32> = []
+    /// Workers that received a role hot-reload within the last 3 seconds,
+    /// mapped to the engine's monotonic reload sequence number. Incrementing
+    /// the value on every reload ensures `onChange` fires even for rapid
+    /// repeated saves within the 3-second window (TD27).
+    @Published var hotReloadedWorkers: [UInt32: UInt64] = [:]
 
     /// Dispatch history from the Team Lead coordinator. Ordered
     /// chronologically; when more than 100 events exist, the oldest are
@@ -742,7 +744,7 @@ final class EngineClient: ObservableObject {
             number: prPtr.pointee.pr_number,
             url: String(cString: prPtr.pointee.pr_url),
             title: String(cString: prPtr.pointee.title),
-            state: PRState(fromCValue: prPtr.pointee.state.rawValue),
+            state: PRStatus(fromCValue: prPtr.pointee.state.rawValue),
             diffUrl: String(cString: prPtr.pointee.diff_url),
             workerId: prPtr.pointee.worker_id
         )
@@ -1278,7 +1280,7 @@ final class EngineClient: ObservableObject {
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         let result = roleId.withCString { cRoleId in
-            tm_role_watch(engine, workerId, cRoleId, { cbWorkerId, newClaudeMdPtr, userdata in
+            tm_role_watch(engine, workerId, cRoleId, { cbWorkerId, newClaudeMdPtr, reloadSeq, userdata in
                 guard let userdata else {
                     Logger(subsystem: "com.teammux.app", category: "EngineClient")
                         .error("role_changed_cb: nil userdata for worker \(cbWorkerId) — pointer lifecycle bug")
@@ -1294,7 +1296,7 @@ final class EngineClient: ObservableObject {
 
                 let client = Unmanaged<EngineClient>.fromOpaque(userdata).takeUnretainedValue()
                 Task { @MainActor in
-                    client.handleRoleChanged(workerId: cbWorkerId, newClaudeMd: newClaudeMd)
+                    client.handleRoleChanged(workerId: cbWorkerId, newClaudeMd: newClaudeMd, reloadSeq: reloadSeq)
                 }
             }, selfPtr)
         }
@@ -1312,7 +1314,7 @@ final class EngineClient: ObservableObject {
     private func stopRoleWatch(workerId: UInt32) {
         hotReloadTimers[workerId]?.cancel()
         hotReloadTimers.removeValue(forKey: workerId)
-        hotReloadedWorkers.remove(workerId)
+        hotReloadedWorkers.removeValue(forKey: workerId)
 
         guard let engine else {
             Self.logger.warning("stopRoleWatch: engine is nil — cannot unwatch for worker \(workerId)")
@@ -1329,7 +1331,7 @@ final class EngineClient: ObservableObject {
     /// notification with the updated CLAUDE.md content into the worker's PTY
     /// and shows a transient banner. Cancels any previous dismiss timer for
     /// the same worker to debounce rapid file saves.
-    private func handleRoleChanged(workerId: UInt32, newClaudeMd: String?) {
+    private func handleRoleChanged(workerId: UInt32, newClaudeMd: String?, reloadSeq: UInt64) {
         guard let newClaudeMd, !newClaudeMd.isEmpty else {
             let msg = "Role hot-reload failed for worker \(workerId) — the role file may contain syntax errors"
             Self.logger.error("handleRoleChanged: \(msg)")
@@ -1341,8 +1343,10 @@ final class EngineClient: ObservableObject {
         injectText(text, for: workerId)
 
         // Cancel any previous dismiss timer for this worker (debounce rapid saves).
+        // Store the engine's reload sequence number — incrementing ensures onChange
+        // fires even when the worker is already in the dict (TD27).
         hotReloadTimers[workerId]?.cancel()
-        hotReloadedWorkers.insert(workerId)
+        hotReloadedWorkers[workerId] = reloadSeq
 
         hotReloadTimers[workerId] = Task { @MainActor in
             do {
@@ -1353,7 +1357,7 @@ final class EngineClient: ObservableObject {
                 Self.logger.warning("handleRoleChanged: sleep interrupted: \(error)")
                 return
             }
-            self.hotReloadedWorkers.remove(workerId)
+            self.hotReloadedWorkers.removeValue(forKey: workerId)
             self.hotReloadTimers.removeValue(forKey: workerId)
         }
     }

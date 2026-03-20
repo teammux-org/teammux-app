@@ -633,6 +633,9 @@ const char* tm_interceptor_path(tm_engine_t* engine, uint32_t worker_id);
 // Callback fired when a watched role TOML file changes.
 // new_claude_md is the regenerated CLAUDE.md content, or NULL if the role
 // file failed to parse (syntax error, unreadable, etc.).
+// reload_seq is a monotonically increasing counter per worker, incremented
+// on every file-change event (including parse failures). Callers can use
+// this to detect rapid repeated saves within the same notification window.
 //
 // THREADING: Invoked on a per-watcher background thread (NOT the engine's
 // internal thread). Callbacks for different workers may fire concurrently.
@@ -644,6 +647,7 @@ const char* tm_interceptor_path(tm_engine_t* engine, uint32_t worker_id);
 // Caller must copy if the content is needed beyond callback scope.
 typedef void (*tm_role_changed_cb)(uint32_t worker_id,
                                     const char* new_claude_md,
+                                    uint64_t reload_seq,
                                     void* userdata);
 
 // Start watching the role TOML file for a worker. When the file changes

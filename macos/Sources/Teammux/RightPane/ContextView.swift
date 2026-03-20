@@ -1,15 +1,16 @@
 import SwiftUI
+import AppKit
 import os
 
 // MARK: - ContextView
 
 /// Right-pane tab for viewing a worker's CLAUDE.md context file.
 ///
-/// Reads {worktreePath}/CLAUDE.md from disk for the selected worker.
-/// Level-2 section headers (## prefix) are rendered bold; other heading
-/// levels are displayed as plain text (TD23). Auto-refreshes on role
-/// hot-reload with changed-line highlight. Edit button opens the worker's
-/// role TOML (visible only when a role is assigned and its file is found).
+/// Renders CLAUDE.md with full inline markdown (bold, italic, code) via
+/// `AttributedString(markdown:)` and header detection (TD23). Auto-refreshes
+/// on role hot-reload using a reload counter dict to detect rapid repeated
+/// saves within the 3-second window (TD27). Changed lines are identified
+/// via LCS diff rather than positional comparison (TD28).
 struct ContextView: View {
     @ObservedObject var engine: EngineClient
 
@@ -46,8 +47,8 @@ struct ContextView: View {
         }
         .onChange(of: engine.hotReloadedWorkers) { oldValue, newValue in
             guard let workerId = selectedWorkerId,
-                  newValue.contains(workerId),
-                  !oldValue.contains(workerId) else { return }
+                  let newSeq = newValue[workerId],
+                  newSeq != oldValue[workerId] else { return }
             loadContent(diffHighlight: true)
         }
     }
@@ -61,7 +62,7 @@ struct ContextView: View {
                 .foregroundColor(.primary)
 
             if let workerId = selectedWorkerId,
-               engine.hotReloadedWorkers.contains(workerId) {
+               engine.hotReloadedWorkers[workerId] != nil {
                 Text("\u{21BB} Updated")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.orange)
@@ -69,7 +70,7 @@ struct ContextView: View {
                     .padding(.vertical, 2)
                     .background(Capsule().fill(Color.orange.opacity(0.15)))
                     .transition(.opacity)
-                    .animation(.easeInOut(duration: 0.3), value: engine.hotReloadedWorkers)
+                    .animation(.easeInOut(duration: 0.3), value: engine.hotReloadedWorkers[selectedWorkerId ?? 0])
             }
 
             Spacer()
@@ -176,32 +177,90 @@ struct ContextView: View {
         .padding()
     }
 
-    // MARK: - CLAUDE.md content
+    // MARK: - CLAUDE.md content (TD23)
 
     private func claudeContentView(_ content: String) -> some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                let lines = content.components(separatedBy: "\n")
-                ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
-                    lineView(line, at: index)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            Text(buildMarkdownContent(content))
+                .font(.system(size: 11, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
         }
     }
 
-    private func lineView(_ line: String, at index: Int) -> some View {
-        let isHeader = line.hasPrefix("## ")
-        let displayText = isHeader ? String(line.dropFirst(3)) : (line.isEmpty ? " " : line)
-        let weight: Font.Weight = isHeader ? .bold : .regular
+    /// Build an `AttributedString` with inline markdown styling, header
+    /// formatting, and diff-highlight backgrounds applied via ranges.
+    private func buildMarkdownContent(_ content: String) -> AttributedString {
+        let lines = content.components(separatedBy: "\n")
 
-        return Text(displayText)
-            .font(.system(size: 11, weight: weight, design: .monospaced))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 1)
-            .background(highlightedLines.contains(index) ? Color.yellow.opacity(0.3) : Color.clear)
-            .animation(.easeInOut(duration: 0.3), value: highlightedLines)
+        // Pre-process: convert header prefixes to bold inline syntax,
+        // skipping lines inside fenced code blocks.
+        var inCodeBlock = false
+        let processed = lines.map { line -> String in
+            if line.hasPrefix("```") {
+                inCodeBlock = !inCodeBlock
+                return line
+            }
+            guard !inCodeBlock else { return line }
+
+            if line.hasPrefix("#### ") {
+                return "**\(line.dropFirst(5))**"
+            } else if line.hasPrefix("### ") {
+                return "**\(line.dropFirst(4))**"
+            } else if line.hasPrefix("## ") {
+                return "**\(line.dropFirst(3))**"
+            } else if line.hasPrefix("# ") {
+                return "**\(line.dropFirst(2))**"
+            }
+            return line
+        }.joined(separator: "\n")
+
+        var result: AttributedString
+        do {
+            result = try AttributedString(
+                markdown: processed,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+            )
+        } catch {
+            Self.logger.warning("buildMarkdownContent: markdown parse failed, falling back to plain text: \(error)")
+            result = AttributedString(processed)
+        }
+
+        // Apply diff-highlight backgrounds to changed line ranges.
+        if !highlightedLines.isEmpty {
+            Self.applyDiffHighlights(&result, highlightedLines: highlightedLines)
+        }
+
+        return result
+    }
+
+    /// Walk the attributed string character-by-character to find line
+    /// boundaries (newlines) and apply yellow background to changed lines.
+    private static func applyDiffHighlights(
+        _ result: inout AttributedString,
+        highlightedLines: Set<Int>
+    ) {
+        let bgColor = Color(nsColor: NSColor.systemYellow.withAlphaComponent(0.3))
+        var lineStart = result.startIndex
+        var lineIndex = 0
+
+        var current = result.startIndex
+        while current < result.endIndex {
+            if result.characters[current] == "\n" {
+                if highlightedLines.contains(lineIndex) {
+                    result[lineStart..<current].backgroundColor = bgColor
+                }
+                lineStart = result.characters.index(after: current)
+                lineIndex += 1
+            }
+            current = result.characters.index(after: current)
+        }
+        // Last line (no trailing newline)
+        if lineStart < result.endIndex && highlightedLines.contains(lineIndex) {
+            result[lineStart..<result.endIndex].backgroundColor = bgColor
+        }
     }
 
     // MARK: - Content loading
@@ -239,27 +298,18 @@ struct ContextView: View {
         }
     }
 
-    /// Highlights lines that differ between old and new content for 2 seconds.
-    /// Uses positional comparison (not LCS/Myers diff), so an insertion or
-    /// deletion will mark all subsequent shifted lines as changed (TD28).
+    // MARK: - LCS diff highlight (TD28)
+
+    /// Highlights truly changed lines between old and new content for 2 seconds.
+    /// Uses LCS (longest common subsequence) to identify lines that were actually
+    /// added, removed, or modified — eliminates false positives from shifted lines.
     private func applyDiffHighlight(oldContent: String, newContent: String) {
         let oldLines = oldContent.components(separatedBy: "\n")
         let newLines = newContent.components(separatedBy: "\n")
 
-        var changedIndices: Set<Int> = []
-        let maxIndex = max(oldLines.count, newLines.count)
-
-        for i in 0..<maxIndex {
-            let oldLine = i < oldLines.count ? oldLines[i] : nil
-            let newLine = i < newLines.count ? newLines[i] : nil
-            if oldLine != newLine {
-                changedIndices.insert(i)
-            }
-        }
-
+        let changedIndices = Self.changedLineIndices(old: oldLines, new: newLines)
         guard !changedIndices.isEmpty else { return }
 
-        // Cancel any existing highlight timer before starting new one.
         highlightTask?.cancel()
         highlightedLines = changedIndices
 
@@ -268,6 +318,43 @@ struct ContextView: View {
             guard !Task.isCancelled else { return }
             highlightedLines = []
         }
+    }
+
+    /// Compute indices of lines in `newLines` that are NOT part of the LCS
+    /// with `oldLines` — these are truly added or changed lines.
+    private static func changedLineIndices(old oldLines: [String], new newLines: [String]) -> Set<Int> {
+        let m = oldLines.count
+        let n = newLines.count
+        guard m > 0, n > 0 else { return Set(0..<n) }
+
+        // Build LCS DP table
+        var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
+        for i in 1...m {
+            for j in 1...n {
+                if oldLines[i - 1] == newLines[j - 1] {
+                    dp[i][j] = dp[i - 1][j - 1] + 1
+                } else {
+                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+                }
+            }
+        }
+
+        // Backtrack to find which new-content line indices are in the LCS
+        var lcsNewIndices: Set<Int> = []
+        var i = m, j = n
+        while i > 0 && j > 0 {
+            if oldLines[i - 1] == newLines[j - 1] {
+                lcsNewIndices.insert(j - 1)
+                i -= 1
+                j -= 1
+            } else if dp[i - 1][j] > dp[i][j - 1] {
+                i -= 1
+            } else {
+                j -= 1
+            }
+        }
+
+        return Set(0..<n).subtracting(lcsNewIndices)
     }
 
     // MARK: - Role TOML path resolution

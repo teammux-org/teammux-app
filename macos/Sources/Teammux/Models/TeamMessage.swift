@@ -120,59 +120,14 @@ struct TeamMessage: Identifiable, Equatable, Sendable {
 
 // MARK: - GitHubPR
 
-// MARK: - PRState
-
-/// Type-safe representation of a GitHub PR's state.
-/// Maps to `tm_pr_state_t` in teammux.h: TM_PR_OPEN=0, TM_PR_CLOSED=1, TM_PR_MERGED=2
-enum PRState: Sendable {
-    case open, closed, merged
-    case unknown
-
-    /// Initialise from the C enum raw value (`tm_pr_state_t`).
-    init(fromCValue value: UInt32) {
-        switch value {
-        case 0: self = .open
-        case 1: self = .closed
-        case 2: self = .merged
-        default: self = .unknown
-        }
-    }
-
-    /// Legacy initialiser from string (used in tests / fallback).
-    init(from string: String) {
-        switch string.lowercased() {
-        case "open":   self = .open
-        case "closed": self = .closed
-        case "merged": self = .merged
-        default:       self = .unknown
-        }
-    }
-
-    var label: String {
-        switch self {
-        case .open: return "Open"
-        case .closed: return "Closed"
-        case .merged: return "Merged"
-        case .unknown: return "Unknown"
-        }
-    }
-
-    var color: Color {
-        switch self {
-        case .open: return .green
-        case .closed: return .red
-        case .merged: return .purple
-        case .unknown: return .secondary
-        }
-    }
-}
-
 /// Mirrors `tm_pr_t` in teammux.h.
+/// Uses `PRStatus` (from CoordinationTypes.swift) for state — the unified
+/// type replacing the former `PRState` (TD26).
 struct GitHubPR: Identifiable, Sendable {
     let number: UInt64
     let url: String
     let title: String
-    let state: PRState
+    let state: PRStatus
     let diffUrl: String
     let workerId: UInt32
 

@@ -8,7 +8,7 @@ const interceptor = @import("interceptor.zig");
 // Types
 // ─────────────────────────────────────────────────────────
 
-pub const RoleChangedCb = *const fn (u32, ?[*:0]const u8, ?*anyopaque) callconv(.c) void;
+pub const RoleChangedCb = *const fn (u32, ?[*:0]const u8, u64, ?*anyopaque) callconv(.c) void;
 
 pub const RoleWatcherMap = std.AutoHashMap(worktree.WorkerId, *RoleWatcher);
 
@@ -31,6 +31,7 @@ pub const RoleWatcher = struct {
     watch_fd: std.posix.fd_t,
     callback: RoleChangedCb,
     userdata: ?*anyopaque,
+    reload_count: u64, // Only accessed from the single watchLoop thread — not atomic.
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
 
@@ -81,6 +82,7 @@ pub const RoleWatcher = struct {
             .watch_fd = -1,
             .callback = callback,
             .userdata = userdata,
+            .reload_count = 0,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
         };
@@ -211,11 +213,13 @@ pub const RoleWatcher = struct {
     }
 
     fn fireCallback(self: *RoleWatcher) void {
+        self.reload_count += 1;
+
         // Re-parse the role definition from disk
         var role_def = config.parseRoleDefinition(self.allocator, self.role_path) catch |err| {
             std.log.warn("[teammux] hotreload: failed to parse role '{s}' for worker {d}: {}", .{ self.role_id, self.worker_id, err });
             // Signal parse failure to callback so UI can notify user
-            self.callback(self.worker_id, null, self.userdata);
+            self.callback(self.worker_id, null, self.reload_count, self.userdata);
             return;
         };
         defer role_def.deinit(self.allocator);
@@ -256,6 +260,7 @@ pub const RoleWatcher = struct {
             self.branch_name,
         ) catch |err| {
             std.log.warn("[teammux] hotreload: failed to generate CLAUDE.md for worker {d}: {}", .{ self.worker_id, err });
+            self.callback(self.worker_id, null, self.reload_count, self.userdata);
             return;
         };
         defer self.allocator.free(claude_md);
@@ -269,7 +274,7 @@ pub const RoleWatcher = struct {
 
         // Fire callback — watcher allocates; memory freed after this call returns
         const ptr: [*:0]const u8 = claude_md_z.ptr;
-        self.callback(self.worker_id, ptr, self.userdata);
+        self.callback(self.worker_id, ptr, self.reload_count, self.userdata);
     }
 };
 
@@ -345,7 +350,7 @@ test "hotreload - RoleWatcher create and destroy without start" {
         "",
         null,
         &struct {
-            fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+            fn cb(_: u32, _: ?[*:0]const u8, _: u64, _: ?*anyopaque) callconv(.c) void {}
         }.cb,
         null,
     );
@@ -382,7 +387,7 @@ test "hotreload - watcher detects NOTE_WRITE" {
         "",
         null,
         &struct {
-            fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+            fn cb(_: u32, content: ?[*:0]const u8, _: u64, ud: ?*anyopaque) callconv(.c) void {
                 if (content) |c| {
                     const s = std.mem.span(c);
                     // Verify the regenerated content contains the updated role name
@@ -442,7 +447,7 @@ test "hotreload - watcher detects NOTE_RENAME (vim save pattern)" {
         "",
         null,
         &struct {
-            fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+            fn cb(_: u32, content: ?[*:0]const u8, _: u64, ud: ?*anyopaque) callconv(.c) void {
                 if (content) |c| {
                     const s = std.mem.span(c);
                     if (std.mem.indexOf(u8, s, "Vim Saved Role") != null) {
@@ -516,7 +521,7 @@ test "hotreload - callback receives correct CLAUDE.md content" {
         "",
         null,
         &struct {
-            fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+            fn cb(_: u32, content: ?[*:0]const u8, _: u64, ud: ?*anyopaque) callconv(.c) void {
                 const s_ptr: *CallbackState = @ptrCast(@alignCast(ud));
                 if (content) |c| {
                     const s = std.mem.span(c);
@@ -580,7 +585,7 @@ test "hotreload - stop joins thread cleanly" {
         "",
         null,
         &struct {
-            fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+            fn cb(_: u32, _: ?[*:0]const u8, _: u64, _: ?*anyopaque) callconv(.c) void {}
         }.cb,
         null,
     );
@@ -618,7 +623,7 @@ test "hotreload - destroyAll cleans up map" {
     defer alloc.free(path_b);
 
     const noop_cb = &struct {
-        fn cb(_: u32, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {}
+        fn cb(_: u32, _: ?[*:0]const u8, _: u64, _: ?*anyopaque) callconv(.c) void {}
     }.cb;
 
     var map = RoleWatcherMap.init(alloc);
@@ -712,7 +717,7 @@ test "hotreload TD18 - ownership registry updated on role change" {
         "Test Worker",
         &registry,
         &struct {
-            fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+            fn cb(_: u32, content: ?[*:0]const u8, _: u64, ud: ?*anyopaque) callconv(.c) void {
                 if (content != null) {
                     const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud));
                     flag.store(true, .release);
@@ -789,7 +794,7 @@ test "hotreload TD18 - interceptor wrapper regenerated with new patterns" {
         "Test Worker",
         &registry,
         &struct {
-            fn cb(_: u32, content: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+            fn cb(_: u32, content: ?[*:0]const u8, _: u64, ud: ?*anyopaque) callconv(.c) void {
                 if (content != null) {
                     const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud));
                     flag.store(true, .release);
@@ -865,7 +870,7 @@ test "hotreload TD18 - failed parse does not corrupt registry" {
         "Test Worker",
         &registry,
         &struct {
-            fn cb(_: u32, _: ?[*:0]const u8, ud: ?*anyopaque) callconv(.c) void {
+            fn cb(_: u32, _: ?[*:0]const u8, _: u64, ud: ?*anyopaque) callconv(.c) void {
                 // Fires for both success (non-null) and failure (null)
                 const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud));
                 flag.store(true, .release);
