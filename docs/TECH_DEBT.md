@@ -124,6 +124,14 @@
 | TD53 | GitWorkerRow / ConflictView | No os.Logger — merge action warnings/errors not logged, unlike PRCardView                      | v0.1.7 | NO       | OPEN   |
 | TD54 | EngineClient.swift          | getMergeStatus() clears lastError as side effect — compound methods lose intermediate warnings  | v0.1.7 | NO       | OPEN   |
 
+## v0.1.6 S12 — Open debt
+
+| ID   | Module                                    | Issue                                                                                                                 | Target | Breaking | Status |
+|------|-------------------------------------------|-----------------------------------------------------------------------------------------------------------------------|--------|----------|--------|
+| TD57 | RightPaneView.swift                       | @ViewBuilder switch recreates terminal PTY on every tab switch — no surface persistence                               | v0.2   | NO       | OPEN   |
+| TD58 | TeamLeadTerminalView / UserTerminalView   | No timeout on Ghostty loading spinner — infinite "Starting…" if Ghostty fails to init                                 | v0.2   | NO       | OPEN   |
+| TD59 | TeamLeadTerminalView / UserTerminalView   | ghostty_surface_new failure not observable — SurfaceView init is non-failable, broken surface shown as blank terminal  | v0.2   | NO       | OPEN   |
+
 ## v0.1.6 S14 — Open debt
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
@@ -178,3 +186,6 @@
 - TD49: tm_history_load returns NULL with count=0 for both empty history and load failure. Swift callers cannot distinguish. setError is called on failure but not on "logger not initialized". Fix: differentiate via count sentinel or additional out parameter. Pre-existing pattern, surfaced during v0.1.6-S3 review.
 - TD55: GitView, DiffView, DispatchView, LiveFeedView, ContextView, RosterView, and RightPaneView (youPlaceholder) all use identical empty state structure (VStack with 32pt icon, headline, subheadline). Extract a shared EmptyStateView(icon:title:subtitle:) component. Target v0.2.
 - TD56: RightPaneView installs an NSEvent.addLocalMonitorForEvents for Cmd+1..7. This swallows the events before they reach the responder chain. If the app later adds menu bar items with Cmd+1..7 shortcuts, they will conflict. Consider migrating to SwiftUI .commands() at the App/Scene level. Target v0.2.
+- TD57: RightPaneView.tabContent uses @ViewBuilder switch — SwiftUI destroys and recreates the view (and its underlying Ghostty SurfaceView PTY) on every tab change. Affects TeamLeadTerminalView, UserTerminalView, and all future terminal panes. Fix: hold surfaces alive at RightPaneView level (e.g. ZStack with opacity toggle, or @StateObject surface holder). Target v0.2.
+- TD58: Both terminal views show ProgressView("Starting…") while ghosttyApp.app is nil. If Ghostty never initializes (crash, config error, resource exhaustion), the spinner shows forever. Fix: add a timeout (e.g. 10s) that transitions to an error state with actionable message.
+- TD59: Ghostty.SurfaceView init is non-failable — ghostty_surface_new can return nil internally, setting self.error = .apiFailed, but the NSViewRepresentable caller has no way to detect this. The user sees a blank/black terminal with no error message. Fix: after construction, check SurfaceView.error or surfaceModel; if failed, log and show fallback view. Requires Ghostty API surface inspection.

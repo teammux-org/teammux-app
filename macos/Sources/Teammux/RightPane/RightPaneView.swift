@@ -115,26 +115,7 @@ struct RightPaneView: View {
         case .context:
             ContextView(engine: engine, selectedWorkerId: $contextSelectedWorkerId)
         case .you:
-            youPlaceholder
+            UserTerminalView(engine: engine)
         }
-    }
-
-    // MARK: - You placeholder (S12 will replace with UserTerminalView)
-
-    private var youPlaceholder: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "person.fill")
-                .font(.system(size: 32))
-                .foregroundColor(.secondary)
-            Text("Your Terminal")
-                .font(.headline)
-                .foregroundColor(.secondary)
-            Text("Your Claude Code session will appear here.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
     }
 }
