@@ -72,14 +72,14 @@
 | TD34 | main.zig (tm_roster_get)    | Roster iteration uses raw pointers without holding roster mutex                    | v0.1.6 | NO       | RESOLVED |
 | TD35 | worktree.zig                | Roster.claimNextId leaks ID slot when subsequent spawn step fails                  | v0.1.6 | NO       | RESOLVED |
 
-## v0.1.5 S2 — Open debt (target updated to v0.1.6)
+## v0.1.5 S2 — Partially resolved (TD39 deferred to v0.2)
 
 | ID   | Module                   | Issue                                                                                    | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------------|--------|----------|--------|
 | TD38 | GitView / ConflictView   | UI callers don't surface CLEANUP_INCOMPLETE warning — lastError only checked on !success | v0.1.6 | NO       | RESOLVED |
 | TD39 | merge.zig (test)         | cleanup_incomplete integration test is non-deterministic                                  | v0.2   | NO       | OPEN   |
 
-## v0.1.5 S5 — Open debt (target updated to v0.1.6)
+## v0.1.5 S5 — Resolved (v0.1.6)
 
 | ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
 |------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|

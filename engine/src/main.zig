@@ -7363,16 +7363,16 @@ test "S15 integration 2: crash recovery — orphaned worktree cleaned on init" {
     e.sessionStop();
     tm_engine_destroy(engine_ptr);
 
-    // Verify orphan directory was removed
+    // Verify orphan directory was removed — hard assertion on success path
     _ = std.fs.openDirAbsolute(orphan_path, .{}) catch |err| {
         try std.testing.expect(err == error.FileNotFound);
-        return; // Success
+        return; // Success — orphan cleaned
     };
-    // If we get here, the directory was NOT removed. This isn't a hard failure
-    // since recovery depends on config load succeeding, but it's unexpected.
+    // If directory still exists after successful sessionStart, recovery failed
+    return error.OrphanNotCleaned;
 }
 
-test "S15 integration 3: history rotation — 1 MiB triggers archive" {
+test "S15 integration 3: history rotation — small max_size triggers archive" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7418,10 +7418,10 @@ test "S15 integration 3: history rotation — 1 MiB triggers archive" {
     return error.Archive3ShouldNotExist;
 }
 
-test "S15 integration 4: bus reliability — /teammux-assign rejected via routing (I6)" {
-    // I6: Silent command failures. /teammux-assign via command file is explicitly
-    // rejected (logged, not silently dropped). Verify commandRoutingCallback handles
-    // it without crash and forwards to Swift callback when wired.
+test "S15 integration 4: bus reliability — /teammux-assign blocked, unknown forwarded (I6)" {
+    // I6: Silent command failures. /teammux-assign is explicitly blocked by
+    // commandRoutingCallback (logged, not silently dropped). Unknown commands
+    // are forwarded to the Swift callback for error surface.
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -7432,14 +7432,11 @@ test "S15 integration 4: bus reliability — /teammux-assign rejected via routin
     const e = try Engine.create(alloc, root);
     defer e.destroy();
 
-    // Wire Swift callback to detect the forwarded command
     const CmdState = struct {
         var forwarded: bool = false;
         var cmd_buf: [64]u8 = undefined;
         var cmd_len: usize = 0;
     };
-    CmdState.forwarded = false;
-    CmdState.cmd_len = 0;
 
     const swift_cb = struct {
         fn cb(cmd: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
@@ -7455,17 +7452,30 @@ test "S15 integration 4: bus reliability — /teammux-assign rejected via routin
     e.cmd_cb = swift_cb;
     e.cmd_cb_userdata = null;
 
-    // Call routing with /teammux-assign — should be rejected/forwarded, not silently dropped
-    const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
-    defer alloc.free(cmd_z);
-    const args_z = try alloc.dupeZ(u8, "{\"task\":\"test\",\"worker_id\":1}");
-    defer alloc.free(args_z);
+    // Part A: /teammux-assign is BLOCKED (not forwarded to Swift callback)
+    CmdState.forwarded = false;
+    CmdState.cmd_len = 0;
+    {
+        const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
+        defer alloc.free(cmd_z);
+        const args_z = try alloc.dupeZ(u8, "{\"task\":\"test\",\"worker_id\":1}");
+        defer alloc.free(args_z);
+        commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    }
+    try std.testing.expect(!CmdState.forwarded);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
-
-    // /teammux-assign is logged as rejected (I6 fix: not silently dropped).
-    // Swift callback receives it for error surface.
-    // Pre-I6 behavior: command file deleted silently with no feedback.
+    // Part B: truly unknown command IS forwarded to Swift callback (I6 error surface)
+    CmdState.forwarded = false;
+    CmdState.cmd_len = 0;
+    {
+        const cmd_z = try alloc.dupeZ(u8, "/teammux-bogus");
+        defer alloc.free(cmd_z);
+        const args_z = try alloc.dupeZ(u8, "{}");
+        defer alloc.free(args_z);
+        commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    }
+    try std.testing.expect(CmdState.forwarded);
+    try std.testing.expectEqualStrings("/teammux-bogus", CmdState.cmd_buf[0..CmdState.cmd_len]);
 }
 
 test "S15 integration 5: dispatch delivery failure — TM_ERR_DELIVERY_FAILED returned" {
