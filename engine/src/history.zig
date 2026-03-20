@@ -4,16 +4,22 @@ const worktree = @import("worktree.zig");
 const commands = @import("commands.zig");
 
 // ─────────────────────────────────────────────────────────
-// Completion history JSONL persistence (TD16)
+// Completion history JSONL persistence (TD16/TD24/I15)
 //
 // Persists completion and question events to a JSONL file.
 // File: {project_root}/.teammux/logs/completion_history.jsonl
-// New entries are appended (append semantics) via atomic
-// read-rewrite-rename to prevent partial writes on crash.
+// New entries are written via direct file append (O(1)).
 //
-// Threading: callers must serialize access externally.
-// The engine guarantees single-threaded access via its
-// event loop. Concurrent writers are not supported (TD24).
+// Threading: when the async writer is started (I15),
+// append() enqueues non-blocking to a 256-slot ring buffer;
+// a background thread drains entries to disk. Queue access
+// is serialized via an internal mutex. When the writer is
+// not started, append() writes synchronously.
+// load()/clear()/rotate() auto-flush the queue.
+//
+// Rotation (TD24): when file size exceeds max_size_bytes
+// (default 1 MiB), .jsonl is rotated to .1, .1 to .2,
+// and .2 is discarded. At most 2 archive files retained.
 // ─────────────────────────────────────────────────────────
 
 /// Maximum JSONL file size for read operations (10 MB).
@@ -157,7 +163,7 @@ pub const HistoryLogger = struct {
 
     /// Start the background writer thread (I15).
     /// After this call, append() enqueues non-blocking instead of writing synchronously.
-    /// Call stopWriter() or shutdown() to drain and stop.
+    /// Call shutdown() or deinit() to drain and stop.
     pub fn startWriter(self: *HistoryLogger) !void {
         if (self.writer_thread != null) return;
         self.queue_stop.store(false, .release);
@@ -214,20 +220,26 @@ pub const HistoryLogger = struct {
     }
 
     /// Check file size and rotate if over limit. Errors are logged, not propagated.
+    /// Uses rotateInner (no flush) — safe to call from the writer thread.
     fn maybeRotate(self: *HistoryLogger) void {
         const stat = std.fs.cwd().statFile(self.file_path) catch return;
         if (stat.size > self.max_size_bytes) {
-            self.rotate() catch |err| {
+            self.rotateInner() catch |err| {
                 std.log.warn("[teammux] history: rotation failed: {}", .{err});
             };
         }
     }
 
     /// Rotate the history file: .jsonl → .1, .1 → .2, discard old .2.
-    /// Flushes the async queue first. Missing files are silently skipped.
-    /// Keeps at most 2 archive files.
+    /// Flushes the async queue first to ensure all pending entries are on disk.
+    /// Keeps at most 2 archive files. Missing files are silently skipped.
     pub fn rotate(self: *HistoryLogger) !void {
         if (self.writer_thread != null) self.flush();
+        return self.rotateInner();
+    }
+
+    /// Inner rotation logic — does NOT flush. Safe to call from the writer thread.
+    fn rotateInner(self: *HistoryLogger) !void {
         var dir = try std.fs.openDirAbsolute(self.dir_path, .{});
         defer dir.close();
 
