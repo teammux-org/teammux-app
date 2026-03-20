@@ -122,6 +122,10 @@ final class EngineClient: ObservableObject {
     /// Not Codable — ephemeral metadata, not persisted across sessions.
     @Published var autonomousDispatches: [UInt32: AutonomousDispatch] = [:]
 
+    /// Per-worker memory file content loaded from .teammux-memory.md.
+    /// Updated on completion signal and on session restore.
+    @Published var workerMemory: [UInt32: String] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -301,6 +305,7 @@ final class EngineClient: ObservableObject {
         completionHistory.removeAll()
         workerPRs.removeAll()
         autonomousDispatches.removeAll()
+        workerMemory.removeAll()
         lastError = nil
     }
 
@@ -435,6 +440,9 @@ final class EngineClient: ObservableObject {
 
         // Refresh the roster to pick up the new worker
         refreshRoster()
+
+        // Load any existing memory file for this worker (S13)
+        loadWorkerMemory(workerId: workerId)
 
         return workerId
     }
@@ -583,6 +591,9 @@ final class EngineClient: ObservableObject {
             lastError = "Skipped workers with missing worktrees: \(names)"
             Self.logger.warning("restoreSession: skipped \(skippedWorkers.count) workers — \(names)")
         }
+
+        // Load agent memory files for all restored workers (S13)
+        loadAllWorkerMemory()
 
         Self.logger.info("restoreSession: restored \(snapshot.workers.count - skippedWorkers.count)/\(snapshot.workers.count) workers")
         return skippedWorkers.count
@@ -2006,6 +2017,83 @@ final class EngineClient: ObservableObject {
         return entries
     }
 
+    // MARK: - Agent memory (S13)
+
+    /// Append a memory entry for a worker. Constructs a summary string from
+    /// the completion report and worker metadata, then delegates to the engine.
+    func memoryAppend(workerId: UInt32, completion: CompletionReport) {
+        guard let engine else {
+            Self.logger.warning("memoryAppend: engine not created")
+            return
+        }
+
+        // Build summary from available data
+        var lines: [String] = []
+
+        // Task description from roster
+        if let worker = roster.first(where: { $0.id == workerId }) {
+            lines.append("**Task:** \(worker.taskDescription)")
+        }
+
+        lines.append("**Summary:** \(completion.summary)")
+
+        if let details = completion.details, !details.isEmpty {
+            lines.append("**Details:** \(details)")
+        }
+
+        if let commit = completion.gitCommit, !commit.isEmpty {
+            lines.append("**Commit:** \(commit)")
+        }
+
+        // PR info if available
+        if let pr = workerPRs[workerId], !pr.prUrl.isEmpty {
+            lines.append("**PR:** \(pr.prUrl)")
+        }
+
+        let summary = lines.joined(separator: "\n")
+
+        let result = summary.withCString { cSummary in
+            tm_memory_append(engine, workerId, cSummary)
+        }
+        if result != TM_OK {
+            if let msg = lastEngineError() {
+                Self.logger.warning("memoryAppend failed for worker \(workerId): \(msg)")
+            }
+        } else {
+            // Refresh cached memory content
+            loadWorkerMemory(workerId: workerId)
+        }
+    }
+
+    /// Read the memory file content for a worker.
+    func memoryRead(workerId: UInt32) -> String? {
+        guard let engine else {
+            Self.logger.warning("memoryRead: engine not created")
+            return nil
+        }
+
+        guard let cStr = tm_memory_read(engine, workerId) else {
+            return nil
+        }
+        let content = String(cString: cStr)
+        tm_memory_free(cStr)
+        return content.isEmpty ? nil : content
+    }
+
+    /// Load memory file for a specific worker and update the published dictionary.
+    func loadWorkerMemory(workerId: UInt32) {
+        if let content = memoryRead(workerId: workerId) {
+            workerMemory[workerId] = content
+        }
+    }
+
+    /// Load memory files for all workers with worktrees.
+    private func loadAllWorkerMemory() {
+        for (workerId, _) in workerWorktrees {
+            loadWorkerMemory(workerId: workerId)
+        }
+    }
+
     // MARK: - Private: Coordination handlers
 
     /// Parse a TM_MSG_COMPLETION payload and update `workerCompletions`.
@@ -2048,6 +2136,7 @@ final class EngineClient: ObservableObject {
                 timestamp: timestamp
             )
             workerCompletions[workerId] = report
+            memoryAppend(workerId: workerId, completion: report)
             triggerAutonomousDispatch(for: report)
         } catch {
             let msg = "handleCompletionMessage: JSON parse failed for worker \(workerId): \(error.localizedDescription)"

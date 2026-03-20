@@ -14,6 +14,7 @@ pub const hotreload = @import("hotreload.zig");
 pub const coordinator_mod = @import("coordinator.zig");
 pub const worktree_lifecycle = @import("worktree_lifecycle.zig");
 pub const history_mod = @import("history.zig");
+pub const memory_mod = @import("memory.zig");
 
 // ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
@@ -2423,6 +2424,57 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         15 => "TM_ERR_CLEANUP_INCOMPLETE",
         else => "TM_ERR_UNKNOWN",
     };
+}
+
+// ─── Agent memory (S13) ──────────────────────────────────
+
+/// Append a memory entry to a worker's .teammux-memory.md file.
+/// summary must not be NULL. Returns TM_OK on success,
+/// TM_ERR_INVALID_WORKER if worker has no worktree.
+export fn tm_memory_append(engine: ?*Engine, worker_id: u32, summary: ?[*:0]const u8) c_int {
+    const e = engine orelse return 99;
+    const sum = std.mem.span(summary orelse {
+        e.setError("tm_memory_append: summary is NULL") catch {};
+        return 99;
+    });
+    const wt_path = worktree_lifecycle.getPath(&e.wt_registry, worker_id) orelse {
+        e.setError("tm_memory_append: worker has no worktree") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    };
+    const now: u64 = @intCast(std.time.timestamp());
+    memory_mod.append(e.allocator, wt_path, sum, now) catch {
+        e.setError("tm_memory_append: failed to write memory file") catch {};
+        return 99;
+    };
+    return 0;
+}
+
+/// Read the full content of a worker's .teammux-memory.md file.
+/// Returns a heap-allocated null-terminated string. Caller must call tm_memory_free().
+/// Returns NULL if the file does not exist or worker has no worktree.
+export fn tm_memory_read(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
+    const e = engine orelse return null;
+    const wt_path = worktree_lifecycle.getPath(&e.wt_registry, worker_id) orelse {
+        e.setError("tm_memory_read: worker has no worktree") catch {};
+        return null;
+    };
+    const content = memory_mod.read(e.allocator, wt_path) catch {
+        e.setError("tm_memory_read: failed to read memory file") catch {};
+        return null;
+    } orelse return null;
+    defer e.allocator.free(content);
+
+    // Dupe as C string for caller ownership
+    const z = std.heap.c_allocator.dupeZ(u8, content) catch {
+        e.setError("tm_memory_read: allocation failed") catch {};
+        return null;
+    };
+    return z.ptr;
+}
+
+/// Free a string returned by tm_memory_read.
+export fn tm_memory_free(str: ?[*:0]const u8) void {
+    if (str) |s| std.heap.c_allocator.free(std.mem.span(s));
 }
 
 // ─── Helpers ─────────────────────────────────────────────

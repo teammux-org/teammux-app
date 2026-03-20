@@ -627,6 +627,29 @@ tm_result_t tm_interceptor_remove(tm_engine_t* engine, uint32_t worker_id);
 const char* tm_interceptor_path(tm_engine_t* engine, uint32_t worker_id);
 
 // -----------------------------------------------------------------
+// Agent memory (S13)
+//
+// Per-worker context summaries persisted as .teammux-memory.md
+// in each worker's worktree. Entries are appended on task completion
+// and persist across session restore (file lives on disk in worktree).
+// -----------------------------------------------------------------
+
+// Append a memory entry to a worker's .teammux-memory.md file.
+// summary must not be NULL. Engine timestamps the entry automatically.
+// Returns TM_ERR_INVALID_WORKER if worker has no worktree.
+tm_result_t tm_memory_append(tm_engine_t* engine,
+                              tm_worker_id_t worker_id,
+                              const char* summary);
+
+// Read the full content of a worker's .teammux-memory.md file.
+// Returns heap-allocated null-terminated string. Caller must call tm_memory_free().
+// Returns NULL if the file does not exist or worker has no worktree.
+const char* tm_memory_read(tm_engine_t* engine, tm_worker_id_t worker_id);
+
+// Free a string returned by tm_memory_read.
+void tm_memory_free(const char* str);
+
+// -----------------------------------------------------------------
 // Role hot-reload
 // -----------------------------------------------------------------
 

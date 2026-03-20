@@ -4,13 +4,18 @@ import os
 
 // MARK: - ContextView
 
-/// Right-pane tab for viewing a worker's CLAUDE.md context file.
+/// Right-pane tab for viewing a worker's CLAUDE.md context file and
+/// agent memory timeline (S13).
 ///
 /// Renders CLAUDE.md with full inline markdown (bold, italic, code) via
 /// `AttributedString(markdown:)` and header detection (TD23). Auto-refreshes
 /// on role hot-reload using a reload counter dict to detect rapid repeated
 /// saves within the 3-second window (TD27). Changed lines are identified
 /// via LCS diff rather than positional comparison (TD28).
+///
+/// The Memory section displays per-worker context summaries persisted in
+/// `.teammux-memory.md`. Entries are collapsible and show timestamp, task,
+/// files touched, and PR link. Memory persists across session restore.
 struct ContextView: View {
     @ObservedObject var engine: EngineClient
 
@@ -22,6 +27,7 @@ struct ContextView: View {
     @State private var loadError: String?
     @State private var highlightedLines: Set<Int> = []
     @State private var highlightTask: Task<Void, Never>?
+    @State private var memoryExpanded: Bool = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -177,17 +183,78 @@ struct ContextView: View {
         .padding()
     }
 
-    // MARK: - CLAUDE.md content (TD23)
+    // MARK: - CLAUDE.md content (TD23) + Memory timeline (S13)
 
     private func claudeContentView(_ content: String) -> some View {
         ScrollView {
-            Text(buildMarkdownContent(content))
+            VStack(alignment: .leading, spacing: 0) {
+                Text(buildMarkdownContent(content))
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+
+                if let workerId = selectedWorkerId {
+                    memorySection(workerId: workerId)
+                }
+            }
+        }
+    }
+
+    // MARK: - Memory timeline (S13)
+
+    @ViewBuilder
+    private func memorySection(workerId: UInt32) -> some View {
+        let memoryContent = engine.workerMemory[workerId]
+        let entries = parseMemoryEntries(memoryContent)
+
+        if !entries.isEmpty {
+            Divider()
+                .padding(.horizontal, 12)
+
+            VStack(alignment: .leading, spacing: 0) {
+                Button(action: { memoryExpanded.toggle() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: memoryExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.secondary)
+
+                        Label("Agent Memory (\(entries.count))", systemImage: "brain")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.primary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+
+                if memoryExpanded {
+                    ForEach(entries.indices, id: \.self) { idx in
+                        memoryEntryView(entries[idx])
+                        if idx < entries.count - 1 {
+                            Divider()
+                                .padding(.horizontal, 16)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func memoryEntryView(_ entry: MemoryEntry) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(entry.timestamp)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(.secondary)
+
+            Text(buildMarkdownContent(entry.body))
                 .font(.system(size: 11, design: .monospaced))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
     }
 
     /// Build an `AttributedString` with inline markdown styling, header
@@ -355,6 +422,56 @@ struct ContextView: View {
         }
 
         return Set(0..<n).subtracting(lcsNewIndices)
+    }
+
+    // MARK: - Memory entry parsing
+
+    /// A single memory entry parsed from .teammux-memory.md.
+    private struct MemoryEntry {
+        let timestamp: String
+        let body: String
+    }
+
+    /// Parse .teammux-memory.md content into individual entries.
+    /// Format: each entry starts with `## {timestamp}` followed by body text.
+    private func parseMemoryEntries(_ content: String?) -> [MemoryEntry] {
+        guard let content, !content.isEmpty else { return [] }
+
+        var entries: [MemoryEntry] = []
+        var currentTimestamp: String?
+        var currentBodyLines: [String] = []
+
+        for line in content.components(separatedBy: "\n") {
+            if line.hasPrefix("## ") {
+                // Flush previous entry
+                if let ts = currentTimestamp {
+                    let body = currentBodyLines.joined(separator: "\n")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !body.isEmpty {
+                        entries.append(MemoryEntry(timestamp: ts, body: body))
+                    }
+                }
+                currentTimestamp = String(line.dropFirst(3))
+                currentBodyLines = []
+            } else if line.hasPrefix("# ") {
+                // Skip the file header
+                continue
+            } else if currentTimestamp != nil {
+                currentBodyLines.append(line)
+            }
+        }
+
+        // Flush last entry
+        if let ts = currentTimestamp {
+            let body = currentBodyLines.joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty {
+                entries.append(MemoryEntry(timestamp: ts, body: body))
+            }
+        }
+
+        // Newest first
+        return entries.reversed()
     }
 
     // MARK: - Role TOML path resolution
