@@ -16,6 +16,10 @@ pub const MergeStatus = enum(c_int) {
     rejected = 4,
 };
 
+/// Per-file conflict resolution choice.
+/// `ours`/`theirs` apply git checkout and are finalizable.
+/// `skip` records the choice without git ops — blocks finalization.
+/// `pending` is the initial state — cannot be set via resolveConflict.
 pub const ConflictResolution = enum(u8) {
     ours = 0,
     theirs = 1,
@@ -341,21 +345,20 @@ pub const MergeCoordinator = struct {
 
         // Apply git operations
         switch (resolution) {
-            .ours => {
-                const r1 = try runGitCapture(self.allocator, project_root, &.{ "checkout", "--ours", file_path });
+            .ours, .theirs => {
+                const flag: []const u8 = if (resolution == .ours) "--ours" else "--theirs";
+                const r1 = try runGitCapture(self.allocator, project_root, &.{ "checkout", flag, file_path });
                 defer r1.deinit(self.allocator);
-                if (r1.exit_code != 0) return error.GitFailed;
+                if (r1.exit_code != 0) {
+                    std.log.err("[teammux] git checkout {s} failed for '{s}': exit code {d}", .{ flag, file_path, r1.exit_code });
+                    return error.GitFailed;
+                }
                 const r2 = try runGitCapture(self.allocator, project_root, &.{ "add", file_path });
                 defer r2.deinit(self.allocator);
-                if (r2.exit_code != 0) return error.GitFailed;
-            },
-            .theirs => {
-                const r1 = try runGitCapture(self.allocator, project_root, &.{ "checkout", "--theirs", file_path });
-                defer r1.deinit(self.allocator);
-                if (r1.exit_code != 0) return error.GitFailed;
-                const r2 = try runGitCapture(self.allocator, project_root, &.{ "add", file_path });
-                defer r2.deinit(self.allocator);
-                if (r2.exit_code != 0) return error.GitFailed;
+                if (r2.exit_code != 0) {
+                    std.log.err("[teammux] git add failed for '{s}': exit code {d}", .{ file_path, r2.exit_code });
+                    return error.GitFailed;
+                }
             },
             .skip => {}, // No git ops — just record the resolution
             .pending => unreachable,
@@ -404,7 +407,10 @@ pub const MergeCoordinator = struct {
         }
 
         // Look up worker for worktree/branch cleanup
-        const worker = roster.getWorker(worker_id) orelse return .success;
+        const worker = roster.getWorker(worker_id) orelse {
+            std.log.warn("[teammux] finalizeMerge: worker {d} not in roster — skipping worktree/branch cleanup", .{worker_id});
+            return .cleanup_incomplete;
+        };
         const branch_name = try self.allocator.dupe(u8, worker.branch_name);
         defer self.allocator.free(branch_name);
         const wt_path = try self.allocator.dupe(u8, worker.worktree_path);
@@ -1443,4 +1449,40 @@ test "merge - resolve theirs + finalize uses worker content (integration)" {
     };
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("# Worker theirs version", content);
+}
+
+test "merge - resolveConflict rejects pending resolution" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    var file_map = std.StringHashMap(ConflictResolution).init(std.testing.allocator);
+    const key = try std.testing.allocator.dupe(u8, "file.txt");
+    try file_map.put(key, .pending);
+    try mc.resolutions.put(1, file_map);
+
+    const result = mc.resolveConflict("/tmp", 1, "file.txt", .pending);
+    try std.testing.expectError(error.InvalidResolution, result);
+}
+
+test "merge - finalizeMerge rejects when no active merge" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const result = mc.finalizeMerge(&roster, "/tmp", 1);
+    try std.testing.expectError(error.NoActiveMerge, result);
+}
+
+test "merge - resolveConflict rejects when no resolutions map for worker" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    // active_merge is set but no resolutions map populated for worker 1
+
+    const result = mc.resolveConflict("/tmp", 1, "file.txt", .ours);
+    try std.testing.expectError(error.NoConflicts, result);
 }

@@ -363,6 +363,9 @@ void tm_merge_conflicts_free(tm_conflict_t** conflicts, uint32_t count);
 
 // Resolve a single file in a conflicted merge.
 // resolution: TM_RESOLUTION_OURS, TM_RESOLUTION_THEIRS, or TM_RESOLUTION_SKIP.
+// OURS/THEIRS apply git checkout and enable finalization for this file.
+// SKIP records the choice without git ops — blocks tm_conflict_finalize.
+// TM_RESOLUTION_PENDING is not a valid input (read-only on output path).
 // Returns TM_OK on success. Returns TM_ERR_INVALID_WORKER if no active merge
 // for this worker or file not in conflict list.
 tm_result_t tm_conflict_resolve(tm_engine_t* engine,

@@ -78,6 +78,9 @@ enum ConflictType: String, Sendable {
 // MARK: - ConflictResolution
 
 /// Per-file conflict resolution choice. Maps to `tm_resolution_t` in teammux.h.
+/// `ours`/`theirs` apply git checkout and are finalizable (`isResolved == true`).
+/// `skip` records choice without git ops — blocks finalization.
+/// `pending` is the initial state set by the engine on conflict detection.
 enum ConflictResolution: UInt8, CaseIterable, Sendable {
     case ours    = 0
     case theirs  = 1
