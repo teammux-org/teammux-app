@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const worktree = @import("worktree.zig");
+const merge = @import("merge.zig");
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -198,22 +199,38 @@ pub fn create(
 }
 
 /// Remove a specific worker's worktree.
-/// Runs git worktree remove --force, then frees registry entry.
-/// Logs but does not fail if git removal fails (fire-and-forget cleanup).
+/// Atomic cleanup: git operations first, registry drop only after.
+/// 1. git worktree remove --force
+/// 2. git branch -D
+/// 3. Drop registry entry and free memory
+/// Logs but does not fail if git operations fail (fire-and-forget cleanup).
 pub fn removeWorker(
     registry: *WorktreeRegistry,
     project_path: []const u8,
     worker_id: u32,
 ) void {
+    const entry = registry.entries.get(worker_id) orelse return;
+
+    // Step 1: git worktree remove --force (before dropping registry entry)
+    _ = merge.runGitLoggedWithStderr(
+        registry.allocator,
+        project_path,
+        &.{ "worktree", "remove", "--force", entry.path },
+        "lifecycle worktree remove",
+    );
+
+    // Step 2: git branch -D (before dropping registry entry)
+    _ = merge.runGitLoggedWithStderr(
+        registry.allocator,
+        project_path,
+        &.{ "branch", "-D", entry.branch },
+        "lifecycle branch delete",
+    );
+
+    // Step 3: ONLY NOW drop registry entry and free memory
     const kv = registry.entries.fetchRemove(worker_id) orelse return;
-    const entry = kv.value;
-
-    worktree.runGit(registry.allocator, project_path, &.{ "worktree", "remove", "--force", entry.path }) catch |err| {
-        std.log.warn("[teammux] lifecycle worktree remove failed for worker {d}: {}", .{ worker_id, err });
-    };
-
-    registry.allocator.free(entry.path);
-    registry.allocator.free(entry.branch);
+    registry.allocator.free(kv.value.path);
+    registry.allocator.free(kv.value.branch);
 }
 
 /// Get worktree path for a worker. Returns null if not registered.
