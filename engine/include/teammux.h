@@ -363,7 +363,8 @@ void tm_merge_conflicts_free(tm_conflict_t** conflicts, uint32_t count);
 // dispatch history. Returns TM_ERR_INVALID_WORKER if worker not found.
 // Returns TM_ERR_BUS if message bus not initialized.
 // Returns TM_ERR_DELIVERY_FAILED if bus delivery fails after retries
-// (event is still recorded with delivered=false).
+// (bus retries 3 times with backoff internally; event is still recorded
+// with delivered=false).
 tm_result_t tm_dispatch_task(tm_engine_t* engine,
                               uint32_t target_worker_id,
                               const char* instruction);
@@ -372,7 +373,8 @@ tm_result_t tm_dispatch_task(tm_engine_t* engine,
 // Routed through the message bus as TM_MSG_RESPONSE and recorded in
 // dispatch history. Returns TM_ERR_INVALID_WORKER if worker not found.
 // Returns TM_ERR_BUS if message bus not initialized.
-// Returns TM_ERR_DELIVERY_FAILED if bus delivery fails after retries.
+// Returns TM_ERR_DELIVERY_FAILED if bus delivery fails after retries
+// (event is still recorded with delivered=false).
 tm_result_t tm_dispatch_response(tm_engine_t* engine,
                                   uint32_t target_worker_id,
                                   const char* response);

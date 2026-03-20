@@ -65,7 +65,8 @@ pub const MessageBus = struct {
     subscriber_cb: ?*const fn (?*const CMessage, ?*anyopaque) callconv(.c) c_int,
     subscriber_userdata: ?*anyopaque,
     /// I13: Error notification callback — called when PR message delivery fails
-    /// after all retries. Args: (message_type_name, worker_id, error_reason, userdata).
+    /// after all retries. Args: (formatted_error_message, userdata).
+    /// The error message is a human-readable string containing message type and worker ID.
     error_notify_cb: ?*const fn (?[*:0]const u8, ?*anyopaque) callconv(.c) void = null,
     error_notify_userdata: ?*anyopaque = null,
     commit_cache: ?[]const u8 = null,
@@ -200,9 +201,9 @@ pub const MessageBus = struct {
         try self.appendLog(msg);
 
         // 5. Fire callback to Swift for delivery with retry on failure.
-        // Initial attempt + up to 3 retries with exponential backoff.
-        // I13: PR_READY/PR_STATUS use shorter delays (100ms/200ms/400ms).
-        // On 4th failure: append FAILED line to JSONL log, notify error callback, return error.
+        // Initial attempt + up to 3 retries with backoff (1s/2s/4s; PR messages: 100ms/200ms/400ms).
+        // On 4th failure: append FAILED line to JSONL log, notify error callback (PR messages only),
+        // return error.
         if (self.subscriber_cb) |cb| {
             var c_msg = try self.toCMessage(msg);
             defer self.freeCMessage(c_msg);
@@ -271,14 +272,22 @@ pub const MessageBus = struct {
     }
 
     /// I13: Notify the error callback that a PR message delivery failed after all retries.
-    /// Formats a human-readable error with the message type and worker ID.
+    /// Format: "{msg_type} delivery failed for worker {id} after retries"
+    /// Uses a stack buffer so notification cannot fail due to OOM.
     fn notifyDeliveryError(self: *MessageBus, msg_type: MessageType, worker_id: worktree.WorkerId) void {
         if (self.error_notify_cb) |cb| {
-            const msg = std.fmt.allocPrint(self.allocator, "{s} delivery failed for worker {d} after retries", .{ msg_type.toString(), worker_id }) catch return;
-            defer self.allocator.free(msg);
-            const msg_z = self.allocator.dupeZ(u8, msg) catch return;
-            defer self.allocator.free(msg_z);
-            cb(msg_z.ptr, self.error_notify_userdata);
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{s} delivery failed for worker {d} after retries", .{ msg_type.toString(), worker_id }) catch {
+                cb("PR message delivery failed after retries", self.error_notify_userdata);
+                return;
+            };
+            // Null-terminate in-place for C callback
+            if (msg.len < buf.len) {
+                buf[msg.len] = 0;
+                cb(@ptrCast(buf[0..msg.len :0].ptr), self.error_notify_userdata);
+            } else {
+                cb("PR message delivery failed after retries", self.error_notify_userdata);
+            }
         }
     }
 

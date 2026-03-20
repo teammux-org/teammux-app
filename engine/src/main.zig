@@ -795,17 +795,27 @@ export fn tm_github_webhooks_stop(engine: ?*Engine, sub: u32) void { _ = sub; if
 
 /// I6: Error callback for CommandWatcher — surfaces command processing errors via setError.
 fn commandErrorCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
-    const engine: *Engine = @ptrCast(@alignCast(userdata orelse return));
+    const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
+        std.log.warn("[teammux] commandErrorCallback: null engine pointer", .{});
+        return;
+    }));
     if (msg) |m| {
-        engine.setError(std.mem.span(m)) catch {};
+        engine.setError(std.mem.span(m)) catch |err| {
+            std.log.err("[teammux] commandErrorCallback: setError failed: {s}", .{@errorName(err)});
+        };
     }
 }
 
 /// I13: Error callback for MessageBus — surfaces PR delivery failures via setError.
 fn busErrorNotifyCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
-    const engine: *Engine = @ptrCast(@alignCast(userdata orelse return));
+    const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
+        std.log.warn("[teammux] busErrorNotifyCallback: null engine pointer", .{});
+        return;
+    }));
     if (msg) |m| {
-        engine.setError(std.mem.span(m)) catch {};
+        engine.setError(std.mem.span(m)) catch |err| {
+            std.log.err("[teammux] busErrorNotifyCallback: setError failed: {s}", .{@errorName(err)});
+        };
     }
 }
 
