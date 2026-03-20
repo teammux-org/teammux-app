@@ -499,6 +499,11 @@ void tm_history_free(tm_history_entry_t** entries, uint32_t count);
 // Missing file is a no-op (returns TM_OK).
 tm_result_t tm_history_clear(tm_engine_t* engine);
 
+// Manually trigger history log rotation (TD24).
+// Rotates completion_history.jsonl → .1, .1 → .2, discards old .2.
+// Flushes async queue before rotating. Returns TM_OK on success.
+tm_result_t tm_history_rotate(tm_engine_t* engine);
+
 // -----------------------------------------------------------------
 // Utility
 // -----------------------------------------------------------------

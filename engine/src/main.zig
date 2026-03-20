@@ -190,6 +190,14 @@ pub const Engine = struct {
         self.commands_watcher = cmd_watcher;
         self.history_logger = hist_logger;
 
+        // Start async history writer (I15) — must be after commit to self so
+        // the writer thread's self pointer targets the stable Engine-embedded logger.
+        if (self.history_logger) |*logger| {
+            logger.startWriter() catch |err| {
+                std.log.warn("[teammux] history: async writer start failed, writes will be synchronous: {}", .{err});
+            };
+        }
+
         // Wire bus routing for PR status events from GitHub polling
         self.github_client.bus_send_fn = busSendBridge;
         self.github_client.bus_send_userdata = self;
@@ -1621,6 +1629,22 @@ export fn tm_history_clear(engine: ?*Engine) c_int {
     });
     logger.clear() catch {
         e.setError("tm_history_clear: failed to clear history") catch {};
+        return 99;
+    };
+    return 0;
+}
+
+/// Manually trigger history log rotation (TD24).
+/// Rotates completion_history.jsonl → .1, .1 → .2, discards old .2.
+/// Returns TM_OK on success. Flushes async queue before rotating.
+export fn tm_history_rotate(engine: ?*Engine) c_int {
+    const e = engine orelse return 99;
+    var logger = &(e.history_logger orelse {
+        e.setError("tm_history_rotate: history logger not initialized") catch {};
+        return 99;
+    });
+    logger.rotate() catch {
+        e.setError("tm_history_rotate: rotation failed") catch {};
         return 99;
     };
     return 0;
