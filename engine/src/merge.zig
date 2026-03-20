@@ -16,6 +16,13 @@ pub const MergeStatus = enum(c_int) {
     rejected = 4,
 };
 
+pub const ConflictResolution = enum(u8) {
+    ours = 0,
+    theirs = 1,
+    skip = 2,
+    pending = 3,
+};
+
 pub const Conflict = struct {
     file_path: []const u8,
     conflict_type: []const u8,
@@ -49,6 +56,7 @@ pub const MergeCoordinator = struct {
     statuses: std.AutoHashMap(worktree.WorkerId, MergeStatus),
     conflicts: std.AutoHashMap(worktree.WorkerId, []Conflict),
     active_merge: ?worktree.WorkerId,
+    resolutions: std.AutoHashMap(worktree.WorkerId, std.StringHashMap(ConflictResolution)),
 
     pub fn init(allocator: std.mem.Allocator) MergeCoordinator {
         return .{
@@ -56,10 +64,16 @@ pub const MergeCoordinator = struct {
             .statuses = std.AutoHashMap(worktree.WorkerId, MergeStatus).init(allocator),
             .conflicts = std.AutoHashMap(worktree.WorkerId, []Conflict).init(allocator),
             .active_merge = null,
+            .resolutions = std.AutoHashMap(worktree.WorkerId, std.StringHashMap(ConflictResolution)).init(allocator),
         };
     }
 
     pub fn deinit(self: *MergeCoordinator) void {
+        var res_it = self.resolutions.iterator();
+        while (res_it.next()) |entry| {
+            freeResolutionMap(self.allocator, entry.value_ptr);
+        }
+        self.resolutions.deinit();
         var it = self.conflicts.iterator();
         while (it.next()) |entry| {
             freeConflicts(self.allocator, entry.value_ptr.*);
@@ -513,6 +527,14 @@ fn freeConflict(allocator: std.mem.Allocator, c: Conflict) void {
 fn freeConflicts(allocator: std.mem.Allocator, conflicts: []Conflict) void {
     for (conflicts) |c| freeConflict(allocator, c);
     allocator.free(conflicts);
+}
+
+fn freeResolutionMap(allocator: std.mem.Allocator, map: *std.StringHashMap(ConflictResolution)) void {
+    var it = map.iterator();
+    while (it.next()) |kv| {
+        allocator.free(kv.key_ptr.*);
+    }
+    map.deinit();
 }
 
 // ─────────────────────────────────────────────────────────
