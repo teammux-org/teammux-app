@@ -195,6 +195,7 @@ pub const Engine = struct {
         if (self.history_logger) |*logger| {
             logger.startWriter() catch |err| {
                 std.log.warn("[teammux] history: async writer start failed, writes will be synchronous: {}", .{err});
+                self.setError("history: async writer unavailable — history writes will block the event loop") catch {};
             };
         }
 
@@ -278,6 +279,8 @@ pub const Engine = struct {
         if (self.commands_watcher) |*w| w.stop();
         if (self.config_watcher) |*w| w.stop();
         self.github_client.stopWebhooks();
+        // Stop async history writer — drain queue before session ends
+        if (self.history_logger) |*logger| logger.shutdown();
         // Clean up Team Lead interceptor from project root
         interceptor.remove(self.allocator, self.project_root) catch |err| {
             std.log.warn("[teammux] Team Lead interceptor cleanup failed: {}", .{err});
@@ -1627,7 +1630,8 @@ export fn tm_history_clear(engine: ?*Engine) c_int {
         e.setError("tm_history_clear: history logger not initialized") catch {};
         return 99;
     });
-    logger.clear() catch {
+    logger.clear() catch |err| {
+        std.log.err("[teammux] tm_history_clear failed: {}", .{err});
         e.setError("tm_history_clear: failed to clear history") catch {};
         return 99;
     };
@@ -1643,7 +1647,8 @@ export fn tm_history_rotate(engine: ?*Engine) c_int {
         e.setError("tm_history_rotate: history logger not initialized") catch {};
         return 99;
     });
-    logger.rotate() catch {
+    logger.rotate() catch |err| {
+        std.log.err("[teammux] tm_history_rotate failed: {}", .{err});
         e.setError("tm_history_rotate: rotation failed") catch {};
         return 99;
     };

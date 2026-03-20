@@ -222,7 +222,13 @@ pub const HistoryLogger = struct {
     /// Check file size and rotate if over limit. Errors are logged, not propagated.
     /// Uses rotateInner (no flush) — safe to call from the writer thread.
     fn maybeRotate(self: *HistoryLogger) void {
-        const stat = std.fs.cwd().statFile(self.file_path) catch return;
+        const stat = std.fs.cwd().statFile(self.file_path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                std.log.warn("[teammux] history: stat failed during rotation check: {}", .{err});
+                return;
+            },
+        };
         if (stat.size > self.max_size_bytes) {
             self.rotateInner() catch |err| {
                 std.log.warn("[teammux] history: rotation failed: {}", .{err});
@@ -263,14 +269,19 @@ pub const HistoryLogger = struct {
     }
 
     /// Block until all enqueued entries are written to disk and no write is in progress.
+    /// Polls at 100µs intervals. Times out after 5 seconds to prevent infinite hang
+    /// if the writer thread dies or gets stuck.
     pub fn flush(self: *HistoryLogger) void {
-        while (true) {
+        const max_iters: usize = 50_000; // 50k * 100µs = 5s
+        var iters: usize = 0;
+        while (iters < max_iters) : (iters += 1) {
             self.queue_mutex.lock();
             const done = self.queue_count == 0 and !self.queue_writing;
             self.queue_mutex.unlock();
             if (done) return;
             std.Thread.sleep(100_000); // 100µs poll
         }
+        std.log.err("[teammux] history: flush timed out after 5s with {d} entries remaining", .{self.queue_count});
     }
 
     /// Stop the background writer: drain remaining entries, join thread.
