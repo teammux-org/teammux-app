@@ -33,6 +33,7 @@ struct UserTerminalView: View {
             ghosttyApp: ghosttyApp,
             projectRoot: engine.projectRoot
         )
+        .id(engine.projectRoot ?? "<default>")
     }
 
     // MARK: - Loading state
@@ -79,7 +80,7 @@ struct UserTerminalSurfaceRepresentable: NSViewRepresentable {
             Self.logger.warning("engine.projectRoot is nil — user terminal will open in default directory instead of project root")
         }
 
-        Self.logger.info("User terminal surface created: shell=\(shell, privacy: .public) workingDirectory=\(projectRoot ?? "<default>", privacy: .public)")
+        Self.logger.info("User terminal surface created: shell=\(shell, privacy: .public) workingDirectory=\(projectRoot ?? "<default>", privacy: .private)")
 
         let surfaceView = Ghostty.SurfaceView(app, baseConfig: config)
         return surfaceView
