@@ -231,12 +231,14 @@ tm_result_t       tm_worker_dismiss(tm_engine_t* engine, tm_worker_id_t worker_i
 // the branch name (teammux/{worker_id}-{slug}). task_description must not
 // be NULL. Returns TM_ERR_CONFIG if task_description is NULL, HOME is unset,
 // or worktree directory cannot be created. Returns TM_ERR_WORKTREE on git failure.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_worktree_create(tm_engine_t* engine,
                                 uint32_t worker_id,
                                 const char* task_description);
 
 // Remove a worker's git worktree. Runs git worktree remove --force,
 // frees registry entry. Idempotent — safe if worker has no worktree.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_worktree_remove(tm_engine_t* engine, uint32_t worker_id);
 
 // Get the absolute path to a worker's worktree directory.
@@ -429,6 +431,7 @@ typedef struct {
 // Signal worker completion. Creates TM_MSG_COMPLETION message, routes
 // through bus to Team Lead (worker 0), persists to JSONL log.
 // summary must not be NULL. details may be NULL.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_worker_complete(tm_engine_t* engine,
                                 uint32_t worker_id,
                                 const char* summary,
@@ -437,15 +440,18 @@ tm_result_t tm_worker_complete(tm_engine_t* engine,
 // Signal worker question. Creates TM_MSG_QUESTION message, routes
 // through bus to Team Lead (worker 0), persists to JSONL log.
 // question must not be NULL. context may be NULL.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_worker_question(tm_engine_t* engine,
                                 uint32_t worker_id,
                                 const char* question,
                                 const char* context);
 
 // Free a heap-allocated completion struct.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 void tm_completion_free(tm_completion_t* completion);
 
 // Free a heap-allocated question struct.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 void tm_question_free(tm_question_t* question);
 
 // -----------------------------------------------------------------
@@ -457,6 +463,7 @@ void tm_question_free(tm_question_t* question);
 // to Team Lead PTY. Returns TM_ERR_UNKNOWN if engine or message is NULL.
 // Returns TM_ERR_INVALID_WORKER if target_id is not in roster or equals
 // from_id. Returns TM_ERR_BUS if bus not initialized.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_peer_question(tm_engine_t* engine,
                               uint32_t from_id,
                               uint32_t target_id,
@@ -467,6 +474,7 @@ tm_result_t tm_peer_question(tm_engine_t* engine,
 // Returns TM_ERR_UNKNOWN if engine or task is NULL.
 // Returns TM_ERR_INVALID_WORKER if target_id is not in roster or equals
 // from_id. Returns TM_ERR_BUS if bus not initialized.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_peer_delegate(tm_engine_t* engine,
                               uint32_t from_id,
                               uint32_t target_id,
@@ -503,6 +511,7 @@ void tm_history_free(tm_history_entry_t** entries, uint32_t count);
 
 // Clear all history entries (truncates the JSONL file to zero length).
 // Missing file is a no-op (returns TM_OK).
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_history_clear(tm_engine_t* engine);
 
 // Manually trigger history log rotation (TD24).
@@ -516,9 +525,11 @@ tm_result_t tm_history_rotate(tm_engine_t* engine);
 
 // Resolve agent binary path. Returns NULL if not found.
 // Returns heap-allocated string. Caller must call tm_free_string().
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 const char* tm_agent_resolve(const char* agent_name);
 void        tm_free_string(const char* str);
 const char* tm_version(void);
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 const char* tm_result_to_string(tm_result_t result);
 
 // -----------------------------------------------------------------
@@ -596,11 +607,13 @@ tm_result_t tm_ownership_release(tm_engine_t* engine,
 // Get all ownership entries for a worker. Returns heap-allocated array.
 // Returns NULL if no rules registered (*count will be 0).
 // Caller must call tm_ownership_free().
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_ownership_entry_t** tm_ownership_get(tm_engine_t* engine,
                                          uint32_t worker_id,
                                          uint32_t* count);
 
 // Free entries returned by tm_ownership_get.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 void tm_ownership_free(tm_ownership_entry_t** entries, uint32_t count);
 
 // Replace all ownership rules for a worker in a single locked swap.
@@ -608,6 +621,7 @@ void tm_ownership_free(tm_ownership_entry_t** entries, uint32_t count);
 // reinstall the interceptor — callers must call tm_interceptor_install
 // separately if needed. Provides C API access to the same operation
 // that hot-reload performs internally via the Zig struct directly.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_ownership_update(tm_engine_t* engine,
                                   uint32_t worker_id,
                                   const char** write_patterns, uint32_t write_count,
@@ -629,6 +643,7 @@ tm_result_t tm_interceptor_install(tm_engine_t* engine, uint32_t worker_id);
 // The interceptor is automatically cleaned up by tm_worker_dismiss and
 // tm_merge_reject. This function is available for explicit removal.
 // Idempotent — safe to call even if no interceptor was installed.
+/* DEPRECATED: No active callers. Candidate for removal in v0.2. Do not add new callers. */
 tm_result_t tm_interceptor_remove(tm_engine_t* engine, uint32_t worker_id);
 
 // Get the absolute path to the interceptor directory for a worker.
