@@ -27,7 +27,7 @@ typedef enum {
     TM_ERR_GH_UNAUTH        = 3,
     TM_ERR_NO_AGENT         = 4,
     TM_ERR_WORKTREE         = 5,
-    TM_ERR_PTY              = 6,
+    TM_ERR_PTY              = 6,  /* RESERVED: was PTY error, no longer returned by any function. v0.2: remove */
     TM_ERR_CONFIG           = 7,
     TM_ERR_BUS              = 8,
     TM_ERR_GITHUB           = 9,
@@ -70,6 +70,7 @@ typedef enum {
     TM_MSG_DELEGATION     = 13,  // Worker-to-worker task delegation direct
     TM_MSG_PR_READY       = 14,  // Engine signals PR created for worker
     TM_MSG_PR_STATUS      = 15,  // GitHub PR status change (open/closed/merged)
+    TM_MSG_PTY_DIED       = 17,  // Worker PTY process exited unexpectedly
 } tm_message_type_t;
 
 typedef enum {
