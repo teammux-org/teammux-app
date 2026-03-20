@@ -25,6 +25,8 @@ pub const CommandWatcher = struct {
     userdata: ?*anyopaque,
     bus_send_fn: ?BusSendFn,
     bus_send_userdata: ?*anyopaque,
+    error_cb: ?*const fn (?[*:0]const u8, ?*anyopaque) callconv(.c) void,
+    error_cb_userdata: ?*anyopaque,
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
 
@@ -40,6 +42,8 @@ pub const CommandWatcher = struct {
             .userdata = null,
             .bus_send_fn = null,
             .bus_send_userdata = null,
+            .error_cb = null,
+            .error_cb_userdata = null,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
         };
@@ -90,6 +94,32 @@ pub const CommandWatcher = struct {
             self.dir_fd = -1;
         }
         self.allocator.free(self.commands_dir);
+    }
+
+    /// Write a .teammux-error JSON file to the commands directory (I6).
+    /// Contains the failing command name and reason for the failure.
+    fn writeErrorResponse(self: *CommandWatcher, dir: std.fs.Dir, command: []const u8, reason: []const u8) void {
+        const content = std.fmt.allocPrint(self.allocator,
+            \\{{"command":"{s}","error":"{s}"}}
+        , .{ command, reason }) catch {
+            std.log.warn("[teammux] error response allocation failed", .{});
+            return;
+        };
+        defer self.allocator.free(content);
+
+        dir.writeFile(.{ .sub_path = ".teammux-error", .data = content }) catch |err| {
+            std.log.warn("[teammux] error response write failed: {}", .{err});
+        };
+    }
+
+    /// Notify engine of a command processing error via the error callback (I6).
+    /// Engine wires this to setError so Swift can surface a notification.
+    fn notifyError(self: *CommandWatcher, msg: []const u8) void {
+        if (self.error_cb) |cb| {
+            const msg_z = self.allocator.dupeZ(u8, msg) catch return;
+            defer self.allocator.free(msg_z);
+            cb(msg_z.ptr, self.error_cb_userdata);
+        }
     }
 
     fn watchLoop(self: *CommandWatcher) void {
@@ -154,6 +184,9 @@ pub const CommandWatcher = struct {
         // Parse command and args from JSON
         const parsed = parseCommandJson(self.allocator, content) catch |err| {
             std.log.warn("[teammux] command file parse failed {s}: {}", .{ filename, err });
+            // I6: Write error response for malformed files
+            self.writeErrorResponse(dir, "unknown", "malformed command JSON: parse failed");
+            self.notifyError("command file parse failed");
             // Do NOT delete malformed files — leave for debugging
             return;
         };
@@ -167,7 +200,11 @@ pub const CommandWatcher = struct {
             if (std.mem.eql(u8, cmd_slice, "/teammux-complete")) {
                 self.routeCompletion(send_fn, parsed.args) catch |err| {
                     std.log.warn("[teammux] /teammux-complete routing failed: {}", .{err});
-                    return; // Do NOT delete — leave for debugging
+                    // I6: Write error response before deleting the original
+                    self.writeErrorResponse(dir, "/teammux-complete", "routing failed");
+                    self.notifyError("/teammux-complete routing failed");
+                    dir.deleteFile(filename) catch {};
+                    return;
                 };
                 dir.deleteFile(filename) catch |err| {
                     std.log.warn("[teammux] command file delete failed {s}: {}", .{ filename, err });
@@ -177,6 +214,10 @@ pub const CommandWatcher = struct {
             if (std.mem.eql(u8, cmd_slice, "/teammux-question")) {
                 self.routeQuestion(send_fn, parsed.args) catch |err| {
                     std.log.warn("[teammux] /teammux-question routing failed: {}", .{err});
+                    // I6: Write error response before deleting the original
+                    self.writeErrorResponse(dir, "/teammux-question", "routing failed");
+                    self.notifyError("/teammux-question routing failed");
+                    dir.deleteFile(filename) catch {};
                     return;
                 };
                 dir.deleteFile(filename) catch |err| {
@@ -189,6 +230,10 @@ pub const CommandWatcher = struct {
         // All other commands: fire generic callback
         if (self.callback) |cb| {
             cb(parsed.command.ptr, parsed.args.ptr, self.userdata);
+        } else {
+            // I6: No handler registered — write error response
+            self.writeErrorResponse(dir, cmd_slice, "no handler registered for command");
+            self.notifyError("command received but no handler registered");
         }
 
         // Delete file only after successful processing
@@ -623,7 +668,7 @@ test "commands - other commands still fire generic callback" {
     try std.testing.expect(!State.bus_called);
 }
 
-test "commands - /teammux-complete missing worker_id leaves file for debugging" {
+test "commands - /teammux-complete missing worker_id writes error and deletes original (I6)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
@@ -647,10 +692,152 @@ test "commands - /teammux-complete missing worker_id leaves file for debugging" 
     watcher.bus_send_fn = bus_send;
     watcher.scanAndProcess();
 
-    // File NOT deleted — left for debugging
-    const file = tmp.dir.openFile("bad1.json", .{}) catch |err| {
+    // I6: Original file deleted after error response written
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("bad1.json", .{}));
+
+    // .teammux-error should exist with failure details
+    const error_file = try tmp.dir.openFile(".teammux-error", .{});
+    defer error_file.close();
+    const content = try error_file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "/teammux-complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "routing failed") != null);
+}
+
+test "commands - I6 parse failure writes .teammux-error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    // Write a malformed command file (not valid JSON)
+    try tmp.dir.writeFile(.{ .sub_path = "malformed.json", .data = "not valid json at all" });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    watcher.scanAndProcess();
+
+    // .teammux-error should exist
+    const error_file = try tmp.dir.openFile(".teammux-error", .{});
+    defer error_file.close();
+    const content = try error_file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "parse failed") != null);
+
+    // Original file should NOT be deleted (left for debugging)
+    const original = tmp.dir.openFile("malformed.json", .{}) catch |err| {
         try std.testing.expect(err != error.FileNotFound);
         return;
     };
-    file.close();
+    original.close();
+}
+
+test "commands - I6 unhandled command writes error when no callback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    const cmd_json =
+        \\{"command": "/teammux-unknown", "args": "{}"}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "unhandled.json", .data = cmd_json });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    // No callback set — command will be unhandled
+    watcher.scanAndProcess();
+
+    // .teammux-error should exist
+    const error_file = try tmp.dir.openFile(".teammux-error", .{});
+    defer error_file.close();
+    const content = try error_file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "/teammux-unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "no handler") != null);
+
+    // Original file should still be deleted after error response
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("unhandled.json", .{}));
+}
+
+test "commands - I6 error_cb is called on command failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    // Malformed file to trigger error
+    try tmp.dir.writeFile(.{ .sub_path = "errorcb.json", .data = "bad json" });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    const State = struct {
+        var error_called: bool = false;
+        var error_msg: [256]u8 = undefined;
+        var error_msg_len: usize = 0;
+    };
+    State.error_called = false;
+    State.error_msg_len = 0;
+
+    const error_cb = struct {
+        fn cb(msg: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            State.error_called = true;
+            if (msg) |m| {
+                const slice = std.mem.span(m);
+                const len = @min(slice.len, State.error_msg.len);
+                @memcpy(State.error_msg[0..len], slice[0..len]);
+                State.error_msg_len = len;
+            }
+        }
+    }.cb;
+
+    watcher.error_cb = error_cb;
+    watcher.scanAndProcess();
+
+    try std.testing.expect(State.error_called);
+    try std.testing.expect(std.mem.indexOf(u8, State.error_msg[0..State.error_msg_len], "parse failed") != null);
+}
+
+test "commands - I6 bus send failure writes error and deletes original" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cmd_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cmd_dir);
+
+    const cmd_json =
+        \\{"command": "/teammux-complete", "args": {"worker_id": 3, "summary": "done"}}
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "busfail.json", .data = cmd_json });
+
+    var watcher = try CommandWatcher.init(std.testing.allocator, cmd_dir);
+    defer watcher.deinit();
+
+    // Bus send always fails
+    const bus_send = struct {
+        fn send(_: u32, _: u32, _: c_int, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) c_int {
+            return 8; // TM_ERR_BUS
+        }
+    }.send;
+    watcher.bus_send_fn = bus_send;
+
+    watcher.scanAndProcess();
+
+    // .teammux-error should exist
+    const error_file = try tmp.dir.openFile(".teammux-error", .{});
+    defer error_file.close();
+    const content = try error_file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "/teammux-complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "routing failed") != null);
+
+    // Original deleted after error response written
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("busfail.json", .{}));
 }
