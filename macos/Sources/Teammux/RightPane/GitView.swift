@@ -344,7 +344,6 @@ struct GitWorkerRow: View {
         .sheet(isPresented: $showConflictSheet) {
             ConflictView(
                 worker: worker,
-                conflicts: conflicts,
                 engine: engine
             )
         }

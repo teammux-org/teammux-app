@@ -16,6 +16,17 @@ pub const MergeStatus = enum(c_int) {
     rejected = 4,
 };
 
+/// Per-file conflict resolution choice.
+/// `ours`/`theirs` apply git checkout and are finalizable.
+/// `skip` records the choice without git ops — blocks finalization.
+/// `pending` is the initial state — cannot be set via resolveConflict.
+pub const ConflictResolution = enum(u8) {
+    ours = 0,
+    theirs = 1,
+    skip = 2,
+    pending = 3,
+};
+
 pub const Conflict = struct {
     file_path: []const u8,
     conflict_type: []const u8,
@@ -49,6 +60,7 @@ pub const MergeCoordinator = struct {
     statuses: std.AutoHashMap(worktree.WorkerId, MergeStatus),
     conflicts: std.AutoHashMap(worktree.WorkerId, []Conflict),
     active_merge: ?worktree.WorkerId,
+    resolutions: std.AutoHashMap(worktree.WorkerId, std.StringHashMap(ConflictResolution)),
 
     pub fn init(allocator: std.mem.Allocator) MergeCoordinator {
         return .{
@@ -56,10 +68,16 @@ pub const MergeCoordinator = struct {
             .statuses = std.AutoHashMap(worktree.WorkerId, MergeStatus).init(allocator),
             .conflicts = std.AutoHashMap(worktree.WorkerId, []Conflict).init(allocator),
             .active_merge = null,
+            .resolutions = std.AutoHashMap(worktree.WorkerId, std.StringHashMap(ConflictResolution)).init(allocator),
         };
     }
 
     pub fn deinit(self: *MergeCoordinator) void {
+        var res_it = self.resolutions.iterator();
+        while (res_it.next()) |entry| {
+            freeResolutionMap(self.allocator, entry.value_ptr);
+        }
+        self.resolutions.deinit();
         var it = self.conflicts.iterator();
         while (it.next()) |entry| {
             freeConflicts(self.allocator, entry.value_ptr.*);
@@ -166,6 +184,27 @@ pub const MergeCoordinator = struct {
                     freeConflicts(self.allocator, old.value);
                 }
                 try self.conflicts.put(worker_id, conflict_list);
+
+                // Populate resolution map (deduplicate by file path)
+                if (self.resolutions.fetchRemove(worker_id)) |old| {
+                    var map = old.value;
+                    freeResolutionMap(self.allocator, &map);
+                }
+                var file_resolutions = std.StringHashMap(ConflictResolution).init(self.allocator);
+                errdefer {
+                    var free_it = file_resolutions.iterator();
+                    while (free_it.next()) |kv| self.allocator.free(kv.key_ptr.*);
+                    file_resolutions.deinit();
+                }
+                for (conflict_list) |conflict| {
+                    if (!file_resolutions.contains(conflict.file_path)) {
+                        const key = try self.allocator.dupe(u8, conflict.file_path);
+                        errdefer self.allocator.free(key);
+                        try file_resolutions.put(key, .pending);
+                    }
+                }
+                try self.resolutions.put(worker_id, file_resolutions);
+
                 try self.statuses.put(worker_id, .conflict);
                 // active_merge stays set — repo is in MERGING state, reject() must be called
             } else {
@@ -258,6 +297,12 @@ pub const MergeCoordinator = struct {
         // Set merge status to rejected
         try self.statuses.put(worker_id, .rejected);
 
+        // Clean up resolution data for this worker
+        if (self.resolutions.fetchRemove(worker_id)) |old| {
+            var map = old.value;
+            freeResolutionMap(self.allocator, &map);
+        }
+
         // Clean up conflict data for this worker
         if (self.conflicts.fetchRemove(worker_id)) |old| {
             freeConflicts(self.allocator, old.value);
@@ -274,6 +319,113 @@ pub const MergeCoordinator = struct {
     /// Get conflicts for a worker. Returns null if no conflicts stored.
     pub fn getConflicts(self: *MergeCoordinator, worker_id: worktree.WorkerId) ?[]Conflict {
         return self.conflicts.get(worker_id);
+    }
+
+    /// Get the per-file resolution map for a worker, or null.
+    pub fn getResolutions(self: *MergeCoordinator, worker_id: worktree.WorkerId) ?*std.StringHashMap(ConflictResolution) {
+        return self.resolutions.getPtr(worker_id);
+    }
+
+    /// Resolve a single file in a conflicted merge.
+    /// For ours/theirs: runs git checkout --ours/--theirs then git add.
+    /// For skip: records resolution without git ops.
+    /// Resolution can be changed freely (ours<->theirs<->skip).
+    pub fn resolveConflict(
+        self: *MergeCoordinator,
+        project_root: []const u8,
+        worker_id: worktree.WorkerId,
+        file_path: []const u8,
+        resolution: ConflictResolution,
+    ) !void {
+        // Must have an active merge for this worker
+        if (self.active_merge == null or self.active_merge.? != worker_id) return error.NoActiveMerge;
+        if (resolution == .pending) return error.InvalidResolution;
+
+        // Verify file is in the resolution map
+        const file_resolutions = self.resolutions.getPtr(worker_id) orelse return error.NoConflicts;
+        const res_ptr = file_resolutions.getPtr(file_path) orelse return error.FileNotInConflicts;
+
+        // Apply git operations
+        switch (resolution) {
+            .ours, .theirs => {
+                const flag: []const u8 = if (resolution == .ours) "--ours" else "--theirs";
+                const r1 = try runGitCapture(self.allocator, project_root, &.{ "checkout", flag, file_path });
+                defer r1.deinit(self.allocator);
+                if (r1.exit_code != 0) {
+                    std.log.err("[teammux] git checkout {s} failed for '{s}': exit code {d}", .{ flag, file_path, r1.exit_code });
+                    return error.GitFailed;
+                }
+                const r2 = try runGitCapture(self.allocator, project_root, &.{ "add", file_path });
+                defer r2.deinit(self.allocator);
+                if (r2.exit_code != 0) {
+                    std.log.err("[teammux] git add failed for '{s}': exit code {d}", .{ file_path, r2.exit_code });
+                    return error.GitFailed;
+                }
+            },
+            .skip => {}, // No git ops — just record the resolution
+            .pending => unreachable,
+        }
+
+        res_ptr.* = resolution;
+    }
+
+    /// Finalize a conflicted merge after all files are resolved.
+    /// All files must have resolution ours or theirs (not pending, not skip).
+    /// Runs git commit --no-edit to complete the merge, then cleans up
+    /// worktree and branch. Returns .success or .cleanup_incomplete.
+    pub fn finalizeMerge(
+        self: *MergeCoordinator,
+        roster: *worktree.Roster,
+        project_root: []const u8,
+        worker_id: worktree.WorkerId,
+    ) !ApproveResult {
+        if (self.active_merge == null or self.active_merge.? != worker_id) return error.NoActiveMerge;
+
+        // Check all files resolved (not pending, not skip)
+        const file_resolutions = self.resolutions.getPtr(worker_id) orelse return error.NoConflicts;
+        var it = file_resolutions.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* == .pending or kv.value_ptr.* == .skip) return error.UnresolvedConflicts;
+        }
+
+        // Complete the merge
+        const commit_result = try runGitCapture(self.allocator, project_root, &.{ "commit", "--no-edit" });
+        defer commit_result.deinit(self.allocator);
+        if (commit_result.exit_code != 0) return error.GitFailed;
+
+        std.log.info("[teammux] merge finalized: worker {d}", .{worker_id});
+        try self.statuses.put(worker_id, .success);
+        self.active_merge = null;
+
+        // Clean up resolutions
+        if (self.resolutions.fetchRemove(worker_id)) |old| {
+            var map = old.value;
+            freeResolutionMap(self.allocator, &map);
+        }
+
+        // Clean up conflicts
+        if (self.conflicts.fetchRemove(worker_id)) |old| {
+            freeConflicts(self.allocator, old.value);
+        }
+
+        // Look up worker for worktree/branch cleanup
+        const worker = roster.getWorker(worker_id) orelse {
+            std.log.warn("[teammux] finalizeMerge: worker {d} not in roster — skipping worktree/branch cleanup", .{worker_id});
+            return .cleanup_incomplete;
+        };
+        const branch_name = try self.allocator.dupe(u8, worker.branch_name);
+        defer self.allocator.free(branch_name);
+        const wt_path = try self.allocator.dupe(u8, worker.worktree_path);
+        defer self.allocator.free(wt_path);
+
+        worker.status = .complete;
+
+        // Remove worktree and branch
+        const wt_removed = runGitLoggedWithStderr(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "finalize cleanup: worktree remove");
+        const br_deleted = runGitLoggedWithStderr(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "finalize cleanup: branch delete");
+
+        if (!wt_removed or !br_deleted) return .cleanup_incomplete;
+        return .success;
     }
 
     // ─── Internal helpers ────────────────────────────────────
@@ -515,6 +667,14 @@ fn freeConflict(allocator: std.mem.Allocator, c: Conflict) void {
 fn freeConflicts(allocator: std.mem.Allocator, conflicts: []Conflict) void {
     for (conflicts) |c| freeConflict(allocator, c);
     allocator.free(conflicts);
+}
+
+fn freeResolutionMap(allocator: std.mem.Allocator, map: *std.StringHashMap(ConflictResolution)) void {
+    var it = map.iterator();
+    while (it.next()) |kv| {
+        allocator.free(kv.key_ptr.*);
+    }
+    map.deinit();
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1016,4 +1176,315 @@ test "merge - concurrent merge prevention" {
 
     // Clean up
     _ = try mc.reject(&roster, repo.path, id1);
+}
+
+test "merge - resolveConflict rejects when no active merge" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    const result = mc.resolveConflict("/tmp", 1, "file.txt", .ours);
+    try std.testing.expectError(error.NoActiveMerge, result);
+}
+
+test "merge - resolveConflict rejects wrong worker" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 5;
+    const result = mc.resolveConflict("/tmp", 99, "file.txt", .ours);
+    try std.testing.expectError(error.NoActiveMerge, result);
+}
+
+test "merge - resolveConflict rejects file not in conflicts" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    var file_map = std.StringHashMap(ConflictResolution).init(std.testing.allocator);
+    const key = try std.testing.allocator.dupe(u8, "other.txt");
+    try file_map.put(key, .pending);
+    try mc.resolutions.put(1, file_map);
+
+    const result = mc.resolveConflict("/tmp", 1, "missing.txt", .ours);
+    try std.testing.expectError(error.FileNotInConflicts, result);
+}
+
+test "merge - finalizeMerge rejects with pending files" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    var file_map = std.StringHashMap(ConflictResolution).init(std.testing.allocator);
+    const k1 = try std.testing.allocator.dupe(u8, "a.txt");
+    try file_map.put(k1, .ours);
+    const k2 = try std.testing.allocator.dupe(u8, "b.txt");
+    try file_map.put(k2, .pending);
+    try mc.resolutions.put(1, file_map);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const result = mc.finalizeMerge(&roster, "/tmp", 1);
+    try std.testing.expectError(error.UnresolvedConflicts, result);
+}
+
+test "merge - finalizeMerge rejects with skip files" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    var file_map = std.StringHashMap(ConflictResolution).init(std.testing.allocator);
+    const k1 = try std.testing.allocator.dupe(u8, "a.txt");
+    try file_map.put(k1, .theirs);
+    const k2 = try std.testing.allocator.dupe(u8, "b.txt");
+    try file_map.put(k2, .skip);
+    try mc.resolutions.put(1, file_map);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const result = mc.finalizeMerge(&roster, "/tmp", 1);
+    try std.testing.expectError(error.UnresolvedConflicts, result);
+}
+
+test "merge - approve populates resolutions map on conflict (integration)" {
+    var repo = setupTestRepo(std.testing.allocator) catch return;
+    defer repo.tmp.cleanup();
+    defer std.testing.allocator.free(repo.path);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "ResWorker", "edit readme");
+    const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
+    defer std.testing.allocator.free(wt_path);
+
+    // Create conflicting changes
+    const wt_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{wt_path});
+    defer std.testing.allocator.free(wt_readme);
+    {
+        const f = try std.fs.createFileAbsolute(wt_readme, .{});
+        try f.writeAll("# Worker change for resolve test");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "commit", "-m", "worker edit" });
+
+    const main_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{repo.path});
+    defer std.testing.allocator.free(main_readme);
+    {
+        const f = try std.fs.createFileAbsolute(main_readme, .{});
+        try f.writeAll("# Main change for resolve test");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "commit", "-m", "main edit" });
+
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    const result = try mc.approve(&roster, repo.path, id, "merge");
+    try std.testing.expect(result == .conflict);
+
+    // Verify resolutions map populated
+    const resolutions = mc.getResolutions(id);
+    try std.testing.expect(resolutions != null);
+    try std.testing.expect(resolutions.?.get("README.md") == .pending);
+
+    // Clean up
+    runGitIgnoreResult(std.testing.allocator, repo.path, &.{ "merge", "--abort" });
+}
+
+test "merge - reject cleans up resolutions (integration)" {
+    var repo = setupTestRepo(std.testing.allocator) catch return;
+    defer repo.tmp.cleanup();
+    defer std.testing.allocator.free(repo.path);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "RejectRes", "edit file");
+    const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
+    defer std.testing.allocator.free(wt_path);
+
+    // Create conflict
+    const wt_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{wt_path});
+    defer std.testing.allocator.free(wt_readme);
+    {
+        const f = try std.fs.createFileAbsolute(wt_readme, .{});
+        try f.writeAll("# RejectRes change");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "commit", "-m", "rejectres edit" });
+    const main_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{repo.path});
+    defer std.testing.allocator.free(main_readme);
+    {
+        const f = try std.fs.createFileAbsolute(main_readme, .{});
+        try f.writeAll("# Main RejectRes change");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "commit", "-m", "main rejectres edit" });
+
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    const approve_result = try mc.approve(&roster, repo.path, id, "merge");
+    try std.testing.expect(approve_result == .conflict);
+    try std.testing.expect(mc.getResolutions(id) != null);
+
+    _ = try mc.reject(&roster, repo.path, id);
+    try std.testing.expect(mc.getResolutions(id) == null);
+}
+
+test "merge - resolve ours + finalize completes merge (integration)" {
+    var repo = setupTestRepo(std.testing.allocator) catch return;
+    defer repo.tmp.cleanup();
+    defer std.testing.allocator.free(repo.path);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "FinalizeW", "edit readme");
+    const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
+    defer std.testing.allocator.free(wt_path);
+
+    // Create conflict
+    const wt_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{wt_path});
+    defer std.testing.allocator.free(wt_readme);
+    {
+        const f = try std.fs.createFileAbsolute(wt_readme, .{});
+        try f.writeAll("# Worker finalize version");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "commit", "-m", "finalize worker edit" });
+    const main_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{repo.path});
+    defer std.testing.allocator.free(main_readme);
+    {
+        const f = try std.fs.createFileAbsolute(main_readme, .{});
+        try f.writeAll("# Main finalize version");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "commit", "-m", "finalize main edit" });
+
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    // Approve -> conflict
+    const approve_result = try mc.approve(&roster, repo.path, id, "merge");
+    try std.testing.expect(approve_result == .conflict);
+
+    // Resolve with ours
+    try mc.resolveConflict(repo.path, id, "README.md", .ours);
+
+    // Verify resolution recorded
+    const resolutions = mc.getResolutions(id);
+    try std.testing.expect(resolutions.?.get("README.md") == .ours);
+
+    // Finalize
+    const finalize_result = try mc.finalizeMerge(&roster, repo.path, id);
+    try std.testing.expect(finalize_result == .success or finalize_result == .cleanup_incomplete);
+    try std.testing.expect(mc.getStatus(id) == .success);
+    try std.testing.expect(mc.active_merge == null);
+
+    // Verify main has ours content
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(main_readme, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(std.testing.allocator, 1024);
+    };
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("# Main finalize version", content);
+}
+
+test "merge - resolve theirs + finalize uses worker content (integration)" {
+    var repo = setupTestRepo(std.testing.allocator) catch return;
+    defer repo.tmp.cleanup();
+    defer std.testing.allocator.free(repo.path);
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = try spawnTestWorker(std.testing.allocator, &roster, repo.path, "TheirsW", "edit readme");
+    const wt_path = try std.testing.allocator.dupe(u8, roster.getWorker(id).?.worktree_path);
+    defer std.testing.allocator.free(wt_path);
+
+    const wt_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{wt_path});
+    defer std.testing.allocator.free(wt_readme);
+    {
+        const f = try std.fs.createFileAbsolute(wt_readme, .{});
+        try f.writeAll("# Worker theirs version");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, wt_path, &.{ "commit", "-m", "theirs worker edit" });
+    const main_readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{repo.path});
+    defer std.testing.allocator.free(main_readme);
+    {
+        const f = try std.fs.createFileAbsolute(main_readme, .{});
+        try f.writeAll("# Main theirs version");
+        f.close();
+    }
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "add", "." });
+    try worktree.runGit(std.testing.allocator, repo.path, &.{ "commit", "-m", "theirs main edit" });
+
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    const approve_result = try mc.approve(&roster, repo.path, id, "merge");
+    try std.testing.expect(approve_result == .conflict);
+
+    // Resolve with theirs (worker's version)
+    try mc.resolveConflict(repo.path, id, "README.md", .theirs);
+
+    const finalize_result = try mc.finalizeMerge(&roster, repo.path, id);
+    try std.testing.expect(finalize_result == .success or finalize_result == .cleanup_incomplete);
+
+    // Verify main has theirs content
+    const content = blk: {
+        const f = try std.fs.openFileAbsolute(main_readme, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(std.testing.allocator, 1024);
+    };
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("# Worker theirs version", content);
+}
+
+test "merge - resolveConflict rejects pending resolution" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    var file_map = std.StringHashMap(ConflictResolution).init(std.testing.allocator);
+    const key = try std.testing.allocator.dupe(u8, "file.txt");
+    try file_map.put(key, .pending);
+    try mc.resolutions.put(1, file_map);
+
+    const result = mc.resolveConflict("/tmp", 1, "file.txt", .pending);
+    try std.testing.expectError(error.InvalidResolution, result);
+}
+
+test "merge - finalizeMerge rejects when no active merge" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    var roster = worktree.Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const result = mc.finalizeMerge(&roster, "/tmp", 1);
+    try std.testing.expectError(error.NoActiveMerge, result);
+}
+
+test "merge - resolveConflict rejects when no resolutions map for worker" {
+    var mc = MergeCoordinator.init(std.testing.allocator);
+    defer mc.deinit();
+
+    mc.active_merge = 1;
+    // active_merge is set but no resolutions map populated for worker 1
+
+    const result = mc.resolveConflict("/tmp", 1, "file.txt", .ours);
+    try std.testing.expectError(error.NoConflicts, result);
 }

@@ -4,20 +4,28 @@ import SwiftUI
 
 /// Sheet view displaying merge conflicts for a worker's branch.
 ///
-/// Shows each conflicting file with its type and read-only ours/theirs content
-/// previews. The Team Lead reviews the conflicts then chooses "Force Merge"
-/// (calls `approveMerge` again) or "Reject" as the resolution. Per-file
-/// resolution is not supported by the engine API — this view is informational
-/// + action footer.
+/// Shows each conflicting file with its type, ours/theirs content previews,
+/// and per-file resolution buttons (Accept Ours / Accept Theirs / Skip).
+/// The Team Lead resolves each file individually, then clicks "Finalize Merge"
+/// once all files are resolved.
 struct ConflictView: View {
     let worker: WorkerInfo
-    let conflicts: [ConflictInfo]
     @ObservedObject var engine: EngineClient
     @Environment(\.dismiss) var dismiss
 
     @State private var isActionInFlight = false
     @State private var actionError: String?
     @State private var cleanupWarning: String?
+
+    private var conflicts: [ConflictInfo] {
+        engine.pendingConflicts[worker.id] ?? []
+    }
+
+    /// True when all files have resolution ours or theirs.
+    private var allResolved: Bool {
+        let c = conflicts
+        return !c.isEmpty && c.allSatisfy { $0.resolution.isResolved }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -68,7 +76,11 @@ struct ConflictView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 12) {
                 ForEach(conflicts) { conflict in
-                    ConflictFileRow(conflict: conflict)
+                    ConflictFileRow(
+                        conflict: conflict,
+                        workerId: worker.id,
+                        engine: engine
+                    )
                 }
             }
             .padding()
@@ -94,18 +106,19 @@ struct ConflictView: View {
             }
 
             HStack(spacing: 12) {
-                Button(action: forceMerge) {
+                Button(action: finalizeMerge) {
                     if isActionInFlight {
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Label("Force Merge", systemImage: "arrow.triangle.merge")
+                        Label("Finalize Merge", systemImage: "checkmark.circle.fill")
                             .font(.system(size: 12, weight: .medium))
                     }
                 }
                 .buttonStyle(.bordered)
-                .tint(.orange)
-                .disabled(isActionInFlight)
+                .tint(.green)
+                .disabled(isActionInFlight || !allResolved)
+                .help(allResolved ? "Complete the merge" : "Resolve all files first")
 
                 Button(action: reject) {
                     Label("Reject", systemImage: "xmark.circle")
@@ -129,12 +142,12 @@ struct ConflictView: View {
 
     // MARK: - Actions
 
-    private func forceMerge() {
+    private func finalizeMerge() {
         isActionInFlight = true
         actionError = nil
         cleanupWarning = nil
         Task { @MainActor in
-            let success = engine.approveMerge(workerId: worker.id, strategy: .merge)
+            let success = engine.finalizeMerge(workerId: worker.id)
             if success {
                 if let warning = engine.lastError {
                     cleanupWarning = warning
@@ -142,7 +155,7 @@ struct ConflictView: View {
                     dismiss()
                 }
             } else {
-                actionError = engine.lastError ?? "Force merge failed"
+                actionError = engine.lastError ?? "Finalize merge failed"
             }
             isActionInFlight = false
         }
@@ -170,18 +183,23 @@ struct ConflictView: View {
 
 // MARK: - ConflictFileRow
 
-/// A single conflict entry showing file path, conflict type, and read-only
-/// ours/theirs content previews.
+/// A single conflict entry showing file path, conflict type, resolution badge,
+/// ours/theirs content previews, and per-file resolution buttons.
 struct ConflictFileRow: View {
     let conflict: ConflictInfo
+    let workerId: UInt32
+    @ObservedObject var engine: EngineClient
+
+    @State private var isResolving = false
+    @State private var resolveError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // File path and conflict type
+            // File path, conflict type, and resolution badge
             HStack(spacing: 8) {
-                Image(systemName: "doc.text")
+                Image(systemName: conflict.resolution.isResolved ? "checkmark.circle.fill" : "doc.text")
                     .font(.system(size: 10))
-                    .foregroundColor(.red)
+                    .foregroundColor(conflict.resolution.isResolved ? .green : .red)
 
                 Text(conflict.filePath)
                     .font(.system(size: 11, design: .monospaced))
@@ -189,6 +207,15 @@ struct ConflictFileRow: View {
                     .truncationMode(.middle)
 
                 Spacer()
+
+                // Resolution badge
+                Text(conflict.resolution.label)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(conflict.resolution.color)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(conflict.resolution.color.opacity(0.12))
+                    .cornerRadius(4)
 
                 Text(conflict.conflictType.displayName)
                     .font(.system(size: 9, weight: .medium))
@@ -201,17 +228,77 @@ struct ConflictFileRow: View {
 
             // Ours preview
             if let ours = conflict.ours, !ours.isEmpty {
-                conflictPreview(label: "ours", content: ours, color: .green)
+                conflictPreview(label: "ours (main)", content: ours, color: .green)
             }
 
             // Theirs preview
             if let theirs = conflict.theirs, !theirs.isEmpty {
-                conflictPreview(label: "theirs", content: theirs, color: .red)
+                conflictPreview(label: "theirs (worker)", content: theirs, color: .blue)
+            }
+
+            // Resolution buttons
+            HStack(spacing: 8) {
+                Button(action: { resolve(.ours) }) {
+                    Label("Accept Ours", systemImage: "arrow.left.circle")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.green)
+                .disabled(isResolving || conflict.resolution == .ours)
+
+                Button(action: { resolve(.theirs) }) {
+                    Label("Accept Theirs", systemImage: "arrow.right.circle")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.blue)
+                .disabled(isResolving || conflict.resolution == .theirs)
+
+                Button(action: { resolve(.skip) }) {
+                    Label("Skip", systemImage: "forward.circle")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.orange)
+                .disabled(isResolving || conflict.resolution == .skip)
+
+                if isResolving {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
+                Spacer()
+            }
+
+            if let error = resolveError {
+                Text(error)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+                    .lineLimit(2)
             }
         }
         .padding(10)
         .background(Color(nsColor: .controlBackgroundColor))
         .cornerRadius(6)
+    }
+
+    private func resolve(_ resolution: ConflictResolution) {
+        isResolving = true
+        resolveError = nil
+        Task { @MainActor in
+            let success = engine.resolveConflict(
+                workerId: workerId,
+                filePath: conflict.filePath,
+                resolution: resolution
+            )
+            if !success {
+                resolveError = engine.lastError ?? "Resolution failed"
+            }
+            isResolving = false
+        }
     }
 
     private func conflictPreview(label: String, content: String, color: Color) -> some View {

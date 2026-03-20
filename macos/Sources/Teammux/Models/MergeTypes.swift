@@ -75,6 +75,41 @@ enum ConflictType: String, Sendable {
     }
 }
 
+// MARK: - ConflictResolution
+
+/// Per-file conflict resolution choice. Maps to `tm_resolution_t` in teammux.h.
+/// `ours`/`theirs` apply git checkout and are finalizable (`isResolved == true`).
+/// `skip` records choice without git ops — blocks finalization.
+/// `pending` is the initial state set by the engine on conflict detection.
+enum ConflictResolution: UInt8, CaseIterable, Sendable {
+    case ours    = 0
+    case theirs  = 1
+    case skip    = 2
+    case pending = 3
+
+    var label: String {
+        switch self {
+        case .ours:    return "Ours"
+        case .theirs:  return "Theirs"
+        case .skip:    return "Skipped"
+        case .pending: return "Pending"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .ours:    return .green
+        case .theirs:  return .blue
+        case .skip:    return .orange
+        case .pending: return .secondary
+        }
+    }
+
+    var isResolved: Bool {
+        self == .ours || self == .theirs
+    }
+}
+
 // MARK: - ConflictInfo
 
 /// Mirrors `tm_conflict_t` in teammux.h.
@@ -85,18 +120,21 @@ struct ConflictInfo: Identifiable, Equatable, Sendable {
     let conflictType: ConflictType
     let ours: String?
     let theirs: String?
+    var resolution: ConflictResolution
 
     init(
         id: UUID = UUID(),
         filePath: String,
         conflictType: ConflictType,
         ours: String? = nil,
-        theirs: String? = nil
+        theirs: String? = nil,
+        resolution: ConflictResolution = .pending
     ) {
         self.id = id
         self.filePath = filePath
         self.conflictType = conflictType
         self.ours = ours
         self.theirs = theirs
+        self.resolution = resolution
     }
 }

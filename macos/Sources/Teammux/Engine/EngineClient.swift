@@ -973,13 +973,69 @@ final class EngineClient: ObservableObject {
                 filePath: String(cString: ptr.pointee.file_path),
                 conflictType: ConflictType(rawString: String(cString: ptr.pointee.conflict_type)),
                 ours: ours,
-                theirs: theirs
+                theirs: theirs,
+                resolution: ConflictResolution(rawValue: UInt8(ptr.pointee.resolution.rawValue)) ?? .pending
             )
             conflicts.append(conflict)
         }
 
         tm_merge_conflicts_free(conflictsPtr, count)
         return conflicts
+    }
+
+    /// Resolve a single file in a conflicted merge.
+    /// Wraps `tm_conflict_resolve()`.
+    func resolveConflict(workerId: UInt32, filePath: String, resolution: ConflictResolution) -> Bool {
+        lastError = nil
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("Engine not created")
+            return false
+        }
+
+        let result = filePath.withCString { cPath in
+            tm_conflict_resolve(engine, workerId, cPath, tm_resolution_t(rawValue: UInt32(resolution.rawValue)))
+        }
+
+        if result != TM_OK {
+            let msg = lastEngineError() ?? "tm_conflict_resolve failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("resolveConflict failed: \(msg)")
+            return false
+        }
+
+        // Refresh conflicts to update resolution state
+        pendingConflicts[workerId] = getConflicts(workerId: workerId)
+        return true
+    }
+
+    /// Finalize a conflicted merge after all files are resolved.
+    /// Wraps `tm_conflict_finalize()`. Returns `true` on success.
+    func finalizeMerge(workerId: UInt32) -> Bool {
+        lastError = nil
+        guard let engine else {
+            lastError = "Engine not created"
+            Self.logger.error("Engine not created")
+            return false
+        }
+
+        let result = tm_conflict_finalize(engine, workerId)
+
+        if result == TM_ERR_CLEANUP_INCOMPLETE {
+            let engineMsg = lastEngineError() ?? "worktree cleanup was incomplete"
+            let warning = "Merge finalized but \(engineMsg). Manual cleanup may be needed."
+            lastError = warning
+            Self.logger.warning("finalizeMerge: worker \(workerId) \(warning)")
+        } else if result != TM_OK {
+            let msg = lastEngineError() ?? "tm_conflict_finalize failed (\(result.rawValue))"
+            lastError = msg
+            Self.logger.error("finalizeMerge failed: \(msg)")
+            return false
+        }
+
+        mergeStatuses[workerId] = .success
+        pendingConflicts.removeValue(forKey: workerId)
+        return true
     }
 
     // MARK: - Roles
