@@ -886,7 +886,9 @@ final class EngineClient: ObservableObject {
             return false
         }
 
+        let savedWarning = lastError
         let initialStatus = getMergeStatus(workerId: workerId)
+        lastError = savedWarning
         mergeStatuses[workerId] = initialStatus
         Self.logger.info("approveMerge: worker \(workerId) initial status: \(initialStatus.label)")
         startMergePolling()

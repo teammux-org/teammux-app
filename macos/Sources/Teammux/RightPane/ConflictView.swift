@@ -151,10 +151,15 @@ struct ConflictView: View {
     private func reject() {
         isActionInFlight = true
         actionError = nil
+        cleanupWarning = nil
         Task { @MainActor in
             let success = engine.rejectMerge(workerId: worker.id)
             if success {
-                dismiss()
+                if let warning = engine.lastError {
+                    cleanupWarning = warning
+                } else {
+                    dismiss()
+                }
             } else {
                 actionError = engine.lastError ?? "Reject failed"
             }
