@@ -192,6 +192,8 @@ pub const Engine = struct {
     last_wt_branch_cstr: ?[*:0]u8,
     history_logger: ?history_mod.HistoryLogger,
     pty_monitor: PtyMonitor,
+    health_monitor_thread: ?std.Thread,
+    health_monitor_running: std.atomic.Value(bool),
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
         const engine = try allocator.create(Engine);
@@ -229,6 +231,8 @@ pub const Engine = struct {
             .last_wt_branch_cstr = null,
             .history_logger = null,
             .pty_monitor = undefined, // initialized below (needs engine pointer)
+            .health_monitor_thread = null,
+            .health_monitor_running = std.atomic.Value(bool).init(false),
         };
         engine.pty_monitor = PtyMonitor.init(allocator, engine);
         return engine;
@@ -236,6 +240,11 @@ pub const Engine = struct {
 
     pub fn destroy(self: *Engine) void {
         self.pty_monitor.deinit(); // stop monitor thread before freeing engine state
+        self.health_monitor_running.store(false, .release);
+        if (self.health_monitor_thread) |t| {
+            t.join();
+            self.health_monitor_thread = null;
+        }
         hotreload.destroyAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.deinit();
         if (self.config_watcher) |*w| w.deinit();
@@ -444,6 +453,12 @@ pub const Engine = struct {
 
     pub fn sessionStop(self: *Engine) void {
         self.pty_monitor.stop();
+        // Stop health monitor
+        self.health_monitor_running.store(false, .release);
+        if (self.health_monitor_thread) |t| {
+            t.join();
+            self.health_monitor_thread = null;
+        }
         hotreload.stopAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.stop();
         if (self.config_watcher) |*w| w.stop();
@@ -487,6 +502,59 @@ pub const Engine = struct {
         const msg = std.fmt.bufPrint(&err_buf, "worker {d} PTY died with exit code {d}", .{ worker_id, exit_code }) catch
             "worker PTY died (details unavailable)";
         self.setError(msg) catch {};
+    }
+
+    fn healthMonitorLoop(self: *Engine) void {
+        const check_interval_ns: u64 = 30 * std.time.ns_per_s;
+        const threshold: i64 = blk: {
+            if (self.cfgPtr()) |cfg| {
+                const val = config.get(cfg, "stall_threshold_secs") orelse break :blk 300;
+                break :blk std.fmt.parseInt(i64, val, 10) catch 300;
+            }
+            break :blk 300;
+        };
+
+        while (self.health_monitor_running.load(.acquire)) {
+            std.Thread.sleep(check_interval_ns);
+            if (!self.health_monitor_running.load(.acquire)) break;
+
+            // Collect stalled worker IDs under lock
+            var stalled_ids: [64]u32 = undefined;
+            var stalled_count: usize = 0;
+            const now = std.time.timestamp();
+            {
+                self.roster.mutex.lock();
+                defer self.roster.mutex.unlock();
+                var it = self.roster.workers.iterator();
+                while (it.next()) |entry| {
+                    const w = entry.value_ptr;
+                    if (w.status != .idle and w.status != .working) continue;
+                    if (w.health_status == .stalled) continue;
+                    if (now - w.last_activity_ts > threshold) {
+                        w.health_status = .stalled;
+                        if (stalled_count < 64) {
+                            stalled_ids[stalled_count] = w.id;
+                            stalled_count += 1;
+                        }
+                    }
+                }
+            }
+
+            // Fire bus events outside the lock
+            if (stalled_count > 0) {
+                if (self.message_bus) |*b| {
+                    for (stalled_ids[0..stalled_count]) |wid| {
+                        const payload = std.fmt.allocPrint(self.allocator,
+                            \\{{"worker_id":{d},"threshold_secs":{d}}}
+                        , .{ wid, threshold }) catch continue;
+                        defer self.allocator.free(payload);
+                        b.send(0, wid, .health_stalled, payload) catch |err| {
+                            std.log.warn("[teammux] health stall event failed for worker {d}: {}", .{ wid, err });
+                        };
+                    }
+                }
+            }
+        }
     }
 
     /// Set the last error message. Acquires last_error_mutex internally.
@@ -603,6 +671,14 @@ export fn tm_session_start(engine: ?*Engine) c_int {
         error.OutOfMemory => 99,
         else => 99,
     };
+
+    // Start health monitor thread
+    e.health_monitor_running.store(true, .release);
+    e.health_monitor_thread = std.Thread.spawn(.{}, Engine.healthMonitorLoop, .{e}) catch |err| blk: {
+        std.log.warn("[teammux] health monitor thread failed to start: {}", .{err});
+        break :blk null;
+    };
+
     return 0;
 }
 export fn tm_session_stop(engine: ?*Engine) void { if (engine) |e| e.sessionStop(); }
