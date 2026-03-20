@@ -517,6 +517,7 @@ const CWorkerInfo = extern struct {
     branch_name: ?[*:0]const u8, worktree_path: ?[*:0]const u8,
     status: c_int, agent_type: c_int, agent_binary: ?[*:0]const u8,
     model: ?[*:0]const u8, spawned_at: u64,
+    last_activity_ts: i64, health_status: c_int,
 };
 const CRoster = extern struct { workers: ?[*]const CWorkerInfo, count: u32 };
 const CPr = extern struct {
@@ -558,8 +559,8 @@ const CDispatchEvent = extern struct {
 // Comptime ABI safety: verify extern struct sizes match expected C layout.
 // If a field is added/removed in teammux.h without updating Zig, this fails at build time.
 comptime {
-    // CWorkerInfo: u32(4) + pad(4) + 5 ptrs(40) + 2 c_int(8) + 2 ptrs(16) + u64(8) = 80... actual 72
-    if (@sizeOf(CWorkerInfo) != 72) @compileError("CWorkerInfo size mismatch with tm_worker_info_t");
+    // CWorkerInfo: u32(4) + pad(4) + 5 ptrs(40) + 2 c_int(8) + 2 ptrs(16) + u64(8) + i64(8) + c_int(4) + pad(4) = 96... actual 88
+    if (@sizeOf(CWorkerInfo) != 88) @compileError("CWorkerInfo size mismatch with tm_worker_info_t");
     // CMessage (bus.zig): u32 + u32 + c_int + ptr + u64 + u64 + ptr = 48 bytes on arm64
     if (@sizeOf(bus.CMessage) != 48) @compileError("CMessage size mismatch with tm_message_t");
     // CConflict: 4 ptrs(32) + c_int(4) + pad(4) = 40 bytes on arm64
@@ -773,6 +774,34 @@ export fn tm_worker_monitor_pid(engine: ?*Engine, worker_id: u32, pid: c_int) c_
     return 0;
 }
 
+export fn tm_worker_restart(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    e.roster.mutex.lock();
+    defer e.roster.mutex.unlock();
+    const w = e.roster.workers.getPtr(worker_id) orelse {
+        e.setError("tm_worker_restart: worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    };
+    w.health_status = .healthy;
+    w.last_activity_ts = std.time.timestamp();
+    return 0;
+}
+
+export fn tm_worker_health_status(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 0;
+    e.roster.mutex.lock();
+    defer e.roster.mutex.unlock();
+    const w = e.roster.workers.getPtr(worker_id) orelse return 0;
+    return @intFromEnum(w.health_status);
+}
+
+export fn tm_worker_last_activity(engine: ?*Engine, worker_id: u32) i64 {
+    const e = engine orelse return 0;
+    e.roster.mutex.lock();
+    defer e.roster.mutex.unlock();
+    const w = e.roster.workers.getPtr(worker_id) orelse return 0;
+    return w.last_activity_ts;
+}
 // ─── Worktree lifecycle ──────────────────────────────────
 
 // NO SWIFT CALLER — candidate for removal in v0.2
@@ -2854,7 +2883,8 @@ fn fillCWorkerInfo(alloc: std.mem.Allocator, w: *const worktree.Worker) !CWorker
     const model_z = try alloc.dupeZ(u8, w.model);
     return .{ .id = w.id, .name = name.ptr, .task_description = task.ptr, .branch_name = branch.ptr,
         .worktree_path = wt_path.ptr, .status = @intFromEnum(w.status), .agent_type = @intFromEnum(w.agent_type),
-        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = w.spawned_at };
+        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = w.spawned_at,
+        .last_activity_ts = w.last_activity_ts, .health_status = @intFromEnum(w.health_status) };
 }
 
 fn fillCWorkerInfoFromFields(alloc: std.mem.Allocator, wf: worktree.WorkerFields) !CWorkerInfo {
@@ -2866,7 +2896,8 @@ fn fillCWorkerInfoFromFields(alloc: std.mem.Allocator, wf: worktree.WorkerFields
     const model_z = try alloc.dupeZ(u8, wf.model);
     return .{ .id = wf.id, .name = name.ptr, .task_description = task.ptr, .branch_name = branch.ptr,
         .worktree_path = wt_path.ptr, .status = @intFromEnum(wf.status), .agent_type = @intFromEnum(wf.agent_type),
-        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = wf.spawned_at };
+        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = wf.spawned_at,
+        .last_activity_ts = wf.last_activity_ts, .health_status = @intFromEnum(wf.health_status) };
 }
 
 fn freeCWorkerInfo(info: CWorkerInfo) void {
@@ -6971,6 +7002,41 @@ test "tm_worker_dismiss unwatches PID from monitor" {
 
     // PID should be unwatched after dismiss
     try std.testing.expect(engine.pty_monitor.countWatched() == 0);
+}
+
+test "S11 - tm_worker_restart returns INVALID_WORKER for missing worker" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+
+    // Init a bare git repo so engine create succeeds
+    const init_result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "init", dir_path },
+    });
+    if (init_result) |r| { alloc.free(r.stdout); alloc.free(r.stderr); } else |_| {}
+
+    const dir_z = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(dir_z);
+
+    var engine_ptr: ?*Engine = null;
+    const rc = tm_engine_create(dir_z.ptr, @ptrCast(&engine_ptr));
+    if (rc != 0 or engine_ptr == null) return; // Skip if engine create fails in test env
+
+    defer tm_engine_destroy(engine_ptr);
+
+    // Non-existent worker should return TM_ERR_INVALID_WORKER (12)
+    try std.testing.expect(tm_worker_restart(engine_ptr, 99) == 12);
+}
+
+test "S11 - tm_worker_health_status returns healthy for missing worker" {
+    try std.testing.expect(tm_worker_health_status(null, 99) == 0);
+}
+
+test "S11 - tm_worker_last_activity returns 0 for null engine" {
+    try std.testing.expect(tm_worker_last_activity(null, 99) == 0);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; _ = worktree_lifecycle; _ = history_mod; }

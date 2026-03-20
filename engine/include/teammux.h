@@ -72,6 +72,7 @@ typedef enum {
     TM_MSG_PR_STATUS      = 15,  // GitHub PR status change (open/closed/merged)
     TM_MSG_PTY_DIED       = 17,  /* Forward declaration — engine implementation in S5 (PTY death cleanup).
                                      Value 16 is TM_ERR_DELIVERY_FAILED (error code, not message type) */
+    TM_MSG_HEALTH_STALLED = 18,  // Worker health stall detected
 } tm_message_type_t;
 
 typedef enum {
@@ -101,6 +102,12 @@ typedef enum {
     TM_MERGE_REJECTED    = 4,
 } tm_merge_status_e;
 
+typedef enum {
+    TM_HEALTH_HEALTHY = 0,
+    TM_HEALTH_STALLED = 1,
+    TM_HEALTH_ERRORED = 2,
+} tm_health_status_t;
+
 typedef struct {
     tm_worker_id_t     id;
     const char*        name;
@@ -112,6 +119,8 @@ typedef struct {
     const char*        agent_binary;
     const char*        model;
     uint64_t           spawned_at;
+    int64_t            last_activity_ts;
+    tm_health_status_t health_status;
 } tm_worker_info_t;
 
 typedef struct {
@@ -227,6 +236,19 @@ tm_worker_id_t tm_worker_spawn(
 );
 
 tm_result_t       tm_worker_dismiss(tm_engine_t* engine, tm_worker_id_t worker_id);
+
+// Reset a worker's health status to healthy and update last_activity_ts.
+// Called by Swift after PTY teardown+respawn. Does not manage PTYs.
+// Returns TM_OK on success, TM_ERR_INVALID_WORKER if worker not found.
+tm_result_t tm_worker_restart(tm_engine_t* engine, tm_worker_id_t worker_id);
+
+// Get health status for a specific worker.
+// Returns TM_HEALTH_HEALTHY if worker not found.
+tm_health_status_t tm_worker_health_status(tm_engine_t* engine, tm_worker_id_t worker_id);
+
+// Get last activity timestamp (unix epoch seconds) for a worker.
+// Returns 0 if worker not found.
+int64_t tm_worker_last_activity(tm_engine_t* engine, tm_worker_id_t worker_id);
 
 // -----------------------------------------------------------------
 // Worktree lifecycle
