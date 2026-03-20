@@ -16,6 +16,137 @@ pub const worktree_lifecycle = @import("worktree_lifecycle.zig");
 pub const history_mod = @import("history.zig");
 
 // ─────────────────────────────────────────────────────────
+// PTY death monitor — detects worker process exits
+//
+// Ghostty owns PTY lifecycle (pty.zig). The PtyMonitor provides
+// a safety-net: Swift registers PIDs via tm_worker_monitor_pid,
+// a background thread polls with kill(pid, 0) per POSIX.1,
+// and fires handlePtyDied on detection. The primary detection
+// path is Swift calling tm_worker_pty_died directly when
+// Ghostty's SurfaceView observes process exit.
+// ─────────────────────────────────────────────────────────
+
+const PtyMonitor = struct {
+    allocator: std.mem.Allocator,
+    pids: std.AutoHashMap(std.posix.pid_t, worktree.WorkerId),
+    mutex: std.Thread.Mutex,
+    thread: ?std.Thread,
+    running: std.atomic.Value(bool),
+    engine: *Engine,
+
+    fn init(allocator: std.mem.Allocator, engine: *Engine) PtyMonitor {
+        return .{
+            .allocator = allocator,
+            .pids = std.AutoHashMap(std.posix.pid_t, worktree.WorkerId).init(allocator),
+            .mutex = .{},
+            .thread = null,
+            .running = std.atomic.Value(bool).init(false),
+            .engine = engine,
+        };
+    }
+
+    fn deinit(self: *PtyMonitor) void {
+        self.stop();
+        self.pids.deinit();
+    }
+
+    /// Register a PID for death monitoring.
+    fn watch(self: *PtyMonitor, pid: std.posix.pid_t, worker_id: worktree.WorkerId) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.pids.put(pid, worker_id);
+    }
+
+    /// Unregister monitoring for a worker (by worker ID).
+    fn unwatch(self: *PtyMonitor, worker_id: worktree.WorkerId) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var remove_pid: ?std.posix.pid_t = null;
+        var it = self.pids.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == worker_id) {
+                remove_pid = entry.key_ptr.*;
+                break;
+            }
+        }
+        if (remove_pid) |pid| {
+            _ = self.pids.remove(pid);
+        }
+    }
+
+    fn start(self: *PtyMonitor) !void {
+        if (self.thread != null) return;
+        self.running.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, monitorLoop, .{self});
+    }
+
+    fn stop(self: *PtyMonitor) void {
+        if (self.thread == null) return;
+        self.running.store(false, .release);
+        self.thread.?.join();
+        self.thread = null;
+    }
+
+    fn monitorLoop(self: *PtyMonitor) void {
+        while (self.running.load(.acquire)) {
+            // 500ms poll — well within the 1s detection requirement
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            if (!self.running.load(.acquire)) break;
+            self.pollOnce();
+        }
+    }
+
+    fn pollOnce(self: *PtyMonitor) void {
+        var dead: [32]struct { pid: std.posix.pid_t, wid: worktree.WorkerId } = undefined;
+        var dead_count: usize = 0;
+
+        // Collect dead PIDs under lock
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            var it = self.pids.iterator();
+            while (it.next()) |entry| {
+                if (!isProcessAlive(entry.key_ptr.*)) {
+                    if (dead_count < dead.len) {
+                        dead[dead_count] = .{ .pid = entry.key_ptr.*, .wid = entry.value_ptr.* };
+                        dead_count += 1;
+                    }
+                }
+            }
+
+            for (dead[0..dead_count]) |d| {
+                _ = self.pids.remove(d.pid);
+            }
+        }
+
+        // Fire callbacks outside lock (avoids deadlock with engine mutexes)
+        for (dead[0..dead_count]) |d| {
+            self.engine.handlePtyDied(d.wid, -1);
+        }
+    }
+
+    fn countWatched(self: *PtyMonitor) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return @intCast(self.pids.count());
+    }
+
+    /// POSIX.1 kill(pid, 0): checks process existence without sending a signal.
+    /// Returns true if process exists, false if ESRCH (no such process).
+    fn isProcessAlive(pid: std.posix.pid_t) bool {
+        // Signal 0 does not send a signal — it only validates PID existence.
+        // Returns 0 if process exists and we have permission.
+        // Returns -1 with ESRCH if process does not exist.
+        // Returns -1 with EPERM if process exists but we lack permission.
+        if (std.c.kill(pid, 0) == 0) return true;
+        // EPERM (errno 1) means process exists but different user — still alive.
+        // ESRCH (errno 3) means no such process — dead.
+        return std.c._errno().* != 3;
+    }
+};
+
+// ─────────────────────────────────────────────────────────
 // Engine struct — central state, owns all module instances
 // ─────────────────────────────────────────────────────────
 
@@ -50,6 +181,7 @@ pub const Engine = struct {
     last_wt_path_cstr: ?[*:0]u8,
     last_wt_branch_cstr: ?[*:0]u8,
     history_logger: ?history_mod.HistoryLogger,
+    pty_monitor: PtyMonitor,
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
         const engine = try allocator.create(Engine);
@@ -86,11 +218,14 @@ pub const Engine = struct {
             .last_wt_path_cstr = null,
             .last_wt_branch_cstr = null,
             .history_logger = null,
+            .pty_monitor = undefined, // initialized below (needs engine pointer)
         };
+        engine.pty_monitor = PtyMonitor.init(allocator, engine);
         return engine;
     }
 
     pub fn destroy(self: *Engine) void {
+        self.pty_monitor.deinit(); // stop monitor thread before freeing engine state
         hotreload.destroyAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.deinit();
         if (self.config_watcher) |*w| w.deinit();
@@ -219,6 +354,11 @@ pub const Engine = struct {
             self.setError("Team Lead interceptor install failed — session cannot start without git write enforcement") catch {};
             return error.InterceptorInstallFailed;
         }
+
+        // Start PTY death monitor — polls registered PIDs for exit events
+        self.pty_monitor.start() catch |err| {
+            std.log.warn("[teammux] PTY monitor start failed: {} — relying on direct tm_worker_pty_died calls", .{err});
+        };
     }
 
     /// Bridge function for MessageBus routing from both CommandWatcher and GitHubClient.
@@ -283,6 +423,7 @@ pub const Engine = struct {
     }
 
     pub fn sessionStop(self: *Engine) void {
+        self.pty_monitor.stop();
         hotreload.stopAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.stop();
         if (self.config_watcher) |*w| w.stop();
@@ -294,6 +435,32 @@ pub const Engine = struct {
             std.log.warn("[teammux] Team Lead interceptor cleanup failed: {}", .{err});
             self.setError("sessionStop: Team Lead interceptor cleanup failed — orphaned .git-wrapper may remain in project root") catch {};
         };
+    }
+
+    /// Handle PTY death for a worker. Called by both PtyMonitor (background)
+    /// and tm_worker_pty_died (direct C API). Performs state reconciliation:
+    /// marks worker errored, releases ownership, fires bus event, sets error.
+    /// Does NOT remove the worktree — preserves the worker's in-progress work.
+    fn handlePtyDied(self: *Engine, worker_id: worktree.WorkerId, exit_code: i32) void {
+        // State reconciliation: mark errored + release ownership
+        if (!coordinator_mod.ptyDiedCallback(&self.roster, &self.ownership_registry, worker_id)) {
+            return; // Worker not in roster (already dismissed or never existed)
+        }
+
+        // Unwatch PID (no-op if not monitored or already removed)
+        self.pty_monitor.unwatch(worker_id);
+
+        // Fire TM_MSG_PTY_DIED on message bus (best-effort)
+        if (self.message_bus) |*b| {
+            var buf: [128]u8 = undefined;
+            const payload = std.fmt.bufPrint(&buf, "{{\"worker_id\":{d},\"exit_code\":{d}}}", .{ worker_id, exit_code }) catch return;
+            b.send(0, worker_id, .pty_died, payload) catch {};
+        }
+
+        // Set last error with worker ID and exit code
+        var err_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&err_buf, "worker {d} PTY died with exit code {d}", .{ worker_id, exit_code }) catch return;
+        self.setError(msg) catch {};
     }
 
     /// Set the last error message. Acquires last_error_mutex internally.
@@ -524,6 +691,8 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
 }
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    // Stop PID monitoring before dismiss
+    e.pty_monitor.unwatch(worker_id);
     // Stop and remove role watcher before dismiss
     if (e.role_watchers.fetchRemove(worker_id)) |kv| {
         kv.value.destroy();
@@ -542,6 +711,38 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     e.ownership_registry.release(worker_id);
     // Remove lifecycle worktree AFTER roster dismiss
     worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
+    return 0;
+}
+
+// ─── PTY death notification ──────────────────────────────
+
+/// Notify engine that a worker's PTY process died. Marks worker as errored,
+/// releases ownership, preserves worktree, fires TM_MSG_PTY_DIED on bus.
+/// This is the primary notification path — Swift/Ghostty calls this when
+/// SurfaceView detects process exit.
+export fn tm_worker_pty_died(engine: ?*Engine, worker_id: u32, exit_code: i32) c_int {
+    const e = engine orelse return 99;
+    if (!e.roster.hasWorker(worker_id)) {
+        e.setError("tm_worker_pty_died: worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    e.handlePtyDied(worker_id, exit_code);
+    return 0;
+}
+
+/// Register a PID for death monitoring. The engine's PtyMonitor polls
+/// registered PIDs via kill(pid, 0) and fires handlePtyDied on detection.
+/// This is a safety-net backup — the primary path is tm_worker_pty_died.
+export fn tm_worker_monitor_pid(engine: ?*Engine, worker_id: u32, pid: c_int) c_int {
+    const e = engine orelse return 99;
+    if (!e.roster.hasWorker(worker_id)) {
+        e.setError("tm_worker_monitor_pid: worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    e.pty_monitor.watch(pid, worker_id) catch {
+        e.setError("tm_worker_monitor_pid: failed to register PID") catch {};
+        return 99;
+    };
     return 0;
 }
 
@@ -6440,6 +6641,198 @@ test "S8 scenario 4b: getDiff C API returns null on null engine" {
 
 test "S8 scenario 4c: diff free handles null safely" {
     tm_diff_free(null); // Should not crash
+}
+
+// ─── S5: PTY death cleanup (I8) ──────────────────────────
+
+test "tm_worker_pty_died null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_worker_pty_died(null, 1, 1) == 99);
+}
+
+test "tm_worker_pty_died invalid worker returns TM_ERR_INVALID_WORKER" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-invalid");
+    defer engine.destroy();
+    try std.testing.expect(tm_worker_pty_died(engine, 99, 1) == 12);
+}
+
+test "tm_worker_pty_died marks worker errored and releases ownership" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-ptydied");
+    defer engine.destroy();
+
+    // Add a worker to roster
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+
+    // Register ownership
+    try engine.ownership_registry.register(1, "src/**/*.zig", true);
+    try std.testing.expect(engine.ownership_registry.rules.contains(1));
+
+    // Verify precondition
+    try std.testing.expect(engine.roster.getWorker(1).?.status == .idle);
+
+    // Notify PTY death
+    const result = tm_worker_pty_died(engine, 1, 137); // SIGKILL exit code
+    try std.testing.expect(result == 0);
+
+    // Worker marked errored
+    try std.testing.expect(engine.roster.getWorker(1).?.status == .err);
+    // Ownership released
+    try std.testing.expect(!engine.ownership_registry.rules.contains(1));
+    // Worker still in roster (not dismissed — worktree preserved)
+    try std.testing.expect(engine.roster.count() == 1);
+}
+
+test "tm_worker_pty_died sets error with exit code info" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-error");
+    defer engine.destroy();
+
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+
+    _ = tm_worker_pty_died(engine, 1, 9);
+
+    // Check error message contains worker ID and exit code
+    const err = std.mem.span(tm_engine_last_error(engine));
+    try std.testing.expect(std.mem.indexOf(u8, err, "worker 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "exit code 9") != null);
+}
+
+test "tm_worker_pty_died fires TM_MSG_PTY_DIED on bus" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(log_dir);
+
+    const engine = try Engine.create(alloc, log_dir);
+    defer engine.destroy();
+
+    // Initialize message bus
+    var sid: [8]u8 = undefined;
+    bus.generateSessionId(&sid);
+    engine.message_bus = try bus.MessageBus.init(alloc, log_dir, &sid, log_dir);
+
+    // Subscribe to bus
+    const State = struct {
+        var received: bool = false;
+        var received_type: c_int = -1;
+        var received_from: u32 = 0;
+    };
+    State.received = false;
+    State.received_type = -1;
+    State.received_from = 0;
+
+    const callback = struct {
+        fn cb(msg: ?*const bus.CMessage, _: ?*anyopaque) callconv(.c) c_int {
+            if (msg) |m| {
+                State.received = true;
+                State.received_type = m.msg_type;
+                State.received_from = m.from;
+            }
+            return 0;
+        }
+    }.cb;
+    engine.message_bus.?.subscribe(callback, null);
+
+    // Add worker and fire PTY death
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+    _ = tm_worker_pty_died(engine, 1, 42);
+
+    // Verify TM_MSG_PTY_DIED (17) received
+    try std.testing.expect(State.received);
+    try std.testing.expect(State.received_type == 17); // TM_MSG_PTY_DIED
+    try std.testing.expect(State.received_from == 1);
+}
+
+test "tm_worker_pty_died is idempotent" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-idempotent");
+    defer engine.destroy();
+
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+
+    // Call twice — both succeed, worker stays errored
+    try std.testing.expect(tm_worker_pty_died(engine, 1, 1) == 0);
+    try std.testing.expect(tm_worker_pty_died(engine, 1, 1) == 0);
+    try std.testing.expect(engine.roster.getWorker(1).?.status == .err);
+}
+
+test "tm_worker_monitor_pid null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_worker_monitor_pid(null, 1, 12345) == 99);
+}
+
+test "tm_worker_monitor_pid invalid worker returns TM_ERR_INVALID_WORKER" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-monpid");
+    defer engine.destroy();
+    try std.testing.expect(tm_worker_monitor_pid(engine, 99, 12345) == 12);
+}
+
+test "tm_worker_monitor_pid registers PID for monitoring" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-monreg");
+    defer engine.destroy();
+
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+
+    try std.testing.expect(engine.pty_monitor.countWatched() == 0);
+    try std.testing.expect(tm_worker_monitor_pid(engine, 1, 99999) == 0);
+    try std.testing.expect(engine.pty_monitor.countWatched() == 1);
+}
+
+test "PtyMonitor detects dead process via kill(pid, 0)" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-detect");
+    defer engine.destroy();
+
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+
+    // Use PID 1 (launchd) as an alive process — should NOT trigger death
+    try std.testing.expect(PtyMonitor.isProcessAlive(1));
+
+    // Use a PID that doesn't exist (very high PID) — should trigger death
+    try std.testing.expect(!PtyMonitor.isProcessAlive(999999999));
+}
+
+test "PtyMonitor pollOnce detects dead PID and fires handlePtyDied" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-poll");
+    defer engine.destroy();
+
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+
+    // Register a PID that doesn't exist
+    try engine.pty_monitor.watch(999999999, 1);
+    try std.testing.expect(engine.pty_monitor.countWatched() == 1);
+
+    // Verify worker is idle before poll
+    try std.testing.expect(engine.roster.getWorker(1).?.status == .idle);
+
+    // Poll — should detect the dead PID and fire handlePtyDied
+    engine.pty_monitor.pollOnce();
+
+    // PID should be removed from monitor
+    try std.testing.expect(engine.pty_monitor.countWatched() == 0);
+    // Worker should be marked errored
+    try std.testing.expect(engine.roster.getWorker(1).?.status == .err);
+}
+
+test "tm_worker_dismiss unwatches PID from monitor" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s5-test-dismiss");
+    defer engine.destroy();
+
+    // Need to add worker properly so dismiss can find it
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+    try engine.pty_monitor.watch(12345, 1);
+    try std.testing.expect(engine.pty_monitor.countWatched() == 1);
+
+    _ = tm_worker_dismiss(engine, 1);
+
+    // PID should be unwatched after dismiss
+    try std.testing.expect(engine.pty_monitor.countWatched() == 0);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; _ = worktree_lifecycle; _ = history_mod; }
