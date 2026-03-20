@@ -315,9 +315,9 @@ tm_result_t tm_github_merge_pr(
     tm_merge_strategy_t strategy
 );
 
-// Get diff for a worker's branch vs main. Returns NULL on failure.
+// Get diff for a pull request via GitHub PR files API. Returns NULL on failure.
 // Caller must call tm_diff_free().
-tm_diff_t* tm_github_get_diff(tm_engine_t* engine, tm_worker_id_t worker_id);
+tm_diff_t* tm_github_get_diff(tm_engine_t* engine, uint64_t pr_number);
 void       tm_diff_free(tm_diff_t* diff);
 
 tm_subscription_t tm_github_webhooks_start(tm_engine_t* engine, tm_github_event_cb callback, void* userdata);

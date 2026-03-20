@@ -73,6 +73,13 @@
 | TD38 | GitView / ConflictView   | UI callers don't surface CLEANUP_INCOMPLETE warning — lastError only checked on !success | v0.1.5 | NO       | OPEN   |
 | TD39 | merge.zig (test)         | cleanup_incomplete integration test is non-deterministic — accepts both outcomes    | v0.2   | NO       | OPEN   |
 
+## v0.1.5 S5 — New debt introduced
+
+| ID   | Module                   | Issue                                                                              | Target | Breaking | Status |
+|------|--------------------------|------------------------------------------------------------------------------------|--------|----------|--------|
+| TD40 | github.zig               | getDiff limited to 100 files (no pagination), 1 MiB buffer cap in runGhCommand     | v0.2   | NO       | OPEN   |
+| TD41 | DiffView.swift           | loadDiff calls engine.getDiff synchronously on MainActor, blocking UI during fetch  | v0.2   | NO       | OPEN   |
+
 ## Notes
 - TD15: Worker-to-worker messaging ships in two modes — questions route via Team Lead relay (/teammux-ask), task delegation routes direct (/teammux-delegate). T2 adds engine routing, T9 adds Swift bridge and feed cards.
 - TD16: CompletionReport and QuestionRequest cards ephemeral across sessions. T5 adds history.zig JSONL persistence, T10 adds Swift bridge loading on sessionStart with collapsible history section in LiveFeedView.
@@ -99,6 +106,8 @@
 - TD37: sessionStop calls interceptor.remove for the Team Lead wrapper. On failure, the error is logged via std.log.warn but not stored via setError. The orphaned .git-wrapper directory in project root can interfere with manual git usage after the app exits. Fix: call setError so Swift can surface a notification, or retry cleanup.
 - TD38: S2 TD31 fix sets lastError on the CLEANUP_INCOMPLETE path (code 15) so the UI can surface it, but GitView.approveMerge (line 411), GitView.rejectMerge (line 422), GitView PREventCard.approveMerge (line 562), PREventCard.rejectMerge (line 576), and ConflictView.forceMerge (line 128) all only read lastError inside `if !success`. Since code 15 returns true, the warning is never displayed. Fix: check lastError on the success path too and show it as a non-fatal banner/toast.
 - TD39: merge.zig test "approve returns cleanup_incomplete when worktree already removed" (line ~810) asserts `result == .cleanup_incomplete or result == .success`. The pre-removed worktree may or may not cause branch delete to also fail, making the test non-deterministic. It does not reliably exercise the cleanup_incomplete return path. Fix: also pre-delete the branch before approve to guarantee cleanup failure, or split into two deterministic tests.
+- TD40: getDiff calls `gh api repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100` without `--paginate`. PRs with >100 files silently return only the first 100. GitHub caps at 3000 files per PR. Adding `--paginate` requires handling concatenated JSON arrays (gh outputs one array per page) — either use `--paginate --slurp` and flatten the nested array, or loop with `page=N` manually. Also, `runGhCommand` caps stdout at 1 MiB (`readToEndAlloc(allocator, 1024 * 1024)`) which may be insufficient for very large PRs with full patch content. Fix: add `--paginate` support and increase or remove the buffer cap.
+- TD41: DiffView.loadDiff wraps `engine.getDiff(for:)` in `Task { @MainActor in }`. Since getDiff calls through the C API into `runGhCommand` which spawns and waits for a `gh` subprocess, the main thread is blocked for 1-5 seconds during the network call. The loading spinner may not render because SwiftUI cannot process the render pass while blocked. Fix: move the engine call to `Task.detached` or `Task { }` (without @MainActor) and dispatch results back to MainActor on completion.
 - Merge order v0.1.4: T1-T7 (parallel Wave 1) → T8-T12 (Wave 2, each waits on specific Wave 1 dep) → T13-T15 (Wave 3) → T16 (last)
 - Message type enum v0.1.4 additions: TM_MSG_PEER_QUESTION=12, TM_MSG_DELEGATION=13, TM_MSG_PR_READY=14, TM_MSG_PR_STATUS=15
 - Worktree root: defaults to ~/.teammux/worktrees/{SHA256(project_path)}/{worker_id}/. Configurable via config.toml key worktree_root.
