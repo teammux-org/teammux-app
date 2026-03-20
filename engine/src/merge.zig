@@ -84,11 +84,12 @@ pub const MergeCoordinator = struct {
             if (active != worker_id) return error.MergeInProgress;
         }
 
-        // Look up worker
-        const worker = roster.getWorker(worker_id) orelse return error.WorkerNotFound;
-        const branch_name = try self.allocator.dupe(u8, worker.branch_name);
+        // Thread-safe: copy fields under lock, safe to use after roster mutations
+        const wf = try roster.copyWorkerFields(worker_id, self.allocator) orelse return error.WorkerNotFound;
+        defer wf.deinit(self.allocator);
+        const branch_name = try self.allocator.dupe(u8, wf.branch_name);
         defer self.allocator.free(branch_name);
-        const wt_path = try self.allocator.dupe(u8, worker.worktree_path);
+        const wt_path = try self.allocator.dupe(u8, wf.worktree_path);
         defer self.allocator.free(wt_path);
 
         // v0.2: read main branch name from config.toml
@@ -141,9 +142,9 @@ pub const MergeCoordinator = struct {
             const wt_removed = runGitLoggedWithStderr(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "merge cleanup: worktree remove");
             const br_deleted = runGitLoggedWithStderr(self.allocator, project_root, &.{ "branch", "-D", branch_name }, "merge cleanup: branch delete");
 
-            // Update worker status to complete (keep roster entry for C1 history display)
-            if (roster.getWorker(worker_id)) |w| {
-                w.status = .complete;
+            // Update worker status under lock — worker may be concurrently read by tm_roster_get
+            if (!roster.setWorkerStatus(worker_id, .complete)) {
+                std.log.warn("[teammux] merge approve: worker {d} vanished from roster after successful merge — status not updated to complete", .{worker_id});
             }
 
             if (!wt_removed or !br_deleted) return .cleanup_incomplete;
@@ -219,11 +220,12 @@ pub const MergeCoordinator = struct {
         project_root: []const u8,
         worker_id: worktree.WorkerId,
     ) !bool {
-        // Look up worker and copy what we need before dismiss frees memory
-        const worker = roster.getWorker(worker_id) orelse return error.WorkerNotFound;
-        const branch_name = try self.allocator.dupe(u8, worker.branch_name);
+        // Thread-safe: copy fields under lock, safe to use after roster mutations
+        const wf = try roster.copyWorkerFields(worker_id, self.allocator) orelse return error.WorkerNotFound;
+        defer wf.deinit(self.allocator);
+        const branch_name = try self.allocator.dupe(u8, wf.branch_name);
         defer self.allocator.free(branch_name);
-        const wt_path = try self.allocator.dupe(u8, worker.worktree_path);
+        const wt_path = try self.allocator.dupe(u8, wf.worktree_path);
         defer self.allocator.free(wt_path);
 
         std.log.info("[teammux] merge reject: worker {d} branch={s}", .{ worker_id, branch_name });

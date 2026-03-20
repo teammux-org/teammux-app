@@ -84,7 +84,10 @@ pub const Coordinator = struct {
         kind: DispatchKind,
         content: []const u8,
     ) !void {
-        if (roster.getWorker(worker_id) == null) return error.WorkerNotFound;
+        // Check under lock — roster can be mutated concurrently by spawn/dismiss.
+        // TOCTOU: worker could be dismissed between this check and bus.send;
+        // acceptable since bus records delivered=false on failure.
+        if (!roster.hasWorker(worker_id)) return error.WorkerNotFound;
 
         var delivered = true;
         message_bus.send(worker_id, 0, msg_type, content) catch |err| {

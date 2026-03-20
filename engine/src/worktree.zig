@@ -71,15 +71,29 @@ pub const Roster = struct {
         };
     }
 
-    /// Claim the next available worker ID. The returned ID is reserved
-    /// and will not be reused. Caller must subsequently call spawn()
-    /// to fully create the worker entry, or accept the consumed slot.
+    /// Claim the next available worker ID. The returned ID is reserved.
+    /// Caller must subsequently call spawn() to fully create the worker
+    /// entry, or call unclaimId() to release the slot on failure.
     pub fn claimNextId(self: *Roster) WorkerId {
         self.mutex.lock();
         defer self.mutex.unlock();
         const id = self.next_id;
         self.next_id += 1;
         return id;
+    }
+
+    /// Release a claimed ID slot when spawn fails after claimNextId.
+    /// Only reclaims if id == next_id - 1 (the most recently claimed);
+    /// otherwise the slot is consumed. Non-contiguous reclaim would risk
+    /// assigning a previously-used ID to a new worker (ID collision).
+    pub fn unclaimId(self: *Roster, id: WorkerId) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.next_id > 0 and id == self.next_id - 1) {
+            self.next_id -= 1;
+        } else {
+            std.log.warn("[teammux] unclaimId: slot {d} leaked (next_id={d}, non-contiguous reclaim unsafe)", .{ id, self.next_id });
+        }
     }
 
     /// Register a worker with a pre-claimed ID and externally-created
@@ -147,10 +161,22 @@ pub const Roster = struct {
 
     /// Returns a raw internal pointer WITHOUT lock protection. Prefer
     /// copyWorkerFields() or hasWorker() for thread-safe access.
-    /// NOTE: merge.zig and coordinator.zig still use this in production
-    /// paths — migration deferred to a follow-up stream.
+    /// Retained for test convenience only; no production callers.
     pub fn getWorker(self: *Roster, worker_id: WorkerId) ?*Worker {
         return self.workers.getPtr(worker_id);
+    }
+
+    /// Thread-safe: set a worker's status under the roster mutex.
+    /// Returns false if worker not found. Prefer this over direct
+    /// field mutation via getWorker().
+    pub fn setWorkerStatus(self: *Roster, worker_id: WorkerId, status: WorkerStatus) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.workers.getPtr(worker_id)) |w| {
+            w.status = status;
+            return true;
+        }
+        return false;
     }
 
     /// Thread-safe: check whether a worker exists in the roster.
@@ -196,6 +222,9 @@ pub const Roster = struct {
         };
     }
 
+    /// Does NOT acquire mutex. Only call from code that already holds self.mutex
+    /// or from single-threaded contexts (tests). Use workers.count() directly
+    /// when you already hold the lock.
     pub fn count(self: *Roster) u32 {
         return @intCast(self.workers.count());
     }
@@ -541,6 +570,52 @@ test "worktree - claimNextId assigns sequential IDs" {
     try std.testing.expect(roster.claimNextId() == 1);
     try std.testing.expect(roster.claimNextId() == 2);
     try std.testing.expect(roster.claimNextId() == 3);
+}
+
+test "worktree - unclaimId reclaims most recent ID" {
+    var roster = Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = roster.claimNextId(); // 1
+    try std.testing.expect(id == 1);
+
+    roster.unclaimId(id);
+    // next_id rolled back — next claim should return 1 again
+    try std.testing.expect(roster.claimNextId() == 1);
+}
+
+test "worktree - unclaimId skips non-contiguous ID" {
+    var roster = Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id1 = roster.claimNextId(); // 1
+    _ = roster.claimNextId(); // 2
+
+    // Trying to unclaim id1 (not the most recent) — should be a no-op
+    roster.unclaimId(id1);
+    // next_id should still be 3
+    try std.testing.expect(roster.claimNextId() == 3);
+}
+
+test "worktree - setWorkerStatus updates existing worker" {
+    var roster = Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    const id = roster.claimNextId();
+    try roster.spawn(id, "/usr/bin/echo", .claude_code, "W", "task", "/tmp/wt", "br");
+
+    try std.testing.expect(roster.getWorker(id).?.status == .idle);
+    try std.testing.expect(roster.setWorkerStatus(id, .working));
+    try std.testing.expect(roster.getWorker(id).?.status == .working);
+    try std.testing.expect(roster.setWorkerStatus(id, .complete));
+    try std.testing.expect(roster.getWorker(id).?.status == .complete);
+}
+
+test "worktree - setWorkerStatus returns false for missing worker" {
+    var roster = Roster.init(std.testing.allocator);
+    defer roster.deinit();
+
+    try std.testing.expect(!roster.setWorkerStatus(999, .working));
 }
 
 test "worktree - spawn registers metadata without git operations" {

@@ -450,6 +450,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     const td = std.mem.span(task_description orelse return 0xFFFFFFFF);
 
     // 1. Claim next worker ID from roster
+    // Error paths below call unclaimId(id) to reclaim the slot on failure.
     const id = e.roster.claimNextId();
 
     // 2. Create worktree via lifecycle (single worktree subsystem)
@@ -460,6 +461,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
             error.MkdirFailed => "failed to create worktree directory",
             else => "worktree create failed",
         }) catch {};
+        e.roster.unclaimId(id);
         return 0xFFFFFFFF;
     };
 
@@ -467,6 +469,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     const entry = e.wt_registry.get(id) orelse {
         e.setError("worktree created but not found in registry — internal error") catch {};
         worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        e.roster.unclaimId(id);
         return 0xFFFFFFFF;
     };
 
@@ -474,6 +477,7 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     e.roster.spawn(id, ab, at, wn, td, entry.path, entry.branch) catch |err| {
         e.setError(switch (err) { else => "worker roster registration failed" }) catch {};
         worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        e.roster.unclaimId(id);
         return 0xFFFFFFFF;
     };
 
@@ -481,8 +485,11 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
     worktree.writeContextFile(e.allocator, entry.path, at, td, null, entry.branch) catch |err| {
         std.log.err("[teammux] context file write failed for worker {d}: {s} — rolling back spawn", .{ id, @errorName(err) });
         e.setError("worker spawn failed: could not write context file") catch {};
-        e.roster.dismiss(id) catch {};
+        e.roster.dismiss(id) catch |derr| {
+            std.log.warn("[teammux] spawn rollback: dismiss worker {d} failed: {s}", .{ id, @errorName(derr) });
+        };
         worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, id);
+        e.roster.unclaimId(id);
         return 0xFFFFFFFF;
     };
 
@@ -556,15 +563,28 @@ export fn tm_worktree_branch(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
 export fn tm_roster_get(engine: ?*Engine) ?*CRoster {
     const e = engine orelse return null;
     const alloc = e.allocator;
-    const count = e.roster.count();
-    const c_roster = alloc.create(CRoster) catch return null;
-    const c_workers = alloc.alloc(CWorkerInfo, count) catch { alloc.destroy(c_roster); return null; };
+    // Hold roster mutex for the entire iteration — concurrent spawn/dismiss
+    // could invalidate the HashMap iterator.
+    e.roster.mutex.lock();
+    defer e.roster.mutex.unlock();
+    const count: u32 = @intCast(e.roster.workers.count());
+    const c_roster = alloc.create(CRoster) catch {
+        e.setError("tm_roster_get: allocation failed") catch {};
+        return null;
+    };
+    const c_workers = alloc.alloc(CWorkerInfo, count) catch {
+        alloc.destroy(c_roster);
+        e.setError("tm_roster_get: allocation failed") catch {};
+        return null;
+    };
     var idx: usize = 0;
     var it = e.roster.workers.iterator();
     while (it.next()) |entry| {
         c_workers[idx] = fillCWorkerInfo(alloc, entry.value_ptr) catch {
             for (0..idx) |j| freeCWorkerInfo(c_workers[j]);
-            alloc.free(c_workers); alloc.destroy(c_roster); return null;
+            alloc.free(c_workers); alloc.destroy(c_roster);
+            e.setError("tm_roster_get: worker info fill failed") catch {};
+            return null;
         };
         idx += 1;
     }
