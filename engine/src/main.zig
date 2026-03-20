@@ -2442,9 +2442,10 @@ export fn tm_memory_append(engine: ?*Engine, worker_id: u32, summary: ?[*:0]cons
         return 12; // TM_ERR_INVALID_WORKER
     };
     const now: u64 = @intCast(std.time.timestamp());
-    memory_mod.append(e.allocator, wt_path, sum, now) catch {
-        e.setError("tm_memory_append: failed to write memory file") catch {};
-        return 99;
+    memory_mod.append(e.allocator, wt_path, sum, now) catch |err| {
+        e.setError(std.fmt.allocPrint(e.allocator, "tm_memory_append: write failed: {}", .{err}) catch
+            "tm_memory_append: write failed") catch {};
+        return 5; // TM_ERR_WORKTREE — filesystem write error in worktree
     };
     return 0;
 }
@@ -2458,10 +2459,11 @@ export fn tm_memory_read(engine: ?*Engine, worker_id: u32) ?[*:0]const u8 {
         e.setError("tm_memory_read: worker has no worktree") catch {};
         return null;
     };
-    const content = memory_mod.read(e.allocator, wt_path) catch {
-        e.setError("tm_memory_read: failed to read memory file") catch {};
+    const content = memory_mod.read(e.allocator, wt_path) catch |err| {
+        e.setError(std.fmt.allocPrint(e.allocator, "tm_memory_read: read failed: {}", .{err}) catch
+            "tm_memory_read: read failed") catch {};
         return null;
-    } orelse return null;
+    } orelse return null; // file-not-found — no setError, expected case
     defer e.allocator.free(content);
 
     // Dupe as C string for caller ownership
@@ -2714,6 +2716,40 @@ test "tm_merge_conflicts_get null returns null" {
     try std.testing.expect(count == 0);
 }
 test "tm_merge_conflicts_free handles null" { tm_merge_conflicts_free(null, 0); }
+
+// ─── Agent memory API tests (S13) ───────────────────────
+
+test "tm_memory_append null engine returns TM_ERR_UNKNOWN" {
+    try std.testing.expect(tm_memory_append(null, 1, "test") == 99);
+}
+test "tm_memory_append null summary returns TM_ERR_UNKNOWN" {
+    var out: ?*Engine = null;
+    const rc = tm_engine_create("/tmp", &out);
+    try std.testing.expect(rc == 0);
+    defer tm_engine_destroy(out);
+    try std.testing.expect(tm_memory_append(out, 1, null) == 99);
+}
+test "tm_memory_append missing worktree returns TM_ERR_INVALID_WORKER" {
+    var out: ?*Engine = null;
+    const rc = tm_engine_create("/tmp", &out);
+    try std.testing.expect(rc == 0);
+    defer tm_engine_destroy(out);
+    // Worker 99 has no worktree registered
+    try std.testing.expect(tm_memory_append(out, 99, "test") == 12);
+}
+test "tm_memory_read null engine returns null" {
+    try std.testing.expect(tm_memory_read(null, 1) == null);
+}
+test "tm_memory_read missing worktree returns null" {
+    var out: ?*Engine = null;
+    const rc = tm_engine_create("/tmp", &out);
+    try std.testing.expect(rc == 0);
+    defer tm_engine_destroy(out);
+    try std.testing.expect(tm_memory_read(out, 99) == null);
+}
+test "tm_memory_free handles null" {
+    tm_memory_free(null);
+}
 
 // ─── Role API tests ──────────────────────────────────────
 

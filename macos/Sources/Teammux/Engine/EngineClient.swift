@@ -475,6 +475,7 @@ final class EngineClient: ObservableObject {
         workerRoles.removeValue(forKey: workerId)
         workerWorktrees.removeValue(forKey: workerId)
         workerBranches.removeValue(forKey: workerId)
+        workerMemory.removeValue(forKey: workerId)
         refreshRoster()
         return true
     }
@@ -2056,9 +2057,8 @@ final class EngineClient: ObservableObject {
             tm_memory_append(engine, workerId, cSummary)
         }
         if result != TM_OK {
-            if let msg = lastEngineError() {
-                Self.logger.warning("memoryAppend failed for worker \(workerId): \(msg)")
-            }
+            let engineMsg = lastEngineError() ?? "unknown error"
+            Self.logger.warning("memoryAppend failed for worker \(workerId): \(engineMsg)")
         } else {
             // Refresh cached memory content
             loadWorkerMemory(workerId: workerId)
@@ -2073,6 +2073,10 @@ final class EngineClient: ObservableObject {
         }
 
         guard let cStr = tm_memory_read(engine, workerId) else {
+            // Distinguish "no file" (no last error) from read failure
+            if let errMsg = lastEngineError() {
+                Self.logger.warning("memoryRead failed for worker \(workerId): \(errMsg)")
+            }
             return nil
         }
         let content = String(cString: cStr)
@@ -2081,10 +2085,9 @@ final class EngineClient: ObservableObject {
     }
 
     /// Load memory file for a specific worker and update the published dictionary.
+    /// Clears the cached entry if the file no longer exists or is empty.
     func loadWorkerMemory(workerId: UInt32) {
-        if let content = memoryRead(workerId: workerId) {
-            workerMemory[workerId] = content
-        }
+        workerMemory[workerId] = memoryRead(workerId: workerId)
     }
 
     /// Load memory files for all workers with worktrees.

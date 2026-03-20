@@ -9,7 +9,8 @@ const std = @import("std");
 // the engine writes it as a timestamped markdown entry.
 //
 // File path: {worktree_path}/.teammux-memory.md
-// Threading: callers must serialize access externally.
+// Threading: concurrent access to different workers is safe (separate
+// files). Callers must serialize access for the same worker_id.
 // ─────────────────────────────────────────────────────────
 
 /// Maximum memory file size for read operations (2 MB).
@@ -34,16 +35,10 @@ pub fn append(
     const ts_str = try formatTimestamp(allocator, timestamp);
     defer allocator.free(ts_str);
 
-    // Build the entry block
     const entry = try std.fmt.allocPrint(allocator, "## {s}\n{s}\n\n", .{ ts_str, summary });
     defer allocator.free(entry);
 
-    // Check if file exists and has content
-    const exists = blk: {
-        const stat = std.fs.cwd().statFile(file_path) catch break :blk false;
-        break :blk stat.size > 0;
-    };
-
+    // Open or create the file (no truncate). worktree_path is always absolute.
     const file = std.fs.createFileAbsolute(file_path, .{
         .truncate = false,
     }) catch |err| {
@@ -52,12 +47,12 @@ pub fn append(
     };
     defer file.close();
 
-    if (!exists) {
-        // Write header for new file
+    // Check size on the opened handle (avoids TOCTOU race vs separate stat)
+    const stat = try file.stat();
+    if (stat.size == 0) {
         try file.writeAll("# Agent Memory\n\n");
     }
 
-    // Seek to end and append
     try file.seekFromEnd(0);
     try file.writeAll(entry);
 }

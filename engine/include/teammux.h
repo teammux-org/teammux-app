@@ -637,13 +637,17 @@ const char* tm_interceptor_path(tm_engine_t* engine, uint32_t worker_id);
 // Append a memory entry to a worker's .teammux-memory.md file.
 // summary must not be NULL. Engine timestamps the entry automatically.
 // Returns TM_ERR_INVALID_WORKER if worker has no worktree.
+// Returns TM_ERR_WORKTREE on I/O failure. Returns TM_ERR_UNKNOWN if
+// engine or summary is NULL. Check tm_engine_last_error() for details.
 tm_result_t tm_memory_append(tm_engine_t* engine,
                               tm_worker_id_t worker_id,
                               const char* summary);
 
 // Read the full content of a worker's .teammux-memory.md file.
 // Returns heap-allocated null-terminated string. Caller must call tm_memory_free().
-// Returns NULL if the file does not exist or worker has no worktree.
+// Returns NULL if the file does not exist, worker has no worktree, or a read
+// error occurred. On error, tm_engine_last_error() will contain details.
+// NULL with no last_error means file does not exist (expected case).
 const char* tm_memory_read(tm_engine_t* engine, tm_worker_id_t worker_id);
 
 // Free a string returned by tm_memory_read.

@@ -14,8 +14,8 @@ import os
 /// via LCS diff rather than positional comparison (TD28).
 ///
 /// The Memory section displays per-worker context summaries persisted in
-/// `.teammux-memory.md`. Entries are collapsible and show timestamp, task,
-/// files touched, and PR link. Memory persists across session restore.
+/// `.teammux-memory.md`. Entries show timestamp, task summary, commit, and
+/// PR link. The section is collapsible. Memory persists across session restore.
 struct ContextView: View {
     @ObservedObject var engine: EngineClient
 
