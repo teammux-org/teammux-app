@@ -322,34 +322,50 @@ struct ContextView: View {
 
     /// Compute indices of lines in `newLines` that are NOT part of the LCS
     /// with `oldLines` — these are truly added or changed lines.
-    private static func changedLineIndices(old oldLines: [String], new newLines: [String]) -> Set<Int> {
+    ///
+    /// TD44: Uses two-row optimization — O(n) space for LCS lengths instead
+    /// of O(m*n). A compact UInt8 direction table is used for backtracking
+    /// (1 byte per cell vs 8 bytes for the former full Int DP table).
+    static func changedLineIndices(old oldLines: [String], new newLines: [String]) -> Set<Int> {
         let m = oldLines.count
         let n = newLines.count
         guard m > 0, n > 0 else { return Set(0..<n) }
 
-        // Build LCS DP table
-        var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
+        // Two-row LCS: only previous and current row needed for lengths
+        var prev = Array(repeating: 0, count: n + 1)
+        var curr = Array(repeating: 0, count: n + 1)
+        // Direction table for backtracking: 0 = diagonal (match), 1 = up, 2 = left
+        var dir = Array(repeating: UInt8(0), count: m * n)
+
         for i in 1...m {
             for j in 1...n {
+                let idx = (i - 1) * n + (j - 1)
                 if oldLines[i - 1] == newLines[j - 1] {
-                    dp[i][j] = dp[i - 1][j - 1] + 1
+                    curr[j] = prev[j - 1] + 1
+                    dir[idx] = 0 // diagonal
+                } else if prev[j] > curr[j - 1] {
+                    curr[j] = prev[j]
+                    dir[idx] = 1 // up
                 } else {
-                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+                    curr[j] = curr[j - 1]
+                    dir[idx] = 2 // left
                 }
             }
+            swap(&prev, &curr)
         }
 
-        // Backtrack to find which new-content line indices are in the LCS
+        // Backtrack using direction table
         var lcsNewIndices: Set<Int> = []
         var i = m, j = n
         while i > 0 && j > 0 {
-            if oldLines[i - 1] == newLines[j - 1] {
+            switch dir[(i - 1) * n + (j - 1)] {
+            case 0:
                 lcsNewIndices.insert(j - 1)
                 i -= 1
                 j -= 1
-            } else if dp[i - 1][j] > dp[i][j - 1] {
+            case 1:
                 i -= 1
-            } else {
+            default:
                 j -= 1
             }
         }
