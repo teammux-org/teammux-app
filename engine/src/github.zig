@@ -144,7 +144,7 @@ pub const GitHubClient = struct {
             "--head",  branch,
             "--title", title,
             "--body",  body,
-        });
+        }, 1024 * 1024);
         defer allocator.free(result);
 
         // gh pr create outputs the PR URL as plain text
@@ -179,7 +179,7 @@ pub const GitHubClient = struct {
             "--repo", repo,
             merge_method,
             "--yes",
-        });
+        }, 1024 * 1024);
         allocator.free(result);
     }
 
@@ -195,10 +195,12 @@ pub const GitHubClient = struct {
         const endpoint = try std.fmt.allocPrint(allocator, "repos/{s}/pulls/{d}/files?per_page=100", .{ repo, pr_number });
         defer allocator.free(endpoint);
 
-        const result = try runGhCommand(allocator, &.{ "api", endpoint });
+        const result = try runGhCommand(allocator, &.{ "api", "--paginate", "--slurp", endpoint }, 10 * 1024 * 1024);
         defer allocator.free(result);
 
-        return parseDiffResponse(allocator, result);
+        const diff = try parseDiffResponse(allocator, result);
+        std.log.info("[teammux] getDiff PR#{d}: {d} files (~{d} pages)", .{ pr_number, diff.files.len, (diff.files.len + 99) / 100 });
+        return diff;
     }
 
     /// Start gh webhook forward for real-time GitHub events.
@@ -310,7 +312,7 @@ pub const GitHubClient = struct {
         };
         defer allocator.free(endpoint);
 
-        const result = runGhCommand(allocator, &.{ "api", endpoint }) catch |err| {
+        const result = runGhCommand(allocator, &.{ "api", endpoint }, 1024 * 1024) catch |err| {
             std.log.warn("[teammux] poll failed: {}", .{err});
             return;
         };
@@ -606,7 +608,7 @@ pub fn resolveAgentBinary(allocator: std.mem.Allocator, agent_name: []const u8) 
 // Helpers
 // ─────────────────────────────────────────────────────────
 
-fn runGhCommand(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
+fn runGhCommand(allocator: std.mem.Allocator, args: []const []const u8, max_output: usize) ![]u8 {
     var argv: std.ArrayList([]const u8) = .{};
     defer argv.deinit(allocator);
     try argv.append(allocator, "gh");
@@ -619,7 +621,7 @@ fn runGhCommand(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
 
     try child.spawn();
     const stdout = child.stdout.?;
-    const result = try stdout.readToEndAlloc(allocator, 1024 * 1024);
+    const result = try stdout.readToEndAlloc(allocator, max_output);
     const term = try child.wait();
 
     if (term != .Exited or term.Exited != 0) {
