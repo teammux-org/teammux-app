@@ -1,7 +1,7 @@
 # Teammux v0.1.5 — Sprint Master Spec
 
 **Theme:** Polish & Stability
-**Status:** Complete — tagged v0.1.5
+**Status:** Complete — tag v0.1.5 pending merge
 **Baseline:** audit-address-v014 tag, engine tests passing
 **Final test count:** 388 engine tests
 

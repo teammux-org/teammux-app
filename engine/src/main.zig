@@ -6008,9 +6008,11 @@ test "S8 scenario 1: updateRepo thread safety — mutex serializes repo swap" {
     try std.testing.expectEqualStrings("owner/new-repo-after-reload", client.repo.?);
 
     // Verify mutex is available (not stuck locked)
-    client.repo_mutex.lock();
-    const repo_copy = try alloc.dupe(u8, client.repo.?);
-    client.repo_mutex.unlock();
+    const repo_copy = blk: {
+        client.repo_mutex.lock();
+        defer client.repo_mutex.unlock();
+        break :blk try alloc.dupe(u8, client.repo.?);
+    };
     defer alloc.free(repo_copy);
     try std.testing.expectEqualStrings("owner/new-repo-after-reload", repo_copy);
 
@@ -6072,9 +6074,9 @@ test "S8 scenario 1c: config reload calls updateRepo via tm_config_reload path" 
     const root_z = try alloc.dupeZ(u8, root);
     defer alloc.free(root_z);
     var engine_ptr: ?*Engine = null;
-    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
     defer tm_engine_destroy(engine_ptr);
-    const e = engine_ptr orelse return;
+    const e = engine_ptr.?;
 
     // Load initial config
     try std.testing.expect(tm_config_reload(e) == 0);
@@ -6182,7 +6184,7 @@ test "S8 scenario 3: ownership register-release-reregister cycle" {
     const root_z = try alloc.dupeZ(u8, root);
     defer alloc.free(root_z);
     var engine_ptr: ?*Engine = null;
-    _ = tm_engine_create(root_z.ptr, &engine_ptr);
+    try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
     defer tm_engine_destroy(engine_ptr);
 
     // Register ownership for worker 1: write to src/**, deny infra/**
@@ -6238,7 +6240,7 @@ test "S8 scenario 3b: ownership resets on engine destroy — re-register restore
     // First engine lifecycle
     {
         var engine_ptr: ?*Engine = null;
-        _ = tm_engine_create(root_z.ptr, &engine_ptr);
+        try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
 
         const deny_pat = try alloc.dupeZ(u8, "secrets/**");
         defer alloc.free(deny_pat);
@@ -6256,7 +6258,7 @@ test "S8 scenario 3b: ownership resets on engine destroy — re-register restore
     // Second engine lifecycle (simulates session restore)
     {
         var engine_ptr: ?*Engine = null;
-        _ = tm_engine_create(root_z.ptr, &engine_ptr);
+        try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
         defer tm_engine_destroy(engine_ptr);
 
         // After fresh engine create, no ownership rules exist
