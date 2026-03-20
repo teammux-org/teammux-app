@@ -471,6 +471,28 @@ final class EngineClient: ObservableObject {
         return true
     }
 
+    // MARK: - Worker health
+
+    /// Reset a worker's health status in the engine after Swift-side PTY respawn.
+    /// Does NOT manage PTYs — call after creating the new SurfaceView.
+    func restartWorker(id: UInt32) -> Bool {
+        guard let engine else {
+            Self.logger.warning("restartWorker: no engine")
+            lastError = "Engine not initialized"
+            return false
+        }
+        lastError = nil
+        let result = tm_worker_restart(engine, id)
+        if result != TM_OK {
+            let msg = String(cString: tm_engine_last_error(engine))
+            lastError = msg
+            Self.logger.warning("restartWorker(\(id)) failed: \(msg)")
+            return false
+        }
+        refreshRoster()
+        return true
+    }
+
     // MARK: - Session Restore
 
     /// Restores workers and state from a previously saved session snapshot.
@@ -615,7 +637,9 @@ final class EngineClient: ObservableObject {
                 ),
                 agentBinary: String(cString: w.agent_binary),
                 model: String(cString: w.model),
-                spawnedAt: Date(timeIntervalSince1970: TimeInterval(w.spawned_at))
+                spawnedAt: Date(timeIntervalSince1970: TimeInterval(w.spawned_at)),
+                lastActivityTs: Date(timeIntervalSince1970: TimeInterval(w.last_activity_ts)),
+                healthStatus: HealthStatus(fromCValue: Int32(w.health_status.rawValue))
             )
             newRoster.append(info)
         }
@@ -1463,7 +1487,9 @@ final class EngineClient: ObservableObject {
                     ),
                     agentBinary: String(cString: w.agent_binary),
                     model: String(cString: w.model),
-                    spawnedAt: Date(timeIntervalSince1970: TimeInterval(w.spawned_at))
+                    spawnedAt: Date(timeIntervalSince1970: TimeInterval(w.spawned_at)),
+                    lastActivityTs: Date(timeIntervalSince1970: TimeInterval(w.last_activity_ts)),
+                    healthStatus: HealthStatus(fromCValue: Int32(w.health_status.rawValue))
                 )
                 workers.append(info)
             }
@@ -1530,6 +1556,9 @@ final class EngineClient: ObservableObject {
                     client.handlePRReadyMessage(payload: payload, timestamp: timestamp)
                 } else if type == .prStatus {
                     client.handlePRStatusMessage(payload: payload)
+                } else if type == .healthStalled {
+                    // Roster refresh picks up the new health_status
+                    client.refreshRoster()
                 }
             }
             return TM_OK

@@ -15,6 +15,12 @@ pub const WorkerStatus = enum(c_int) {
     err = 4,
 };
 
+pub const HealthStatus = enum(c_int) {
+    healthy = 0,
+    stalled = 1,
+    errored = 2,
+};
+
 pub const Worker = struct {
     id: WorkerId,
     name: []const u8,
@@ -26,6 +32,8 @@ pub const Worker = struct {
     agent_binary: []const u8,
     model: []const u8,
     spawned_at: u64,
+    last_activity_ts: i64,
+    health_status: HealthStatus,
 };
 
 /// Caller-owned copy of worker fields, safe to use after releasing the
@@ -41,6 +49,8 @@ pub const WorkerFields = struct {
     agent_binary: []const u8,
     model: []const u8,
     spawned_at: u64,
+    last_activity_ts: i64,
+    health_status: HealthStatus,
 
     pub fn deinit(self: WorkerFields, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -137,6 +147,8 @@ pub const Roster = struct {
             .agent_binary = owned_binary,
             .model = owned_model,
             .spawned_at = @intCast(std.time.timestamp()),
+            .last_activity_ts = std.time.timestamp(),
+            .health_status = .healthy,
         });
     }
 
@@ -219,6 +231,8 @@ pub const Roster = struct {
             .agent_binary = binary,
             .model = model,
             .spawned_at = w.spawned_at,
+            .last_activity_ts = w.last_activity_ts,
+            .health_status = w.health_status,
         };
     }
 

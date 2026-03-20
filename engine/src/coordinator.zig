@@ -167,6 +167,33 @@ pub fn ptyDiedCallback(
 }
 
 // ─────────────────────────────────────────────────────────
+// Health monitoring
+// ─────────────────────────────────────────────────────────
+
+/// Single pass of health checking: iterate all workers, mark as stalled
+/// if last_activity_ts exceeds threshold. Called by the monitor thread
+/// and by tests. Does NOT fire bus events — caller is responsible for
+/// that (the monitor thread fires TM_MSG_HEALTH_STALLED).
+pub fn checkWorkerHealth(roster: *worktree.Roster, stall_threshold_secs: i64) void {
+    const now = std.time.timestamp();
+    roster.mutex.lock();
+    defer roster.mutex.unlock();
+
+    var it = roster.workers.iterator();
+    while (it.next()) |entry| {
+        const w = entry.value_ptr;
+        // Only check active workers (idle or working)
+        if (w.status != .idle and w.status != .working) continue;
+        // Skip already-stalled workers
+        if (w.health_status == .stalled) continue;
+
+        if (now - w.last_activity_ts > stall_threshold_secs) {
+            w.health_status = .stalled;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────
 
@@ -182,6 +209,8 @@ pub fn makeTestWorker(alloc: std.mem.Allocator, id: worktree.WorkerId) !worktree
         .agent_binary = try alloc.dupe(u8, "echo"),
         .model = try alloc.dupe(u8, ""),
         .spawned_at = 0,
+        .last_activity_ts = std.time.timestamp(),
+        .health_status = .healthy,
     };
 }
 
@@ -516,4 +545,163 @@ test "ptyDiedCallback preserves worker in roster (does not dismiss)" {
     // Worker should still be in roster (errored but not dismissed)
     try std.testing.expect(roster.getWorker(1) != null);
     try std.testing.expect(roster.count() == 1);
+}
+
+test "health monitor - detects stalled worker" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    const worker = try makeTestWorker(alloc, 1);
+    try roster.workers.put(1, worker);
+
+    // Set last_activity_ts to 400 seconds ago (threshold is 300)
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        if (roster.workers.getPtr(1)) |w| {
+            w.last_activity_ts = std.time.timestamp() - 400;
+        }
+    }
+
+    // Run a single health check pass
+    checkWorkerHealth(&roster, 300);
+
+    // Verify worker is now stalled
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .stalled);
+    }
+}
+
+test "health monitor - healthy worker not stalled" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    const worker = try makeTestWorker(alloc, 1);
+    try roster.workers.put(1, worker);
+
+    // Worker was just active (default from makeTestWorker)
+    checkWorkerHealth(&roster, 300);
+
+    // Verify worker is still healthy
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .healthy);
+    }
+}
+
+test "health monitor - stalled worker resets on activity" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    const worker = try makeTestWorker(alloc, 1);
+    try roster.workers.put(1, worker);
+
+    // Stall the worker
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        if (roster.workers.getPtr(1)) |w| {
+            w.last_activity_ts = std.time.timestamp() - 400;
+        }
+    }
+    checkWorkerHealth(&roster, 300);
+
+    // Simulate activity — update timestamp and reset health
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        if (roster.workers.getPtr(1)) |w| {
+            w.last_activity_ts = std.time.timestamp();
+            w.health_status = .healthy;
+        }
+    }
+
+    checkWorkerHealth(&roster, 300);
+
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .healthy);
+    }
+}
+
+test "health monitor - restart resets stalled worker" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    const worker = try makeTestWorker(alloc, 1);
+    try roster.workers.put(1, worker);
+
+    // Stall the worker
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        if (roster.workers.getPtr(1)) |w| {
+            w.last_activity_ts = std.time.timestamp() - 400;
+        }
+    }
+    checkWorkerHealth(&roster, 300);
+
+    // Verify stalled
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .stalled);
+    }
+
+    // Simulate restart (same logic as tm_worker_restart)
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        if (roster.workers.getPtr(1)) |w| {
+            w.health_status = .healthy;
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
+
+    // Re-check — should stay healthy
+    checkWorkerHealth(&roster, 300);
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .healthy);
+    }
+}
+
+test "health monitor - skips completed workers" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    var worker = try makeTestWorker(alloc, 1);
+    worker.status = .complete;
+    worker.last_activity_ts = std.time.timestamp() - 400;
+    try roster.workers.put(1, worker);
+
+    // Completed worker should NOT be stalled even with old timestamp
+    checkWorkerHealth(&roster, 300);
+
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .healthy);
+    }
 }

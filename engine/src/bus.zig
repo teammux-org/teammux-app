@@ -20,8 +20,10 @@ pub const MessageType = enum(c_int) {
     delegation = 13,
     pr_ready = 14,
     pr_status = 15,
-    // 16 reserved for TM_MSG_HEALTH_STALLED (S11)
-    pty_died = 17, // Worker PTY process died unexpectedly
+    pty_died = 17, // Worker PTY process died unexpectedly (S5)
+    // 16 = TM_ERR_DELIVERY_FAILED (error code, not message type — S4)
+    // 17 = TM_MSG_PTY_DIED (S5)
+    health_stalled = 18, // Worker health stall detected (S11)
 
     pub fn toString(self: MessageType) []const u8 {
         return switch (self) {
@@ -39,6 +41,7 @@ pub const MessageType = enum(c_int) {
             .pr_ready => "pr_ready",
             .pr_status => "pr_status",
             .pty_died => "pty_died",
+            .health_stalled => "health_stalled",
         };
     }
 };
@@ -597,6 +600,8 @@ test "bus - broadcast sends to all active workers" {
         .agent_binary = try alloc.dupe(u8, "echo"),
         .model = try alloc.dupe(u8, ""),
         .spawned_at = 0,
+        .last_activity_ts = std.time.timestamp(),
+        .health_status = .healthy,
     });
     try roster.workers.put(2, .{
         .id = 2,
@@ -609,6 +614,8 @@ test "bus - broadcast sends to all active workers" {
         .agent_binary = try alloc.dupe(u8, "echo"),
         .model = try alloc.dupe(u8, ""),
         .spawned_at = 0,
+        .last_activity_ts = std.time.timestamp(),
+        .health_status = .healthy,
     });
 
     try b.broadcast(0, .broadcast, "\"status update\"", &roster);

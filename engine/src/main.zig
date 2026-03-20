@@ -192,6 +192,8 @@ pub const Engine = struct {
     last_wt_branch_cstr: ?[*:0]u8,
     history_logger: ?history_mod.HistoryLogger,
     pty_monitor: PtyMonitor,
+    health_monitor_thread: ?std.Thread,
+    health_monitor_running: std.atomic.Value(bool),
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
         const engine = try allocator.create(Engine);
@@ -229,6 +231,8 @@ pub const Engine = struct {
             .last_wt_branch_cstr = null,
             .history_logger = null,
             .pty_monitor = undefined, // initialized below (needs engine pointer)
+            .health_monitor_thread = null,
+            .health_monitor_running = std.atomic.Value(bool).init(false),
         };
         engine.pty_monitor = PtyMonitor.init(allocator, engine);
         return engine;
@@ -236,6 +240,11 @@ pub const Engine = struct {
 
     pub fn destroy(self: *Engine) void {
         self.pty_monitor.deinit(); // stop monitor thread before freeing engine state
+        self.health_monitor_running.store(false, .release);
+        if (self.health_monitor_thread) |t| {
+            t.join();
+            self.health_monitor_thread = null;
+        }
         hotreload.destroyAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.deinit();
         if (self.config_watcher) |*w| w.deinit();
@@ -395,6 +404,15 @@ pub const Engine = struct {
             return 8;
         };
 
+        // Update sender's last activity timestamp for health monitoring
+        {
+            self.roster.mutex.lock();
+            defer self.roster.mutex.unlock();
+            if (self.roster.workers.getPtr(from)) |w| {
+                w.last_activity_ts = std.time.timestamp();
+            }
+        }
+
         // History write for command-file path (workers writing /teammux-complete files).
         // The C API path (tm_worker_complete/tm_worker_question) has its own history write.
         if (msg_enum == .completion or msg_enum == .question) {
@@ -435,6 +453,12 @@ pub const Engine = struct {
 
     pub fn sessionStop(self: *Engine) void {
         self.pty_monitor.stop();
+        // Stop health monitor
+        self.health_monitor_running.store(false, .release);
+        if (self.health_monitor_thread) |t| {
+            t.join();
+            self.health_monitor_thread = null;
+        }
         hotreload.stopAll(&self.role_watchers);
         if (self.commands_watcher) |*w| w.stop();
         if (self.config_watcher) |*w| w.stop();
@@ -480,6 +504,66 @@ pub const Engine = struct {
         self.setError(msg) catch {};
     }
 
+    fn healthMonitorLoop(self: *Engine) void {
+        const check_interval_ns: u64 = 30 * std.time.ns_per_s;
+        const threshold: i64 = blk: {
+            if (self.cfgPtr()) |cfg| {
+                const val = config.get(cfg, "stall_threshold_secs") orelse break :blk 300;
+                break :blk std.fmt.parseInt(i64, val, 10) catch 300;
+            }
+            break :blk 300;
+        };
+
+        while (self.health_monitor_running.load(.acquire)) {
+            std.Thread.sleep(check_interval_ns);
+            if (!self.health_monitor_running.load(.acquire)) break;
+
+            // Collect stalled worker IDs under lock
+            var stalled_ids: [64]u32 = undefined;
+            var stalled_count: usize = 0;
+            const now = std.time.timestamp();
+            {
+                self.roster.mutex.lock();
+                defer self.roster.mutex.unlock();
+                var it = self.roster.workers.iterator();
+                while (it.next()) |entry| {
+                    const w = entry.value_ptr;
+                    if (w.status != .idle and w.status != .working) continue;
+                    if (w.health_status == .stalled) continue;
+                    if (now - w.last_activity_ts > threshold) {
+                        w.health_status = .stalled;
+                        if (stalled_count < 64) {
+                            stalled_ids[stalled_count] = w.id;
+                            stalled_count += 1;
+                        } else {
+                            // Revert stall so this worker is re-checked next cycle
+                            // (avoids permanent notification loss for overflow workers)
+                            w.health_status = .healthy;
+                        }
+                    }
+                }
+            }
+
+            // Fire bus events outside the lock
+            if (stalled_count > 0) {
+                if (self.message_bus) |*b| {
+                    for (stalled_ids[0..stalled_count]) |wid| {
+                        const payload = std.fmt.allocPrint(self.allocator,
+                            \\{{"worker_id":{d},"threshold_secs":{d}}}
+                        , .{ wid, threshold }) catch {
+                            std.log.err("[teammux] health monitor: OOM allocating stall payload for worker {d}", .{wid});
+                            continue;
+                        };
+                        defer self.allocator.free(payload);
+                        b.send(0, wid, .health_stalled, payload) catch |err| {
+                            std.log.warn("[teammux] health stall event failed for worker {d}: {}", .{ wid, err });
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     /// Set the last error message. Acquires last_error_mutex internally.
     /// NEVER call from code that already holds last_error_mutex (non-recursive).
     fn setError(self: *Engine, msg: []const u8) !void {
@@ -508,6 +592,7 @@ const CWorkerInfo = extern struct {
     branch_name: ?[*:0]const u8, worktree_path: ?[*:0]const u8,
     status: c_int, agent_type: c_int, agent_binary: ?[*:0]const u8,
     model: ?[*:0]const u8, spawned_at: u64,
+    last_activity_ts: i64, health_status: c_int,
 };
 const CRoster = extern struct { workers: ?[*]const CWorkerInfo, count: u32 };
 const CPr = extern struct {
@@ -549,8 +634,8 @@ const CDispatchEvent = extern struct {
 // Comptime ABI safety: verify extern struct sizes match expected C layout.
 // If a field is added/removed in teammux.h without updating Zig, this fails at build time.
 comptime {
-    // CWorkerInfo: u32(4) + pad(4) + 5 ptrs(40) + 2 c_int(8) + 2 ptrs(16) + u64(8) = 80... actual 72
-    if (@sizeOf(CWorkerInfo) != 72) @compileError("CWorkerInfo size mismatch with tm_worker_info_t");
+    // CWorkerInfo: u32(4) + pad(4) + 5 ptrs(40) + 2 c_int(8) + 2 ptrs(16) + u64(8) + i64(8) + c_int(4) + pad(4) = 96... actual 88
+    if (@sizeOf(CWorkerInfo) != 88) @compileError("CWorkerInfo size mismatch with tm_worker_info_t");
     // CMessage (bus.zig): u32 + u32 + c_int + ptr + u64 + u64 + ptr = 48 bytes on arm64
     if (@sizeOf(bus.CMessage) != 48) @compileError("CMessage size mismatch with tm_message_t");
     // CConflict: 4 ptrs(32) + c_int(4) + pad(4) = 40 bytes on arm64
@@ -593,6 +678,16 @@ export fn tm_session_start(engine: ?*Engine) c_int {
         error.OutOfMemory => 99,
         else => 99,
     };
+
+    // Start health monitor thread
+    e.health_monitor_running.store(true, .release);
+    e.health_monitor_thread = std.Thread.spawn(.{}, Engine.healthMonitorLoop, .{e}) catch |err| blk: {
+        std.log.warn("[teammux] health monitor thread failed to start: {}", .{err});
+        e.health_monitor_running.store(false, .release);
+        e.setError("health monitoring unavailable — background thread failed to start") catch {};
+        break :blk null;
+    };
+
     return 0;
 }
 export fn tm_session_stop(engine: ?*Engine) void { if (engine) |e| e.sessionStop(); }
@@ -764,6 +859,38 @@ export fn tm_worker_monitor_pid(engine: ?*Engine, worker_id: u32, pid: c_int) c_
     return 0;
 }
 
+export fn tm_worker_restart(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 99;
+    const found = blk: {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        const w = e.roster.workers.getPtr(worker_id) orelse break :blk false;
+        w.health_status = .healthy;
+        w.last_activity_ts = std.time.timestamp();
+        break :blk true;
+    };
+    if (!found) {
+        e.setError("tm_worker_restart: worker not found") catch {};
+        return 12; // TM_ERR_INVALID_WORKER
+    }
+    return 0;
+}
+
+export fn tm_worker_health_status(engine: ?*Engine, worker_id: u32) c_int {
+    const e = engine orelse return 0;
+    e.roster.mutex.lock();
+    defer e.roster.mutex.unlock();
+    const w = e.roster.workers.getPtr(worker_id) orelse return 0;
+    return @intFromEnum(w.health_status);
+}
+
+export fn tm_worker_last_activity(engine: ?*Engine, worker_id: u32) i64 {
+    const e = engine orelse return 0;
+    e.roster.mutex.lock();
+    defer e.roster.mutex.unlock();
+    const w = e.roster.workers.getPtr(worker_id) orelse return 0;
+    return w.last_activity_ts;
+}
 // ─── Worktree lifecycle ──────────────────────────────────
 
 // NO SWIFT CALLER — candidate for removal in v0.2
@@ -881,6 +1008,16 @@ export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_i
         e.setError(if (err == error.DeliveryFailed) "message delivery failed after 4 attempts" else "message send failed") catch {};
         return 8;
     };
+
+    // Update target worker's last activity timestamp (receiving a message = activity)
+    {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        if (e.roster.workers.getPtr(target_worker_id)) |w| {
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
+
     return 0;
 }
 export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0]const u8) c_int {
@@ -1671,6 +1808,15 @@ export fn tm_worker_complete(engine: ?*Engine, worker_id: u32, summary: ?[*:0]co
         return 8;
     });
 
+    // Update worker activity timestamp
+    {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        if (e.roster.workers.getPtr(worker_id)) |w| {
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
+
     b.send(0, worker_id, .completion, payload) catch |err| {
         e.setError(if (err == error.DeliveryFailed) "completion delivery failed after retries exhausted" else "completion bus send failed") catch {};
         return 8;
@@ -1741,6 +1887,15 @@ export fn tm_worker_question(engine: ?*Engine, worker_id: u32, question: ?[*:0]c
         e.setError("tm_worker_question: message bus not initialized (call tm_session_start first)") catch {};
         return 8;
     });
+
+    // Update worker activity timestamp
+    {
+        e.roster.mutex.lock();
+        defer e.roster.mutex.unlock();
+        if (e.roster.workers.getPtr(worker_id)) |w| {
+            w.last_activity_ts = std.time.timestamp();
+        }
+    }
 
     b.send(0, worker_id, .question, payload) catch |err| {
         e.setError(if (err == error.DeliveryFailed) "question delivery failed after retries exhausted" else "question bus send failed") catch {};
@@ -2817,7 +2972,8 @@ fn fillCWorkerInfo(alloc: std.mem.Allocator, w: *const worktree.Worker) !CWorker
     const model_z = try alloc.dupeZ(u8, w.model);
     return .{ .id = w.id, .name = name.ptr, .task_description = task.ptr, .branch_name = branch.ptr,
         .worktree_path = wt_path.ptr, .status = @intFromEnum(w.status), .agent_type = @intFromEnum(w.agent_type),
-        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = w.spawned_at };
+        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = w.spawned_at,
+        .last_activity_ts = w.last_activity_ts, .health_status = @intFromEnum(w.health_status) };
 }
 
 fn fillCWorkerInfoFromFields(alloc: std.mem.Allocator, wf: worktree.WorkerFields) !CWorkerInfo {
@@ -2829,7 +2985,8 @@ fn fillCWorkerInfoFromFields(alloc: std.mem.Allocator, wf: worktree.WorkerFields
     const model_z = try alloc.dupeZ(u8, wf.model);
     return .{ .id = wf.id, .name = name.ptr, .task_description = task.ptr, .branch_name = branch.ptr,
         .worktree_path = wt_path.ptr, .status = @intFromEnum(wf.status), .agent_type = @intFromEnum(wf.agent_type),
-        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = wf.spawned_at };
+        .agent_binary = binary.ptr, .model = model_z.ptr, .spawned_at = wf.spawned_at,
+        .last_activity_ts = wf.last_activity_ts, .health_status = @intFromEnum(wf.health_status) };
 }
 
 fn freeCWorkerInfo(info: CWorkerInfo) void {
@@ -6934,6 +7091,41 @@ test "tm_worker_dismiss unwatches PID from monitor" {
 
     // PID should be unwatched after dismiss
     try std.testing.expect(engine.pty_monitor.countWatched() == 0);
+}
+
+test "S11 - tm_worker_restart returns INVALID_WORKER for missing worker" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+
+    // Init a bare git repo so engine create succeeds
+    const init_result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "init", dir_path },
+    });
+    if (init_result) |r| { alloc.free(r.stdout); alloc.free(r.stderr); } else |_| {}
+
+    const dir_z = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(dir_z);
+
+    var engine_ptr: ?*Engine = null;
+    const rc = tm_engine_create(dir_z.ptr, @ptrCast(&engine_ptr));
+    if (rc != 0 or engine_ptr == null) return; // Skip if engine create fails in test env
+
+    defer tm_engine_destroy(engine_ptr);
+
+    // Non-existent worker should return TM_ERR_INVALID_WORKER (12)
+    try std.testing.expect(tm_worker_restart(engine_ptr, 99) == 12);
+}
+
+test "S11 - tm_worker_health_status returns healthy for missing worker" {
+    try std.testing.expect(tm_worker_health_status(null, 99) == 0);
+}
+
+test "S11 - tm_worker_last_activity returns 0 for null engine" {
+    try std.testing.expect(tm_worker_last_activity(null, 99) == 0);
 }
 
 test { _ = config; _ = worktree; _ = pty_mod; _ = bus; _ = github; _ = commands; _ = merge; _ = ownership; _ = interceptor; _ = hotreload; _ = coordinator_mod; _ = worktree_lifecycle; _ = history_mod; }

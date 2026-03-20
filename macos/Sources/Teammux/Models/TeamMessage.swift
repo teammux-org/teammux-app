@@ -22,6 +22,8 @@ enum MessageType: Int, CaseIterable, Sendable {
     case delegation   = 13
     case prReady      = 14
     case prStatus     = 15
+    // 16-17 reserved (S4 error code, S5 PTY death — not yet merged)
+    case healthStalled = 18
 
     private static let logger = Logger(subsystem: "com.teammux.app", category: "MessageType")
 
@@ -41,6 +43,7 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .delegation:   return .purple
         case .prReady:      return .green
         case .prStatus:     return .purple
+        case .healthStalled: return .yellow
         }
     }
 
@@ -60,6 +63,7 @@ enum MessageType: Int, CaseIterable, Sendable {
         case .delegation:   return "Delegation"
         case .prReady:      return "PR Ready"
         case .prStatus:     return "PR Status"
+        case .healthStalled: return "Health Stalled"
         }
     }
 

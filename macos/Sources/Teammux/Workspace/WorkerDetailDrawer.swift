@@ -42,6 +42,10 @@ struct WorkerDetailDrawer: View {
                     .foregroundStyle(.secondary)
             }
 
+            // Health status
+            Divider()
+            healthSection
+
             // PR status row — only shown when a PR exists for this worker
             if let prEvent = engine.workerPRs[worker.id] {
                 Divider()
@@ -95,6 +99,47 @@ struct WorkerDetailDrawer: View {
             }
             .buttonStyle(.plain)
             .help("Copy \(label.lowercased())")
+        }
+    }
+
+    // MARK: - Health section
+
+    private var healthSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text("Health")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.tertiary)
+
+                Circle()
+                    .fill(worker.healthStatus.color)
+                    .frame(width: 6, height: 6)
+
+                Text(worker.healthStatus.label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(worker.healthStatus.color)
+            }
+
+            HStack(spacing: 4) {
+                Text("Last activity")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                Text(worker.lastActivityTs, style: .relative)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
+            if worker.healthStatus == .stalled || worker.healthStatus == .errored {
+                Button(action: {
+                    _ = engine.restartWorker(id: worker.id)
+                }) {
+                    Label("Restart Worker", systemImage: "arrow.clockwise")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.orange)
+            }
         }
     }
 
