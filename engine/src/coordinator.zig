@@ -156,6 +156,7 @@ pub fn ptyDiedCallback(
         return false;
     };
     w.status = .err;
+    w.health_status = .errored;
     roster.mutex.unlock();
 
     // Release all ownership entries for the dead worker
@@ -182,7 +183,9 @@ pub fn checkWorkerHealth(roster: *worktree.Roster, stall_threshold_secs: i64) vo
     var it = roster.workers.iterator();
     while (it.next()) |entry| {
         const w = entry.value_ptr;
-        // Only check active workers (idle or working)
+        // Only check active workers (idle or working).
+        // Dead workers (status=.err) are skipped — they already have
+        // health_status=.errored set by ptyDiedCallback (I12).
         if (w.status != .idle and w.status != .working) continue;
         // Skip already-stalled workers
         if (w.health_status == .stalled) continue;
@@ -493,8 +496,9 @@ test "ptyDiedCallback marks worker errored and releases ownership" {
     const result = ptyDiedCallback(&roster, &ownership_reg, 1);
     try std.testing.expect(result);
 
-    // Worker marked errored
+    // Worker marked errored (both status and health_status — I12)
     try std.testing.expect(roster.getWorker(1).?.status == .err);
+    try std.testing.expect(roster.getWorker(1).?.health_status == .errored);
     // Ownership released
     try std.testing.expect(!ownership_reg.rules.contains(1));
 }
@@ -528,6 +532,7 @@ test "ptyDiedCallback is idempotent" {
     try std.testing.expect(r1);
     try std.testing.expect(r2);
     try std.testing.expect(roster.getWorker(1).?.status == .err);
+    try std.testing.expect(roster.getWorker(1).?.health_status == .errored);
 }
 
 test "ptyDiedCallback preserves worker in roster (does not dismiss)" {
@@ -703,5 +708,29 @@ test "health monitor - skips completed workers" {
         defer roster.mutex.unlock();
         const w = roster.workers.getPtr(1).?;
         try std.testing.expect(w.health_status == .healthy);
+    }
+}
+
+test "health monitor - skips errored (dead PTY) workers (I12)" {
+    const alloc = std.testing.allocator;
+
+    var roster = worktree.Roster.init(alloc);
+    defer roster.deinit();
+
+    var worker = try makeTestWorker(alloc, 1);
+    worker.status = .err;
+    worker.health_status = .errored;
+    worker.last_activity_ts = std.time.timestamp() - 400;
+    try roster.workers.put(1, worker);
+
+    // Dead worker should NOT be marked stalled — it is already errored
+    checkWorkerHealth(&roster, 300);
+
+    {
+        roster.mutex.lock();
+        defer roster.mutex.unlock();
+        const w = roster.workers.getPtr(1).?;
+        try std.testing.expect(w.health_status == .errored);
+        try std.testing.expect(w.status == .err);
     }
 }

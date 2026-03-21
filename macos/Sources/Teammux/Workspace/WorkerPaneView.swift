@@ -49,10 +49,25 @@ struct WorkerPaneView: View {
     private var workerStack: some View {
         ZStack {
             ForEach(engine.roster) { worker in
+                let gen = engine.restartGeneration[worker.id] ?? 0
                 WorkerTerminalView(worker: worker, engine: engine)
+                    // C4: Generation-based identity forces SwiftUI to destroy
+                    // the old NSViewRepresentable and call makeNSView fresh on
+                    // restart, spawning a new PTY surface in the same worktree.
+                    .id(WorkerSurfaceIdentity(workerId: worker.id, generation: gen))
                     .opacity(activeWorkerId == worker.id ? 1 : 0)
                     .allowsHitTesting(activeWorkerId == worker.id)
             }
         }
     }
+}
+
+// MARK: - Surface identity
+
+/// Hashable identity combining worker ID and restart generation.
+/// When the generation bumps, SwiftUI treats it as a new view and
+/// recreates the underlying WorkerTerminalSurface (C4 PTY respawn).
+private struct WorkerSurfaceIdentity: Hashable {
+    let workerId: UInt32
+    let generation: UInt64
 }
