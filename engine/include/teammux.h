@@ -38,7 +38,9 @@ typedef enum {
     TM_ERR_OWNERSHIP        = 14,
     TM_ERR_CLEANUP_INCOMPLETE = 15,
     TM_ERR_DELIVERY_FAILED    = 16,  /* Forward declaration — engine implementation in S4 (bus reliability) */
-    TM_ERR_GIT_FAILURE        = 19,  /* Git operation failed inside conflict resolution (I3) */
+    /* 17 and 18 reserved — collide with TM_MSG_PTY_DIED and TM_MSG_HEALTH_STALLED in tm_message_type_t.
+       Kept unused in tm_result_t to avoid cross-enum confusion. Do not reuse. */
+    TM_ERR_GIT_FAILURE        = 19,  /* Git operation failed inside conflict resolution */
     TM_ERR_UNKNOWN          = 99,
 } tm_result_t;
 
