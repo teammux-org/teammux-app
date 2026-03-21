@@ -7171,8 +7171,9 @@ test "PtyMonitor pollOnce detects dead PID and fires handlePtyDied" {
 
     // PID should be removed from monitor
     try std.testing.expect(engine.pty_monitor.countWatched() == 0);
-    // Worker should be marked errored
+    // Worker should be marked errored (both status and health_status — I12)
     try std.testing.expect(engine.roster.getWorker(1).?.status == .err);
+    try std.testing.expect(engine.roster.getWorker(1).?.health_status == .errored);
 }
 
 test "tm_worker_dismiss unwatches PID from monitor" {
