@@ -149,8 +149,8 @@ struct ConflictView: View {
         let engine = self.engine
         let workerId = worker.id
         Task.detached {
-            let success = engine.finalizeMerge(workerId: workerId)
-            let error = engine.lastError
+            let success = await engine.finalizeMerge(workerId: workerId)
+            let error = await engine.lastError
             await MainActor.run {
                 if success {
                     if let warning = error {
@@ -173,8 +173,8 @@ struct ConflictView: View {
         let engine = self.engine
         let workerId = worker.id
         Task.detached {
-            let success = engine.rejectMerge(workerId: workerId)
-            let error = engine.lastError
+            let success = await engine.rejectMerge(workerId: workerId)
+            let error = await engine.lastError
             await MainActor.run {
                 if success {
                     if let warning = error {
@@ -302,12 +302,12 @@ struct ConflictFileRow: View {
         let workerId = self.workerId
         let filePath = conflict.filePath
         Task.detached {
-            let success = engine.resolveConflict(
+            let success = await engine.resolveConflict(
                 workerId: workerId,
                 filePath: filePath,
                 resolution: resolution
             )
-            let error = engine.lastError
+            let error = await engine.lastError
             await MainActor.run {
                 if !success {
                     self.resolveError = error ?? "Resolution failed"
