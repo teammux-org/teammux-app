@@ -96,12 +96,18 @@ pub const CommandWatcher = struct {
         self.allocator.free(self.commands_dir);
     }
 
-    /// I13: Delete stale .teammux-error files from previous sessions.
+    /// I13: Delete stale .teammux-error file from previous sessions.
     /// Called at sessionStart to prevent error bleed across sessions.
     pub fn clearStaleErrors(self: *CommandWatcher) void {
-        var dir = std.fs.openDirAbsolute(self.commands_dir, .{}) catch return;
+        var dir = std.fs.openDirAbsolute(self.commands_dir, .{}) catch |err| {
+            std.log.warn("[teammux] clearStaleErrors: cannot open commands dir: {}", .{err});
+            return;
+        };
         defer dir.close();
-        dir.deleteFile(".teammux-error") catch {};
+        dir.deleteFile(".teammux-error") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => std.log.warn("[teammux] clearStaleErrors: cannot remove stale error file: {}", .{err}),
+        };
     }
 
     /// Write a .teammux-error JSON file to the commands directory (I6).
@@ -258,17 +264,20 @@ pub const CommandWatcher = struct {
         if (self.callback) |cb| {
             const ok = cb(parsed.command.ptr, parsed.args.ptr, self.userdata);
             if (!ok) {
-                // I11: Handler failed — write .teammux-error before deleting command file
-                _ = self.writeErrorResponse(dir, cmd_slice, "command handler failed");
+                // I11: Handler failed — write .teammux-error, only delete original
+                // if error file was written (same guard pattern as /teammux-complete path).
+                if (self.writeErrorResponse(dir, cmd_slice, "command handler failed")) {
+                    dir.deleteFile(filename) catch {};
+                }
                 self.notifyError("command handler failed");
-                dir.deleteFile(filename) catch {};
                 return;
             }
         } else {
             // I6: No handler registered — write error response
-            _ = self.writeErrorResponse(dir, cmd_slice, "no handler registered for command");
+            if (self.writeErrorResponse(dir, cmd_slice, "no handler registered for command")) {
+                dir.deleteFile(filename) catch {};
+            }
             self.notifyError("command received but no handler registered");
-            dir.deleteFile(filename) catch {};
             return;
         }
 
@@ -276,8 +285,11 @@ pub const CommandWatcher = struct {
         dir.deleteFile(filename) catch |err| {
             std.log.warn("[teammux] command file delete failed {s}: {}", .{ filename, err });
         };
-        // I13: Clear stale .teammux-error on successful command processing
-        dir.deleteFile(".teammux-error") catch {};
+        // I13: Clear prior .teammux-error on successful command processing
+        dir.deleteFile(".teammux-error") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => std.log.warn("[teammux] stale .teammux-error cleanup failed: {}", .{err}),
+        };
     }
 
     /// Route a /teammux-complete command to the bus as TM_MSG_COMPLETION.

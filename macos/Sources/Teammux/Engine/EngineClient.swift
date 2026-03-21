@@ -316,6 +316,7 @@ final class EngineClient: ObservableObject {
         autonomousDispatches.removeAll()
         workerMemory.removeAll()
         restartGeneration.removeAll()
+        cleanupWarnings.removeAll()
         lastError = nil
     }
 

@@ -474,11 +474,12 @@ pub const Engine = struct {
         }
 
         b.send(to, from, msg_enum, payload_span) catch |err| {
-            // S1: DeliveryFailed already set a specific error via error_notify_cb
-            // (e.g. "pr_ready delivery failed for worker 3 after retries").
-            // Only set a generic error for other failure types.
-            if (err != error.DeliveryFailed) {
-                self.setError("bus message send failed") catch {};
+            // S1: For PR messages, DeliveryFailed already set a specific error via
+            // error_notify_cb (e.g. "pr_ready delivery failed for worker 3 after retries").
+            // For non-PR messages, error_notify_cb does not fire — set generic error.
+            const is_pr = msg_enum == .pr_ready or msg_enum == .pr_status;
+            if (!(err == error.DeliveryFailed and is_pr)) {
+                self.setError("bus message delivery failed") catch {};
             }
             return 8;
         };
@@ -1342,9 +1343,14 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
         return handlePrReadyCommand(engine, args_ptr);
     }
 
-    // Forward unhandled commands to Swift callback (assume success — Swift has its own error handling)
-    if (engine.cmd_cb) |cb| cb(command_ptr, args_ptr, engine.cmd_cb_userdata);
-    return true;
+    // Forward unhandled commands to Swift callback — void-returning,
+    // so engine cannot verify success. Return true when callback exists.
+    if (engine.cmd_cb) |cb| {
+        cb(command_ptr, args_ptr, engine.cmd_cb_userdata);
+        return true;
+    }
+    std.log.warn("[teammux] commandRoutingCallback: no handler for command, no Swift callback registered", .{});
+    return false;
 }
 
 fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) bool {
