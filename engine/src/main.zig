@@ -437,22 +437,9 @@ pub const Engine = struct {
             self.setError("busSendBridge: payload is NULL") catch {};
             return 8;
         });
-        b.send(to, from, msg_enum, payload_span) catch |err| {
-            self.setError(if (err == error.DeliveryFailed) "bus message delivery failed after retries exhausted" else "bus message send failed") catch {};
-            return 8;
-        };
 
-        // Update sender's last activity timestamp for health monitoring
-        {
-            self.roster.mutex.lock();
-            defer self.roster.mutex.unlock();
-            if (self.roster.workers.getPtr(from)) |w| {
-                w.last_activity_ts = std.time.timestamp();
-            }
-        }
-
-        // History write for command-file path (workers writing /teammux-complete files).
-        // The C API path (tm_worker_complete/tm_worker_question) has its own history write.
+        // I15: Write history BEFORE bus delivery so transient bus failures
+        // do not suppress audit/restore records permanently.
         if (msg_enum == .completion or msg_enum == .question) {
             if (self.history_logger) |*logger| {
                 const content_key: []const u8 = if (msg_enum == .completion) "summary" else "question";
@@ -481,8 +468,22 @@ pub const Engine = struct {
                     .timestamp = @intCast(std.time.timestamp()),
                 }) catch |err| {
                     std.log.err("[teammux] history append failed in busSendBridge: {}", .{err});
-                    self.setError("history persistence failed — event delivered to bus but not written to JSONL log") catch {};
+                    self.setError("history persistence failed — event not written to JSONL log") catch {};
                 };
+            }
+        }
+
+        b.send(to, from, msg_enum, payload_span) catch |err| {
+            self.setError(if (err == error.DeliveryFailed) "bus message delivery failed after retries exhausted" else "bus message send failed") catch {};
+            return 8;
+        };
+
+        // Update sender's last activity timestamp for health monitoring
+        {
+            self.roster.mutex.lock();
+            defer self.roster.mutex.unlock();
+            if (self.roster.workers.getPtr(from)) |w| {
+                w.last_activity_ts = std.time.timestamp();
             }
         }
 
