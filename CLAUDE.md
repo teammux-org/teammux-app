@@ -40,9 +40,8 @@ transiently — retry once before treating as a code issue.
 
 - engine/include/teammux.h              — C API contract (source of truth)
 - docs/TECH_DEBT.md                     — all known tech debt with target versions
-- docs/sprints/v0.1.6/V016_SPRINT.md   — last completed sprint master spec
-- docs/codex-audits/audit-002-post-v016/AUDIT-002-SPEC.md — active audit spec
-- docs/codex-audits/audit-001-post-v014/ACTION-PLAN.md — prior audit findings
+- docs/sprints/audit-address-002/AUDIT-ADDRESS-002-SPRINT.md — active sprint
+- docs/codex-audits/audit-002-post-v016/ACTION-PLAN.md — audit findings
 
 ## Directory Structure
 
@@ -64,9 +63,7 @@ src/                             — Ghostty upstream (DO NOT TOUCH)
 ## Right Pane Navigation
 
 The right pane uses a vertical scrollable icon rail on the far
-right edge of the screen. Each icon selects a pane view. Icons
-are stacked vertically, scrollable, with tooltip on hover and
-active state highlight. Current panes (top to bottom):
+right edge of the screen. Current panes (top to bottom):
 
 1. terminal — Team Lead (PTY surface, worker 0)
 2. arrow.triangle.branch — Git (PR review, merge coordinator)
@@ -110,6 +107,8 @@ Cmd+1..7 keyboard shortcuts map to pane order above.
 - Dead exports: 15 exports annotated DEPRECATED in header.
   Do not add new callers. Removal target: v0.2.
 - TM_ERR_PTY (6): RESERVED — no longer returned by any function.
+- tm_version(): must return build-time version string from
+  build.zig option. Do not hardcode.
 
 ## Version History
 
@@ -130,11 +129,12 @@ Cmd+1..7 keyboard shortcuts map to pane order above.
 - v0.1.5 — shipped: polish and stability. TD22(partial)/TD23/
   TD26/TD27/TD28/TD31/TD32/TD36/TD37 resolved, GitHub diff
   backend, updateRepo thread safety, OSS docs. 388 engine tests.
-- v0.1.6 — shipped: depth and polish. All remaining TD items
-  (TD21/TD24/TD29/TD30/TD33/TD34/TD35/TD38/TD40/TD41/TD42/
-  TD43/TD44), all audit-001 findings (I6/I7/I8/I11/I13/I15),
-  MergeCoordinator full conflict workflow, worker health
-  monitoring, User terminal pane, agent memory, premium UI
-  with vertical icon rail. 475 engine tests.
-- audit-002 — in progress: post-v0.1.6 audit across 8 domains.
-  See docs/codex-audits/audit-002-post-v016/AUDIT-002-SPEC.md
+- v0.1.6 — shipped: depth and polish. All remaining TD items,
+  all audit-001 findings, MergeCoordinator full conflict workflow,
+  worker health monitoring, User terminal pane, agent memory,
+  premium UI with vertical icon rail. 475 engine tests.
+- audit-002 — shipped: 23 unique findings (6C/18I/1S) across
+  7 domains. Tag: audit-002-post-v016.
+  See docs/codex-audits/audit-002-post-v016/ACTION-PLAN.md
+- audit-address-002 — in progress: 6-stream address sprint.
+  See docs/sprints/audit-address-002/AUDIT-ADDRESS-002-SPRINT.md
