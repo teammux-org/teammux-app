@@ -805,26 +805,13 @@ export fn tm_worker_spawn(engine: ?*Engine, agent_binary: ?[*:0]const u8, agent_
 }
 export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
-    // I14 fix: if worker has an active merge, abort it first to clean up
-    // MergeCoordinator state (active_merge, resolutions, conflicts) and
-    // run git merge --abort. reject() also dismisses from roster and
-    // removes worktree/branch, so we skip those steps below.
-    var merge_rejected = false;
-    if (e.merge_coordinator.active_merge) |active| {
-        if (active == worker_id) {
-            _ = e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
-                std.log.warn("[teammux] dismiss: merge reject for worker {d} failed: {} — proceeding with dismiss", .{ worker_id, err });
-            };
-            merge_rejected = true;
-        }
-    }
     // Stop PID monitoring before dismiss
     e.pty_monitor.unwatch(worker_id);
     // Stop and remove role watcher before dismiss
     if (e.role_watchers.fetchRemove(worker_id)) |kv| {
         kv.value.destroy();
     }
-    // Remove interceptor wrapper before worktree is deleted
+    // Remove interceptor wrapper while worker is still in roster
     if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
         std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
         break :blk null;
@@ -834,10 +821,19 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
         };
     }
-    // reject() already dismissed from roster + removed worktree — skip if merge was rejected
-    if (!merge_rejected) {
-        e.roster.dismiss(worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
+    // I14 fix (dismiss strands merge state): if worker has an active merge,
+    // abort it to clean up MergeCoordinator state and run git merge --abort.
+    // Must run after interceptor cleanup (needs worker in roster for
+    // copyWorkerFields). reject() also dismisses from roster.
+    if (e.merge_coordinator.active_merge) |active| {
+        if (active == worker_id) {
+            _ = e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
+                std.log.warn("[teammux] dismiss: merge reject for worker {d} failed: {} — proceeding with dismiss", .{ worker_id, err });
+            };
+        }
     }
+    // Dismiss from roster — may already be done by reject() above
+    e.roster.dismiss(worker_id) catch {};
     e.ownership_registry.release(worker_id);
     // Remove lifecycle worktree AFTER roster dismiss
     worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
