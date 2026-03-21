@@ -347,7 +347,8 @@ pub const Engine = struct {
             return err;
         };
 
-        // All subsystems initialized — commit to self (no more errors possible)
+        // All subsystems initialized — commit to self. The interceptor install
+        // below can still fail, so errdefers guard post-commit cleanup.
         self.cfg = cfg;
         self.message_bus = msg_bus;
         self.commands_watcher = cmd_watcher;
@@ -360,6 +361,13 @@ pub const Engine = struct {
                 std.log.warn("[teammux] history: async writer start failed, writes will be synchronous: {}", .{err});
                 self.setError("history: async writer unavailable — history writes will block the event loop") catch {};
             };
+        }
+
+        // C2: If any step after startWriter() fails, stop the writer thread.
+        // Without this, the interceptor install failure below leaves a live writer
+        // racing on an engine instance that the caller may retry or destroy.
+        errdefer {
+            if (self.history_logger) |*logger| logger.shutdown();
         }
 
         // Wire bus routing for PR status events from GitHub polling
