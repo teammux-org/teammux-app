@@ -2211,7 +2211,7 @@ export fn tm_conflict_resolve(engine: ?*Engine, worker_id: u32, file_path: ?[*:0
             error.GitFailed => "conflict resolve failed: git operation failed",
             else => "conflict resolve failed",
         }) catch {};
-        return 12; // TM_ERR_INVALID_WORKER
+        return if (err == error.GitFailed) 19 else 12; // TM_ERR_GIT_FAILURE / TM_ERR_INVALID_WORKER
     };
     return 0;
 }
@@ -2239,7 +2239,7 @@ export fn tm_conflict_finalize(engine: ?*Engine, worker_id: u32) c_int {
             error.GitFailed => "conflict finalize failed: git commit failed",
             else => "conflict finalize failed",
         }) catch {};
-        return 12; // TM_ERR_INVALID_WORKER
+        return if (err == error.GitFailed) 19 else 12; // TM_ERR_GIT_FAILURE / TM_ERR_INVALID_WORKER
     };
     e.ownership_registry.release(worker_id);
     if (result == .cleanup_incomplete) {
@@ -2973,6 +2973,7 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         14 => "TM_ERR_OWNERSHIP",
         15 => "TM_ERR_CLEANUP_INCOMPLETE",
         16 => "TM_ERR_DELIVERY_FAILED",
+        19 => "TM_ERR_GIT_FAILURE",
         else => "TM_ERR_UNKNOWN",
     };
 }
