@@ -313,8 +313,12 @@ pub const Engine = struct {
         };
         errdefer cfg.deinit(self.allocator);
 
-        // C5: Orphan recovery moved to tm_recover_orphans() — called by Swift AFTER
-        // restoreSession() populates the roster, so restored workers are not deleted.
+        // I9: normalize worktree_root
+        try normalizeWorktreeRoot(self.allocator, &cfg, self.project_root);
+
+        // C5: Orphan recovery deferred to tm_recover_orphans()
+        // Called by Swift AFTER restoreSession() populates the roster
+        // so restored workers are not deleted.
 
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
@@ -777,6 +781,12 @@ export fn tm_config_reload(engine: ?*Engine) c_int {
     defer e.allocator.free(p2);
     // Load into local first — on failure, old config remains intact
     var new_cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
+    // I9: normalize worktree_root
+    normalizeWorktreeRoot(e.allocator, &new_cfg, e.project_root) catch {
+        e.setError("config reload: worktree_root normalization failed") catch {};
+        new_cfg.deinit(e.allocator);
+        return 7;
+    };
     // Update GitHubClient repo before swapping config — on failure, discard new config
     e.github_client.updateRepo(new_cfg.project.github_repo) catch {
         e.setError("config reload: github repo update failed") catch {};
@@ -1299,6 +1309,17 @@ fn commandErrorCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c)
             std.log.err("[teammux] commandErrorCallback: setError failed: {s}", .{@errorName(err)});
         };
     }
+}
+
+/// I9: Normalize a relative worktree_root to an absolute path relative to project_root.
+/// If worktree_root is null or already absolute, this is a no-op.
+/// On success, the old worktree_root string is freed and replaced with the resolved path.
+fn normalizeWorktreeRoot(allocator: std.mem.Allocator, cfg: *config.Config, project_root: []const u8) !void {
+    const wr = cfg.worktree_root orelse return;
+    if (wr.len > 0 and wr[0] == '/') return; // already absolute
+    const resolved = try std.fs.path.resolve(allocator, &[_][]const u8{ project_root, wr });
+    allocator.free(wr);
+    cfg.worktree_root = resolved;
 }
 
 /// I13: Error callback for MessageBus — surfaces PR delivery failures via setError.
@@ -6703,6 +6724,63 @@ test "T16 integration 8: config.toml worktree_root override respected" {
     try std.testing.expect(tm_worktree_remove(engine_ptr, 9) == 0);
 }
 
+test "I9: normalizeWorktreeRoot resolves relative path to absolute" {
+    const alloc = std.testing.allocator;
+    var cfg = config.Config{
+        .project = .{ .name = "", .github_repo = null },
+        .team_lead = .{ .agent = .claude_code, .model = "", .permissions = "" },
+        .workers = &.{},
+        .github_token = null,
+        .bus_delivery = "",
+        .worktree_root = try alloc.dupe(u8, "relative/worktrees"),
+    };
+    defer cfg.deinit(alloc);
+
+    try normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
+
+    const wr = cfg.worktree_root.?;
+    // Must be absolute now
+    try std.testing.expect(wr.len > 0 and wr[0] == '/');
+    // Must contain the relative component
+    try std.testing.expect(std.mem.indexOf(u8, wr, "relative/worktrees") != null);
+    // Must be rooted under project path
+    try std.testing.expect(std.mem.startsWith(u8, wr, "/abs/project/"));
+}
+
+test "I9: normalizeWorktreeRoot leaves absolute path unchanged" {
+    const alloc = std.testing.allocator;
+    var cfg = config.Config{
+        .project = .{ .name = "", .github_repo = null },
+        .team_lead = .{ .agent = .claude_code, .model = "", .permissions = "" },
+        .workers = &.{},
+        .github_token = null,
+        .bus_delivery = "",
+        .worktree_root = try alloc.dupe(u8, "/already/absolute"),
+    };
+    defer cfg.deinit(alloc);
+
+    try normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
+
+    try std.testing.expectEqualStrings("/already/absolute", cfg.worktree_root.?);
+}
+
+test "I9: normalizeWorktreeRoot no-op on null" {
+    const alloc = std.testing.allocator;
+    var cfg = config.Config{
+        .project = .{ .name = "", .github_repo = null },
+        .team_lead = .{ .agent = .claude_code, .model = "", .permissions = "" },
+        .workers = &.{},
+        .github_token = null,
+        .bus_delivery = "",
+        .worktree_root = null,
+    };
+    defer cfg.deinit(alloc);
+
+    try normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
+
+    try std.testing.expect(cfg.worktree_root == null);
+}
+
 // ─── C4: Team Lead enforcement tests ─────────────────────
 
 test "C4 - tm_interceptor_install worker 0 creates deny-all wrapper" {
@@ -7595,23 +7673,31 @@ test "S15 integration 3: history rotation — small max_size triggers archive" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    // Use small max_size (64 bytes) so each entry triggers rotation
+    // Use small max_size (64 bytes) so rotation triggers on second append.
+    // I8: Rotation now happens BEFORE write — file must already exceed limit.
     var logger = try history_mod.HistoryLogger.initWithConfig(alloc, root, 64);
     defer logger.deinit();
 
-    // Append entries to trigger rotation
-    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "test-role", .content = "completed task alpha with enough content to exceed the sixty-four byte limit", .git_commit = null, .timestamp = 1000 });
-
-    // After first rotation: .jsonl.1 must exist
     const archive1 = try std.fmt.allocPrint(alloc, "{s}/completion_history.jsonl.1", .{logger.dir_path});
     defer alloc.free(archive1);
+
+    // First append — file was empty, no rotation yet
+    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "test-role", .content = "completed task alpha with enough content to exceed the sixty-four byte limit", .git_commit = null, .timestamp = 1000 });
+
+    // No archive after first append (rotation is before-write, file was empty)
+    const no_archive = std.fs.cwd().statFile(archive1);
+    try std.testing.expectError(error.FileNotFound, no_archive);
+
+    // Second append — file > 64 bytes, rotation fires before this write
+    try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "second entry also exceeding the sixty-four byte limit for rotation", .git_commit = null, .timestamp = 2000 });
+
+    // .jsonl.1 now exists (old content rotated out)
     const stat1 = try std.fs.cwd().statFile(archive1);
     try std.testing.expect(stat1.size > 0);
 
-    // Append more to trigger second rotation
-    try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "second entry also exceeding the sixty-four byte limit for rotation", .git_commit = null, .timestamp = 2000 });
+    // Third append triggers another rotation: .1 → .2
+    try logger.append(.{ .entry_type = .completion, .worker_id = 3, .role_id = "", .content = "third entry triggers the second rotation cycle", .git_commit = null, .timestamp = 3000 });
 
-    // .jsonl.2 must now exist (old .1 → .2)
     const archive2 = try std.fmt.allocPrint(alloc, "{s}/completion_history.jsonl.2", .{logger.dir_path});
     defer alloc.free(archive2);
     const stat2 = try std.fs.cwd().statFile(archive2);

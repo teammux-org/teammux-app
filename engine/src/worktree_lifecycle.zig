@@ -259,7 +259,10 @@ pub fn recoverOrphans(
         std.fs.openDirAbsolute(root, .{ .iterate = true })
     else
         std.fs.cwd().openDir(root, .{ .iterate = true })) catch |err| {
-        if (err == error.FileNotFound) return 0; // No worktree root — nothing to recover
+        if (err == error.FileNotFound) {
+            // Root missing but orphaned branches may still exist (I10).
+            return cleanupOrphanedBranchesGlobal(allocator, project_path, root, roster);
+        }
         std.log.err("[teammux] recovery: cannot open worktree root {s}: {}", .{ root, err });
         return 0;
     };
@@ -306,8 +309,16 @@ pub fn recoverOrphans(
         }
     }
 
+    // I10: Separate pass for orphaned branches without worktree directories.
+    // When removeWorker succeeds at deleting the directory but git branch -D
+    // fails, the stale branch accumulates. The directory scan above won't find
+    // it because the directory is already gone. Scan all teammux/* branches and
+    // delete any whose worker is not on the roster and has no worktree directory.
+    const branch_orphans = cleanupOrphanedBranchesGlobal(allocator, project_path, root, roster);
+    orphan_count += branch_orphans;
+
     if (orphan_count > 0) {
-        std.log.warn("[teammux] recovery: cleaned up {d} orphaned worktree(s)", .{orphan_count});
+        std.log.warn("[teammux] recovery: cleaned up {d} orphaned worktree(s)/branch(es)", .{orphan_count});
     }
 
     return orphan_count;
@@ -345,6 +356,81 @@ fn cleanupOrphanBranches(allocator: std.mem.Allocator, project_path: []const u8,
             "recovery branch delete",
         );
     }
+}
+
+/// I10: Scan all teammux/* branches and delete those whose corresponding
+/// worktree directory does not exist and whose worker ID is not on the roster.
+/// Returns the count of orphaned branches successfully deleted.
+fn cleanupOrphanedBranchesGlobal(
+    allocator: std.mem.Allocator,
+    project_path: []const u8,
+    worktree_root: []const u8,
+    roster: *worktree.Roster,
+) u32 {
+    const result = merge.runGitCapture(allocator, project_path, &.{ "branch", "--list", "teammux/*" }) catch |err| {
+        std.log.warn("[teammux] recovery: global branch list failed: {}", .{err});
+        return 0;
+    };
+    defer result.deinit(allocator);
+
+    if (result.exit_code != 0) {
+        std.log.warn("[teammux] recovery: global branch list exited with code {d}", .{result.exit_code});
+        return 0;
+    }
+
+    var cleaned: u32 = 0;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '*', '\r' });
+        if (line.len == 0) continue;
+
+        // Branch format: teammux/{worker_id}-{slug}
+        // Extract worker_id from "teammux/" prefix
+        const prefix = "teammux/";
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const after_prefix = line[prefix.len..];
+
+        // Find the dash separator to isolate the numeric worker ID
+        const dash_pos = std.mem.indexOfScalar(u8, after_prefix, '-') orelse after_prefix.len;
+        const id_str = after_prefix[0..dash_pos];
+        const worker_id = std.fmt.parseInt(u32, id_str, 10) catch continue;
+
+        // Skip if worker is on the active roster
+        if (roster.hasWorker(worker_id)) continue;
+
+        // Check if corresponding worktree directory exists
+        const wt_dir_path = std.fmt.allocPrint(allocator, "{s}/{d}", .{ worktree_root, worker_id }) catch |err| {
+            std.log.warn("[teammux] recovery: cannot build path for branch '{s}': {}", .{ line, err });
+            continue;
+        };
+        defer allocator.free(wt_dir_path);
+
+        const dir_exists = blk: {
+            if (wt_dir_path.len > 0 and wt_dir_path[0] == '/') {
+                var d = std.fs.openDirAbsolute(wt_dir_path, .{}) catch break :blk false;
+                d.close();
+                break :blk true;
+            } else {
+                var d = std.fs.cwd().openDir(wt_dir_path, .{}) catch break :blk false;
+                d.close();
+                break :blk true;
+            }
+        };
+
+        if (dir_exists) continue; // Directory exists — handled by directory scan above
+
+        // Orphaned branch: no directory, not on roster — delete it
+        std.log.warn("[teammux] recovery: orphaned branch '{s}' (worker {d}, no directory)", .{ line, worker_id });
+        const deleted = merge.runGitLoggedWithStderr(
+            allocator,
+            project_path,
+            &.{ "branch", "-D", line },
+            "recovery orphan branch delete",
+        );
+        if (deleted) cleaned += 1;
+    }
+
+    return cleaned;
 }
 
 /// Get worktree path for a worker. Returns null if not registered.
@@ -551,4 +637,111 @@ test "lifecycle - remove non-existent worker is safe" {
     defer reg.deinit();
     removeWorker(&reg, "/tmp", 999);
     try std.testing.expect(getPath(&reg, 999) == null);
+}
+
+test "lifecycle - I10 recoverOrphans cleans up orphaned branches without directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(project_root);
+    try initTestRepo(std.testing.allocator, project_root);
+
+    const wt_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/worktrees", .{project_root});
+    defer std.testing.allocator.free(wt_root);
+
+    // Create a worktree + branch for worker 7 via the normal path
+    var cfg = testConfig(wt_root);
+    var reg = WorktreeRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try create(&reg, &cfg, project_root, 7, "orphan branch test");
+
+    // Verify branch exists
+    const branch_name = getBranch(&reg, 7).?;
+    const branch_check = merge.runGitCapture(std.testing.allocator, project_root, &.{ "branch", "--list", branch_name }) catch unreachable;
+    defer branch_check.deinit(std.testing.allocator);
+    try std.testing.expect(branch_check.stdout.len > 0);
+
+    // Simulate the I10 bug: remove worktree directory but leave the branch.
+    // (This is what happens when git worktree remove succeeds but git branch -D fails.)
+    _ = merge.runGitLoggedWithStderr(
+        std.testing.allocator,
+        project_root,
+        &.{ "worktree", "remove", "--force", getPath(&reg, 7).? },
+        "test worktree remove",
+    );
+
+    // Remove from registry (simulating partial cleanup)
+    const kv = reg.entries.fetchRemove(7).?;
+    std.testing.allocator.free(kv.value.path);
+    std.testing.allocator.free(kv.value.branch);
+
+    // Verify: directory gone but branch still exists
+    const wt_dir_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/7", .{wt_root});
+    defer std.testing.allocator.free(wt_dir_path);
+    _ = std.fs.openDirAbsolute(wt_dir_path, .{}) catch |err| {
+        try std.testing.expect(err == error.FileNotFound); // directory gone
+    };
+
+    const branch_still = merge.runGitCapture(std.testing.allocator, project_root, &.{ "branch", "--list", "teammux/7-*" }) catch unreachable;
+    defer branch_still.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, branch_still.stdout, "teammux/7-") != null); // branch persists
+
+    // Run recoverOrphans — should clean up the orphaned branch (I10 fix)
+    var empty_roster = worktree.Roster.init(std.testing.allocator);
+    defer empty_roster.deinit();
+    const cleaned = recoverOrphans(std.testing.allocator, &cfg, project_root, &empty_roster);
+    try std.testing.expect(cleaned >= 1);
+
+    // Verify branch is now gone
+    const branch_after = merge.runGitCapture(std.testing.allocator, project_root, &.{ "branch", "--list", "teammux/7-*" }) catch unreachable;
+    defer branch_after.deinit(std.testing.allocator);
+    const trimmed = std.mem.trim(u8, branch_after.stdout, &[_]u8{ ' ', '\n', '\r' });
+    try std.testing.expect(trimmed.len == 0); // branch cleaned up
+}
+
+test "lifecycle - I10 recoverOrphans skips branches for roster-present workers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(project_root);
+    try initTestRepo(std.testing.allocator, project_root);
+
+    const wt_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/worktrees", .{project_root});
+    defer std.testing.allocator.free(wt_root);
+
+    // Create worktree + branch for worker 8
+    var cfg = testConfig(wt_root);
+    var reg = WorktreeRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try create(&reg, &cfg, project_root, 8, "active worker test");
+    const branch_name = try std.testing.allocator.dupe(u8, getBranch(&reg, 8).?);
+    defer std.testing.allocator.free(branch_name);
+
+    // Remove worktree directory but leave branch (simulate I10 bug)
+    _ = merge.runGitLoggedWithStderr(
+        std.testing.allocator,
+        project_root,
+        &.{ "worktree", "remove", "--force", getPath(&reg, 8).? },
+        "test worktree remove",
+    );
+
+    // Remove from registry
+    const kv = reg.entries.fetchRemove(8).?;
+    std.testing.allocator.free(kv.value.path);
+    std.testing.allocator.free(kv.value.branch);
+
+    // Create a roster with worker 8 present — recoverOrphans must NOT delete its branch
+    var roster_with_worker = worktree.Roster.init(std.testing.allocator);
+    defer roster_with_worker.deinit();
+    try roster_with_worker.spawn(8, "", .claude_code, "w8", "test", "/tmp/fake", "teammux/8-fake");
+
+    _ = recoverOrphans(std.testing.allocator, &cfg, project_root, &roster_with_worker);
+
+    // Branch must still exist — roster-present workers are protected
+    const branch_after = merge.runGitCapture(std.testing.allocator, project_root, &.{ "branch", "--list", branch_name }) catch unreachable;
+    defer branch_after.deinit(std.testing.allocator);
+    const trimmed = std.mem.trim(u8, branch_after.stdout, &[_]u8{ ' ', '\n', '\r' });
+    try std.testing.expect(trimmed.len > 0); // branch preserved
 }

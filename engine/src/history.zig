@@ -152,12 +152,14 @@ pub const HistoryLogger = struct {
     /// Append a history entry (I15).
     /// If the async writer is running (startWriter was called), enqueues non-blocking.
     /// Otherwise, writes synchronously via direct file append.
+    /// I8: Rotation runs BEFORE write so the newest entry always lands in the
+    /// active .jsonl file (not in the file that gets renamed to .1).
     pub fn append(self: *HistoryLogger, entry: HistoryEntry) !void {
         if (self.writer_thread != null) {
             try self.enqueue(entry);
         } else {
-            try self.writeToDisk(entry);
             self.maybeRotate();
+            try self.writeToDisk(entry);
         }
     }
 
@@ -326,6 +328,8 @@ pub const HistoryLogger = struct {
             self.queue_mutex.unlock();
 
             if (entry) |e| {
+                // I8: Rotate BEFORE write so newest entry lands in active file
+                self.maybeRotate();
                 // Write to disk (no lock held — file I/O is slow)
                 self.writeToDisk(.{
                     .entry_type = e.entry_type,
@@ -337,7 +341,6 @@ pub const HistoryLogger = struct {
                 }) catch |err| {
                     std.log.err("[teammux] history: async write failed: {}", .{err});
                 };
-                self.maybeRotate();
 
                 // Free owned strings
                 e.deinit(self.allocator);
@@ -857,19 +860,26 @@ test "history - rotation creates archive on size exceeded" {
     var logger = try HistoryLogger.initWithConfig(std.testing.allocator, root, 64);
     defer logger.deinit();
 
-    // First append — file size likely exceeds 64 bytes, triggers rotation
-    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "role", .content = "entry content exceeding the small size limit", .git_commit = null, .timestamp = 100 });
-
-    // After rotation: .jsonl was renamed to .1, new .jsonl doesn't exist yet (or is empty)
     const archive1_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/completion_history.jsonl.1", .{logger.dir_path});
     defer std.testing.allocator.free(archive1_path);
+
+    // First append — file was empty, so I8 rotate-before-write does NOT rotate.
+    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "role", .content = "entry content exceeding the small size limit", .git_commit = null, .timestamp = 100 });
+
+    // No archive yet — rotation only happens when file already exceeds limit
+    const no_archive = std.fs.cwd().statFile(archive1_path);
+    try std.testing.expectError(error.FileNotFound, no_archive);
+
+    // Second append — file now > 64 bytes, rotation fires BEFORE this write.
+    // Old content moves to .1, new entry lands in fresh .jsonl.
+    try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "second entry also exceeding limit", .git_commit = null, .timestamp = 200 });
+
     const stat1 = try std.fs.cwd().statFile(archive1_path);
     try std.testing.expect(stat1.size > 0);
 
-    // Second append creates new .jsonl
-    try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "second entry also exceeding limit", .git_commit = null, .timestamp = 200 });
+    // Third append triggers another rotation: .1 → .2
+    try logger.append(.{ .entry_type = .completion, .worker_id = 3, .role_id = "", .content = "third entry triggers second rotation", .git_commit = null, .timestamp = 300 });
 
-    // After second rotation: old .1 moved to .2, new content in .1
     const archive2_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/completion_history.jsonl.2", .{logger.dir_path});
     defer std.testing.allocator.free(archive2_path);
     const stat2 = try std.fs.cwd().statFile(archive2_path);
@@ -1272,5 +1282,78 @@ test "history - async drain preserves entry order" {
             try std.testing.expect(entry.worker_id == @as(u32, @intCast(i)));
             try std.testing.expect(entry.timestamp == 100 + @as(u64, @intCast(i)));
         }
+    }
+}
+
+test "history - I8 rotation before write keeps newest entry in active file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    // Use a tiny max_size (50 bytes) so rotation triggers on the second append.
+    var logger = try HistoryLogger.initWithConfig(std.testing.allocator, root, 50);
+    defer logger.deinit();
+
+    // First entry — fits within max_size
+    try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "", .content = "old entry", .git_commit = null, .timestamp = 100 });
+
+    // Verify first entry is in active file
+    var entries1 = try logger.load();
+    defer {
+        for (entries1.items) |e| e.deinit(std.testing.allocator);
+        entries1.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(entries1.items.len == 1);
+    try std.testing.expectEqualStrings("old entry", entries1.items[0].content);
+
+    // Second entry — triggers rotation BEFORE write (I8 fix).
+    // The old entry moves to .1, the new entry lands in fresh .jsonl.
+    try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "newest entry", .git_commit = null, .timestamp = 200 });
+
+    // Load only reads active .jsonl — newest entry MUST be there
+    var entries2 = try logger.load();
+    defer {
+        for (entries2.items) |e| e.deinit(std.testing.allocator);
+        entries2.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(entries2.items.len == 1);
+    try std.testing.expectEqualStrings("newest entry", entries2.items[0].content);
+    try std.testing.expect(entries2.items[0].worker_id == 2);
+    try std.testing.expect(entries2.items[0].timestamp == 200);
+}
+
+test "history - I8 async rotation before write keeps newest entry in active file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    {
+        // Use tiny max_size so rotation triggers on second append via async writer.
+        var logger = try HistoryLogger.initWithConfig(std.testing.allocator, root, 50);
+        try logger.startWriter();
+
+        // First entry — file empty, no rotation
+        try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "", .content = "old async entry", .git_commit = null, .timestamp = 100 });
+        // Second entry — file > 50 bytes, async writer rotates before write
+        try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "newest async entry", .git_commit = null, .timestamp = 200 });
+
+        // shutdown drains queue to disk
+        logger.deinit();
+    }
+
+    // Re-open and load — newest entry must be in active file
+    {
+        var logger = try HistoryLogger.initWithConfig(std.testing.allocator, root, 50);
+        defer logger.deinit();
+        var entries = try logger.load();
+        defer {
+            for (entries.items) |e| e.deinit(std.testing.allocator);
+            entries.deinit(std.testing.allocator);
+        }
+        try std.testing.expect(entries.items.len == 1);
+        try std.testing.expectEqualStrings("newest async entry", entries.items[0].content);
+        try std.testing.expect(entries.items[0].worker_id == 2);
     }
 }

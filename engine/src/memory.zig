@@ -35,7 +35,14 @@ pub fn append(
     const ts_str = try formatTimestamp(allocator, timestamp);
     defer allocator.free(ts_str);
 
-    const entry = try std.fmt.allocPrint(allocator, "## {s}\n{s}\n\n", .{ ts_str, summary });
+    // I7: Escape markdown heading markers in summary body. The Swift parser
+    // uses "## " at line starts as candidate entry delimiters (with timestamp
+    // validation as defense-in-depth). Prepend U+200B (zero-width space)
+    // before "## " at each line start to prevent false delimiter matches.
+    const escaped = try escapeSummaryHeadings(allocator, summary);
+    defer allocator.free(escaped);
+
+    const entry = try std.fmt.allocPrint(allocator, "## {s}\n{s}\n\n", .{ ts_str, escaped });
     defer allocator.free(entry);
 
     // Open or create the file (no truncate). worktree_path is always absolute.
@@ -85,6 +92,50 @@ fn formatTimestamp(allocator: std.mem.Allocator, timestamp: u64) ![]u8 {
         day.getMinutesIntoHour(),
         day.getSecondsIntoMinute(),
     });
+}
+
+/// I7: Escape markdown heading markers ("## ") at line starts in memory
+/// summary bodies. Prepends U+200B (zero-width space, 3 bytes UTF-8)
+/// before "## " at each line start so the Swift parser does not treat
+/// body headings as entry delimiters. Returns a new allocation (caller
+/// must free). If no escaping is needed, returns a dupe of the original.
+fn escapeSummaryHeadings(allocator: std.mem.Allocator, summary: []const u8) ![]u8 {
+    if (summary.len == 0) return allocator.dupe(u8, summary);
+
+    const zws = "\xe2\x80\x8b"; // U+200B zero-width space
+
+    // Count lines starting with "## " to determine allocation size.
+    var count: usize = 0;
+    if (std.mem.startsWith(u8, summary, "## ")) count += 1;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, summary, pos, "\n## ")) |idx| {
+        count += 1;
+        pos = idx + 4;
+    }
+
+    if (count == 0) return allocator.dupe(u8, summary);
+
+    var buf = try allocator.alloc(u8, summary.len + count * zws.len);
+    var out: usize = 0;
+
+    // Insert ZWS before first line if it starts with "## "
+    if (std.mem.startsWith(u8, summary, "## ")) {
+        @memcpy(buf[out..][0..zws.len], zws);
+        out += zws.len;
+    }
+
+    for (summary, 0..) |c, i| {
+        buf[out] = c;
+        out += 1;
+        // After a newline, check if next line starts with "## "
+        if (c == '\n' and i + 3 < summary.len and std.mem.startsWith(u8, summary[i + 1 ..], "## ")) {
+            @memcpy(buf[out..][0..zws.len], zws);
+            out += zws.len;
+        }
+    }
+
+    std.debug.assert(out == buf.len);
+    return buf;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -204,6 +255,80 @@ test "memory - append persists across re-reads" {
         try std.testing.expect(std.mem.indexOf(u8, content.?, "Session 1 task") != null);
         try std.testing.expect(std.mem.indexOf(u8, content.?, "Session 2 task") != null);
     }
+}
+
+test "memory - I7 escapeSummaryHeadings no-op on safe text" {
+    const result = try escapeSummaryHeadings(std.testing.allocator, "safe summary\nno headings");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("safe summary\nno headings", result);
+}
+
+test "memory - I7 escapeSummaryHeadings escapes ## at first line" {
+    const result = try escapeSummaryHeadings(std.testing.allocator, "## Heading\nbody text");
+    defer std.testing.allocator.free(result);
+    // First 3 bytes should be ZWS
+    try std.testing.expect(result.len == "## Heading\nbody text".len + 3);
+    try std.testing.expect(result[0] == 0xE2 and result[1] == 0x80 and result[2] == 0x8B);
+    try std.testing.expect(std.mem.indexOf(u8, result, "## Heading") != null);
+}
+
+test "memory - I7 escapeSummaryHeadings escapes ## after newline" {
+    const result = try escapeSummaryHeadings(std.testing.allocator, "line 1\n## Heading\nline 3");
+    defer std.testing.allocator.free(result);
+    // One ZWS inserted (3 bytes)
+    try std.testing.expect(result.len == "line 1\n## Heading\nline 3".len + 3);
+    // The "\n## " should now be "\n<ZWS>## "
+    try std.testing.expect(std.mem.indexOf(u8, result, "\n\xe2\x80\x8b## Heading") != null);
+}
+
+test "memory - I7 escapeSummaryHeadings escapes multiple headings" {
+    const input = "## First\nbody\n## Second\nmore";
+    const result = try escapeSummaryHeadings(std.testing.allocator, input);
+    defer std.testing.allocator.free(result);
+    // Two ZWS insertions (6 bytes)
+    try std.testing.expect(result.len == input.len + 6);
+}
+
+test "memory - I7 escapeSummaryHeadings empty input returns empty" {
+    const result = try escapeSummaryHeadings(std.testing.allocator, "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(result.len == 0);
+}
+
+test "memory - I7 append escapes ## in summary (end-to-end)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    // Summary containing a markdown heading that would corrupt the parser
+    try append(std.testing.allocator, root, "Task done\n## Architecture\nRefactored modules", 1711000000);
+
+    const content = try read(std.testing.allocator, root);
+    defer if (content) |c| std.testing.allocator.free(c);
+
+    try std.testing.expect(content != null);
+    const text = content.?;
+
+    // Should have exactly 1 entry delimiter "## " (the timestamp line).
+    // The "## Architecture" in body should be escaped with ZWS.
+    var real_delimiters: usize = 0;
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search_pos, "\n## ")) |idx| {
+        // Check this is NOT preceded by ZWS (which would mean it's an escaped body heading)
+        if (idx >= 3 and text[idx - 3] == 0xE2 and text[idx - 2] == 0x80 and text[idx - 1] == 0x8B) {
+            // Escaped — not a real delimiter
+        } else {
+            real_delimiters += 1;
+        }
+        search_pos = idx + 4;
+    }
+    // Only 1 real delimiter: the entry timestamp "## 2024-03-21T..."
+    try std.testing.expect(real_delimiters == 1);
+
+    // Body content preserved (with ZWS)
+    try std.testing.expect(std.mem.indexOf(u8, text, "Architecture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Refactored modules") != null);
 }
 
 test "memory - empty summary produces valid entry" {
