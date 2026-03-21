@@ -480,6 +480,7 @@ final class EngineClient: ObservableObject {
         workerWorktrees.removeValue(forKey: workerId)
         workerBranches.removeValue(forKey: workerId)
         workerMemory.removeValue(forKey: workerId)
+        restartGeneration.removeValue(forKey: workerId)
         refreshRoster()
         return true
     }

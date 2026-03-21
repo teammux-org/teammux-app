@@ -131,11 +131,13 @@ struct WorkerDetailDrawer: View {
 
             if worker.healthStatus == .stalled || worker.healthStatus == .errored {
                 Button(action: {
-                    // C4: Full PTY respawn — tear down old surface, reset engine
-                    // state, then bump generation to trigger SwiftUI view recreation.
+                    // C4: Full PTY respawn — reset engine state first, then
+                    // tear down old surface and bump generation to trigger
+                    // SwiftUI view recreation. Operations gated on engine
+                    // success to avoid ghost worker state.
                     // Role watcher is left running (worktree path unchanged).
+                    guard engine.restartWorker(id: worker.id) else { return }
                     engine.unregisterSurface(for: worker.id)
-                    _ = engine.restartWorker(id: worker.id)
                     engine.bumpRestartGeneration(for: worker.id)
                 }) {
                     Label("Restart Worker", systemImage: "arrow.clockwise")
