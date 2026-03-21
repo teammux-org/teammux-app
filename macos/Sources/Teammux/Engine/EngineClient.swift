@@ -130,6 +130,11 @@ final class EngineClient: ObservableObject {
     /// SwiftUI to destroy and recreate the WorkerTerminalSurface (C4).
     @Published var restartGeneration: [UInt32: UInt64] = [:]
 
+    /// I5: Per-worker cleanup warnings (e.g. TM_ERR_CLEANUP_INCOMPLETE).
+    /// Stored here instead of @State on GitWorkerRow/PRCardView so warnings
+    /// persist across view recreation when merge state changes.
+    @Published var cleanupWarnings: [UInt32: String] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).

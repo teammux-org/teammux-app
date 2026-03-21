@@ -242,7 +242,6 @@ struct GitWorkerRow: View {
     @State private var lastCreatedPR: GitHubPR?
     @State private var isMergeActionInFlight = false
     @State private var mergeError: String?
-    @State private var cleanupWarning: String?
     @State private var showConflictSheet = false
 
     private var mergeStatus: MergeStatus? {
@@ -322,11 +321,20 @@ struct GitWorkerRow: View {
                     .lineLimit(2)
             }
 
-            if let warning = cleanupWarning {
-                Label(warning, systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 10))
-                    .foregroundColor(.orange)
-                    .lineLimit(2)
+            if let warning = engine.cleanupWarnings[worker.id] {
+                HStack {
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .lineLimit(2)
+                    Spacer()
+                    Button(action: { engine.cleanupWarnings.removeValue(forKey: worker.id) }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
         .onChange(of: mergeStatus) { _, newStatus in
@@ -413,13 +421,13 @@ struct GitWorkerRow: View {
     private func approveMerge() {
         isMergeActionInFlight = true
         mergeError = nil
-        cleanupWarning = nil
+        engine.cleanupWarnings.removeValue(forKey: worker.id)
         Task { @MainActor in
             let success = engine.approveMerge(workerId: worker.id, strategy: .merge)
             if !success {
                 mergeError = engine.lastError ?? "Failed to approve merge"
             } else if let warning = engine.lastError {
-                cleanupWarning = warning
+                engine.cleanupWarnings[worker.id] = warning
             }
             isMergeActionInFlight = false
         }
@@ -428,13 +436,13 @@ struct GitWorkerRow: View {
     private func rejectMerge() {
         isMergeActionInFlight = true
         mergeError = nil
-        cleanupWarning = nil
+        engine.cleanupWarnings.removeValue(forKey: worker.id)
         Task { @MainActor in
             let success = engine.rejectMerge(workerId: worker.id)
             if !success {
                 mergeError = engine.lastError ?? "Failed to reject merge"
             } else if let warning = engine.lastError {
-                cleanupWarning = warning
+                engine.cleanupWarnings[worker.id] = warning
             }
             isMergeActionInFlight = false
         }
@@ -472,7 +480,6 @@ struct PRCardView: View {
 
     @State private var isMergeActionInFlight = false
     @State private var actionError: String?
-    @State private var cleanupWarning: String?
 
     /// Worker name from the roster, or a fallback label.
     private var workerName: String {
@@ -553,11 +560,20 @@ struct PRCardView: View {
                     .lineLimit(2)
             }
 
-            if let warning = cleanupWarning {
-                Label(warning, systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 10))
-                    .foregroundColor(.orange)
-                    .lineLimit(2)
+            if let warning = engine.cleanupWarnings[prEvent.workerId] {
+                HStack {
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .lineLimit(2)
+                    Spacer()
+                    Button(action: { engine.cleanupWarnings.removeValue(forKey: prEvent.workerId) }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
     }
@@ -579,7 +595,7 @@ struct PRCardView: View {
     private func approveMerge() {
         isMergeActionInFlight = true
         actionError = nil
-        cleanupWarning = nil
+        engine.cleanupWarnings.removeValue(forKey: prEvent.workerId)
         Task { @MainActor in
             let success = engine.approveMerge(workerId: prEvent.workerId, strategy: .merge)
             if !success {
@@ -588,7 +604,7 @@ struct PRCardView: View {
                 actionError = msg
             } else if let warning = engine.lastError {
                 Self.logger.warning("approveMerge partial success for worker \(prEvent.workerId): \(warning)")
-                cleanupWarning = warning
+                engine.cleanupWarnings[prEvent.workerId] = warning
             }
             isMergeActionInFlight = false
         }
@@ -597,7 +613,7 @@ struct PRCardView: View {
     private func rejectMerge() {
         isMergeActionInFlight = true
         actionError = nil
-        cleanupWarning = nil
+        engine.cleanupWarnings.removeValue(forKey: prEvent.workerId)
         Task { @MainActor in
             let success = engine.rejectMerge(workerId: prEvent.workerId)
             if !success {
@@ -606,7 +622,7 @@ struct PRCardView: View {
                 actionError = msg
             } else if let warning = engine.lastError {
                 Self.logger.warning("rejectMerge partial success for worker \(prEvent.workerId): \(warning)")
-                cleanupWarning = warning
+                engine.cleanupWarnings[prEvent.workerId] = warning
             }
             isMergeActionInFlight = false
         }
