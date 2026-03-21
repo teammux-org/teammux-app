@@ -410,8 +410,9 @@ void tm_merge_conflicts_free(tm_conflict_t** conflicts, uint32_t count);
 // OURS/THEIRS apply git checkout and enable finalization for this file.
 // SKIP records the choice without git ops — blocks tm_conflict_finalize.
 // TM_RESOLUTION_PENDING is not a valid input (read-only on output path).
-// Returns TM_OK on success. Returns TM_ERR_INVALID_WORKER if no active merge
-// for this worker or file not in conflict list.
+// Returns TM_OK on success. Returns TM_ERR_GIT_FAILURE if git checkout failed.
+// Returns TM_ERR_INVALID_WORKER if no active merge for this worker or file
+// not in conflict list.
 tm_result_t tm_conflict_resolve(tm_engine_t* engine,
                                  uint32_t worker_id,
                                  const char* file_path,
@@ -420,8 +421,9 @@ tm_result_t tm_conflict_resolve(tm_engine_t* engine,
 // Finalize a conflicted merge after all files are resolved (ours or theirs).
 // Files with pending or skip resolution block finalization.
 // Returns TM_OK on clean success, TM_ERR_CLEANUP_INCOMPLETE if merge succeeded
-// but worktree/branch removal failed. Returns TM_ERR_INVALID_WORKER if
-// preconditions not met (no active merge, unresolved files).
+// but worktree/branch removal failed. Returns TM_ERR_GIT_FAILURE if git commit
+// failed. Returns TM_ERR_INVALID_WORKER if preconditions not met (no active
+// merge, unresolved files).
 tm_result_t tm_conflict_finalize(tm_engine_t* engine,
                                   uint32_t worker_id);
 

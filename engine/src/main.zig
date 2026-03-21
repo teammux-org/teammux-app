@@ -1007,7 +1007,7 @@ export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_i
     const e = engine orelse return 99;
     const mt = std.meta.intToEnum(bus.MessageType, msg_type) catch {
         e.setError("tm_message_send: invalid message type") catch {};
-        return 12; // TM_ERR_INVALID_ARG
+        return 12; // TM_ERR_INVALID_WORKER (no dedicated invalid-arg code)
     };
     var b = &(e.message_bus orelse return 8);
     b.send(target_worker_id, 0, mt, std.mem.span(payload orelse return 8)) catch |err| {
@@ -1030,7 +1030,7 @@ export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0
     const e = engine orelse return 99;
     const mt = std.meta.intToEnum(bus.MessageType, msg_type) catch {
         e.setError("tm_message_broadcast: invalid message type") catch {};
-        return 12; // TM_ERR_INVALID_ARG
+        return 12; // TM_ERR_INVALID_WORKER (no dedicated invalid-arg code)
     };
     var b = &(e.message_bus orelse return 8);
     b.broadcast(0, mt, std.mem.span(payload orelse return 8), &e.roster) catch { e.setError("message broadcast failed") catch {}; return 8; };
@@ -1111,7 +1111,7 @@ export fn tm_github_merge_pr(engine: ?*Engine, pr_number: u64, strategy: c_int) 
     const e = engine orelse return 99;
     const strat = std.meta.intToEnum(github.MergeStrategy, strategy) catch {
         e.setError("tm_github_merge_pr: invalid merge strategy") catch {};
-        return 12; // TM_ERR_INVALID_ARG
+        return 12; // TM_ERR_INVALID_WORKER (no dedicated invalid-arg code)
     };
     e.github_client.mergePr(e.allocator, pr_number, strat) catch {
         e.setError("PR merge failed: gh CLI error") catch {};
@@ -2209,9 +2209,14 @@ export fn tm_conflict_resolve(engine: ?*Engine, worker_id: u32, file_path: ?[*:0
             error.FileNotInConflicts => "conflict resolve failed: file not in conflict list",
             error.InvalidResolution => "conflict resolve failed: invalid resolution",
             error.GitFailed => "conflict resolve failed: git operation failed",
-            else => "conflict resolve failed",
+            error.OutOfMemory => "conflict resolve failed: out of memory",
+            else => "conflict resolve failed: unexpected internal error",
         }) catch {};
-        return if (err == error.GitFailed) 19 else 12; // TM_ERR_GIT_FAILURE / TM_ERR_INVALID_WORKER
+        return switch (err) {
+            error.GitFailed => 19, // TM_ERR_GIT_FAILURE
+            error.NoActiveMerge, error.NoConflicts, error.FileNotInConflicts, error.InvalidResolution => 12, // TM_ERR_INVALID_WORKER
+            else => 99, // TM_ERR_UNKNOWN
+        };
     };
     return 0;
 }
@@ -2237,9 +2242,14 @@ export fn tm_conflict_finalize(engine: ?*Engine, worker_id: u32) c_int {
             error.NoConflicts => "conflict finalize failed: no conflicts for this worker",
             error.UnresolvedConflicts => "conflict finalize failed: unresolved files remain",
             error.GitFailed => "conflict finalize failed: git commit failed",
-            else => "conflict finalize failed",
+            error.OutOfMemory => "conflict finalize failed: out of memory",
+            else => "conflict finalize failed: unexpected internal error",
         }) catch {};
-        return if (err == error.GitFailed) 19 else 12; // TM_ERR_GIT_FAILURE / TM_ERR_INVALID_WORKER
+        return switch (err) {
+            error.GitFailed => 19, // TM_ERR_GIT_FAILURE
+            error.NoActiveMerge, error.NoConflicts, error.UnresolvedConflicts => 12, // TM_ERR_INVALID_WORKER
+            else => 99, // TM_ERR_UNKNOWN
+        };
     };
     e.ownership_registry.release(worker_id);
     if (result == .cleanup_incomplete) {
@@ -2961,7 +2971,10 @@ export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
 }
 export fn tm_free_string(str: ?[*:0]const u8) void { if (str) |s| { std.heap.c_allocator.free(std.mem.span(s)); } }
 export fn tm_version() [*:0]const u8 {
-    return @ptrCast(build_options.version.ptr);
+    // Comptime sentinel coercion — asserts null terminator exists at compile time.
+    // Safe because build_options embeds string literals which are always null-terminated.
+    const v: [:0]const u8 = build_options.version[0..build_options.version.len :0];
+    return v.ptr;
 }
 // NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_result_to_string(result: c_int) [*:0]const u8 {
@@ -3242,6 +3255,7 @@ test "result_to_string maps all codes" {
     try std.testing.expectEqualStrings("TM_ERR_CONFIG", std.mem.span(tm_result_to_string(7)));
     try std.testing.expectEqualStrings("TM_ERR_NOT_IMPLEMENTED", std.mem.span(tm_result_to_string(10)));
     try std.testing.expectEqualStrings("TM_ERR_ROLE", std.mem.span(tm_result_to_string(13)));
+    try std.testing.expectEqualStrings("TM_ERR_GIT_FAILURE", std.mem.span(tm_result_to_string(19)));
     try std.testing.expectEqualStrings("TM_ERR_UNKNOWN", std.mem.span(tm_result_to_string(99)));
 }
 

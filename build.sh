@@ -4,8 +4,10 @@ set -euo pipefail
 command -v zig >/dev/null 2>&1 || { echo "ERROR: 'zig' not found. Install from https://ziglang.org/download/"; exit 1; }
 command -v lipo >/dev/null 2>&1 || { echo "ERROR: 'lipo' not found. Run: xcode-select --install"; exit 1; }
 
+TEAMMUX_VERSION="0.1.6"  # Must match tagged release version
+
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Teammux build"
+echo "  Teammux build (v${TEAMMUX_VERSION})"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 STAGING=$(mktemp -d)
@@ -14,9 +16,9 @@ trap 'rm -rf "$STAGING"' EXIT
 echo ""
 echo "[1/3] Building Zig engine (libteammux)..."
 cd engine
-zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast -Dversion=0.1.6
+zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast -Dversion="$TEAMMUX_VERSION"
 cp zig-out/lib/libteammux.a "$STAGING/libteammux-arm64.a"
-zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast -Dversion=0.1.6
+zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast -Dversion="$TEAMMUX_VERSION"
 cp zig-out/lib/libteammux.a "$STAGING/libteammux-x86_64.a"
 cd ..
 mkdir -p macos/Resources
