@@ -629,7 +629,6 @@ final class EngineClient: ObservableObject {
         let count = tm_recover_orphans(engine)
         if count > 0 {
             Self.logger.info("recoverOrphans: cleaned up \(count) orphaned worktree(s)")
-            lastError = "Recovered \(count) orphaned worktree(s) from previous crash"
         }
     }
 

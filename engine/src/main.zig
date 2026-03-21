@@ -534,8 +534,11 @@ pub const Engine = struct {
     /// Called at session start (before the monitor thread is spawned — no lock needed)
     /// and on config reload (under health_cfg_mutex).
     fn snapshotHealthCfg(self: *Engine, cfg: *const config.Config) void {
+        // Reset to default first — if the key was removed or is unparseable,
+        // the monitor reverts to the default instead of keeping a stale value.
+        self.health_cfg_stall_threshold = 300;
         const val = config.get(cfg, "stall_threshold_secs") orelse return;
-        self.health_cfg_stall_threshold = std.fmt.parseInt(i64, val, 10) catch return;
+        self.health_cfg_stall_threshold = std.fmt.parseInt(i64, val, 10) catch 300;
     }
 
     fn healthMonitorLoop(self: *Engine) void {
