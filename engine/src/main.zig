@@ -338,6 +338,9 @@ pub const Engine = struct {
         };
         errdefer cmd_watcher.deinit();
 
+        // I13: Clear stale .teammux-error files from previous sessions
+        cmd_watcher.clearStaleErrors();
+
         // Wire bus routing for /teammux-complete and /teammux-question
         cmd_watcher.bus_send_fn = busSendBridge;
         cmd_watcher.bus_send_userdata = self;
@@ -434,22 +437,9 @@ pub const Engine = struct {
             self.setError("busSendBridge: payload is NULL") catch {};
             return 8;
         });
-        b.send(to, from, msg_enum, payload_span) catch |err| {
-            self.setError(if (err == error.DeliveryFailed) "bus message delivery failed after retries exhausted" else "bus message send failed") catch {};
-            return 8;
-        };
 
-        // Update sender's last activity timestamp for health monitoring
-        {
-            self.roster.mutex.lock();
-            defer self.roster.mutex.unlock();
-            if (self.roster.workers.getPtr(from)) |w| {
-                w.last_activity_ts = std.time.timestamp();
-            }
-        }
-
-        // History write for command-file path (workers writing /teammux-complete files).
-        // The C API path (tm_worker_complete/tm_worker_question) has its own history write.
+        // I15: Write history BEFORE bus delivery so transient bus failures
+        // do not suppress audit/restore records permanently.
         if (msg_enum == .completion or msg_enum == .question) {
             if (self.history_logger) |*logger| {
                 const content_key: []const u8 = if (msg_enum == .completion) "summary" else "question";
@@ -478,8 +468,28 @@ pub const Engine = struct {
                     .timestamp = @intCast(std.time.timestamp()),
                 }) catch |err| {
                     std.log.err("[teammux] history append failed in busSendBridge: {}", .{err});
-                    self.setError("history persistence failed — event delivered to bus but not written to JSONL log") catch {};
+                    self.setError("history persistence failed — event not written to JSONL log") catch {};
                 };
+            }
+        }
+
+        b.send(to, from, msg_enum, payload_span) catch |err| {
+            // S1: For PR messages, DeliveryFailed already set a specific error via
+            // error_notify_cb (e.g. "pr_ready delivery failed for worker 3 after retries").
+            // For non-PR messages, error_notify_cb does not fire — set generic error.
+            const is_pr = msg_enum == .pr_ready or msg_enum == .pr_status;
+            if (!(err == error.DeliveryFailed and is_pr)) {
+                self.setError("bus message delivery failed") catch {};
+            }
+            return 8;
+        };
+
+        // Update sender's last activity timestamp for health monitoring
+        {
+            self.roster.mutex.lock();
+            defer self.roster.mutex.unlock();
+            if (self.roster.workers.getPtr(from)) |w| {
+                w.last_activity_ts = std.time.timestamp();
             }
         }
 
@@ -1305,14 +1315,15 @@ fn busErrorNotifyCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.
 }
 
 // Command routing wrapper — add new /teammux-* command handlers as additional branches below.
-fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) void {
+// I11: Returns bool — false signals failure to CommandWatcher, which writes .teammux-error.
+fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c) bool {
     const engine: *Engine = @ptrCast(@alignCast(userdata orelse {
         std.log.warn("[teammux] commandRoutingCallback: null userdata (engine pointer missing)", .{});
-        return;
+        return false;
     }));
     const cmd = std.mem.span(command_ptr orelse {
         std.log.warn("[teammux] commandRoutingCallback: null command pointer", .{});
-        return;
+        return false;
     });
 
     if (std.mem.eql(u8, cmd, "/teammux-assign")) {
@@ -1320,163 +1331,170 @@ fn commandRoutingCallback(command_ptr: ?[*:0]const u8, args_ptr: ?[*:0]const u8,
         // spoofable in untrusted JSON. Task assignment must use tm_dispatch_task
         // through the authenticated Swift UI path.
         std.log.warn("[teammux] /teammux-assign: command-file dispatch disabled — use tm_dispatch_task from the Teammux UI", .{});
-        return;
+        return false;
     }
     if (std.mem.eql(u8, cmd, "/teammux-ask")) {
-        handlePeerQuestionCommand(engine, args_ptr);
-        return;
+        return handlePeerQuestionCommand(engine, args_ptr);
     }
     if (std.mem.eql(u8, cmd, "/teammux-delegate")) {
-        handleDelegationCommand(engine, args_ptr);
-        return;
+        return handleDelegationCommand(engine, args_ptr);
     }
     if (std.mem.eql(u8, cmd, "/teammux-pr-ready")) {
-        handlePrReadyCommand(engine, args_ptr);
-        return;
+        return handlePrReadyCommand(engine, args_ptr);
     }
 
-    // Forward unhandled commands to Swift callback
-    if (engine.cmd_cb) |cb| cb(command_ptr, args_ptr, engine.cmd_cb_userdata);
+    // Forward unhandled commands to Swift callback — void-returning,
+    // so engine cannot verify success. Return true when callback exists.
+    if (engine.cmd_cb) |cb| {
+        cb(command_ptr, args_ptr, engine.cmd_cb_userdata);
+        return true;
+    }
+    std.log.warn("[teammux] commandRoutingCallback: no handler for command, no Swift callback registered", .{});
+    return false;
 }
 
-fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
+fn handlePeerQuestionCommand(engine: *Engine, args_ptr: ?[*:0]const u8) bool {
     const args = std.mem.span(args_ptr orelse {
         std.log.warn("[teammux] /teammux-ask: args is NULL (expected JSON body)", .{});
-        return;
+        return false;
     });
 
     const from_id_str = extractJsonStringValue(args, "worker_id") orelse
         extractJsonNumber(args, "worker_id");
     if (from_id_str == null) {
         std.log.warn("[teammux] /teammux-ask: missing worker_id", .{});
-        return;
+        return false;
     }
     const from_id = std.fmt.parseInt(u32, from_id_str.?, 10) catch {
         std.log.warn("[teammux] /teammux-ask: invalid worker_id", .{});
-        return;
+        return false;
     };
 
     const target_id_str = extractJsonStringValue(args, "target_worker_id") orelse
         extractJsonNumber(args, "target_worker_id");
     if (target_id_str == null) {
         std.log.warn("[teammux] /teammux-ask: missing target_worker_id", .{});
-        return;
+        return false;
     }
     const target_id = std.fmt.parseInt(u32, target_id_str.?, 10) catch {
         std.log.warn("[teammux] /teammux-ask: invalid target_worker_id", .{});
-        return;
+        return false;
     };
 
     if (from_id == 0) {
         std.log.warn("[teammux] /teammux-ask: Team Lead (worker 0) cannot send peer questions — use tm_dispatch_response", .{});
-        return;
+        return false;
     }
 
     if (from_id == target_id) {
         std.log.warn("[teammux] /teammux-ask: cannot ask yourself (worker {d})", .{from_id});
-        return;
+        return false;
     }
 
     if (!engine.roster.hasWorker(from_id)) {
         std.log.warn("[teammux] /teammux-ask: sender worker {d} not found in roster", .{from_id});
-        return;
+        return false;
     }
 
     if (!engine.roster.hasWorker(target_id)) {
         std.log.warn("[teammux] /teammux-ask: target worker {d} not found in roster", .{target_id});
-        return;
+        return false;
     }
 
     // Validate message field exists (value not needed — we forward raw args as payload)
     _ = extractJsonStringValue(args, "message") orelse {
         std.log.warn("[teammux] /teammux-ask: missing message", .{});
-        return;
+        return false;
     };
 
     var b = &(engine.message_bus orelse {
         std.log.warn("[teammux] /teammux-ask: message bus not available", .{});
-        return;
+        return false;
     });
     // Route to Team Lead (worker 0) — Team Lead relays to target
     b.send(0, from_id, .peer_question, args) catch |err| {
         std.log.warn("[teammux] /teammux-ask: bus send failed: {s}", .{@errorName(err)});
         // Notify sender that delivery failed
         b.send(from_id, 0, .err, "\"[Teammux] peer message delivery failed\"") catch {};
+        return false;
     };
+    return true;
 }
 
-fn handleDelegationCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
+fn handleDelegationCommand(engine: *Engine, args_ptr: ?[*:0]const u8) bool {
     const args = std.mem.span(args_ptr orelse {
         std.log.warn("[teammux] /teammux-delegate: args is NULL (expected JSON body)", .{});
-        return;
+        return false;
     });
 
     const from_id_str = extractJsonStringValue(args, "worker_id") orelse
         extractJsonNumber(args, "worker_id");
     if (from_id_str == null) {
         std.log.warn("[teammux] /teammux-delegate: missing worker_id", .{});
-        return;
+        return false;
     }
     const from_id = std.fmt.parseInt(u32, from_id_str.?, 10) catch {
         std.log.warn("[teammux] /teammux-delegate: invalid worker_id", .{});
-        return;
+        return false;
     };
 
     const target_id_str = extractJsonStringValue(args, "target_worker_id") orelse
         extractJsonNumber(args, "target_worker_id");
     if (target_id_str == null) {
         std.log.warn("[teammux] /teammux-delegate: missing target_worker_id", .{});
-        return;
+        return false;
     }
     const target_id = std.fmt.parseInt(u32, target_id_str.?, 10) catch {
         std.log.warn("[teammux] /teammux-delegate: invalid target_worker_id", .{});
-        return;
+        return false;
     };
 
     if (from_id == 0) {
         std.log.warn("[teammux] /teammux-delegate: Team Lead (worker 0) cannot delegate — use tm_dispatch_task", .{});
-        return;
+        return false;
     }
 
     if (from_id == target_id) {
         std.log.warn("[teammux] /teammux-delegate: cannot delegate to yourself (worker {d})", .{from_id});
-        return;
+        return false;
     }
 
     if (!engine.roster.hasWorker(from_id)) {
         std.log.warn("[teammux] /teammux-delegate: sender worker {d} not found in roster", .{from_id});
-        return;
+        return false;
     }
 
     if (!engine.roster.hasWorker(target_id)) {
         std.log.warn("[teammux] /teammux-delegate: target worker {d} not found in roster", .{target_id});
-        return;
+        return false;
     }
 
     // Validate task field exists (value not needed — we forward raw args as payload)
     _ = extractJsonStringValue(args, "task") orelse {
         std.log.warn("[teammux] /teammux-delegate: missing task", .{});
-        return;
+        return false;
     };
 
     var b = &(engine.message_bus orelse {
         std.log.warn("[teammux] /teammux-delegate: message bus not available", .{});
-        return;
+        return false;
     });
     // Route directly to target worker PTY
     b.send(target_id, from_id, .delegation, args) catch |err| {
         std.log.warn("[teammux] /teammux-delegate: bus send failed: {s}", .{@errorName(err)});
         // Notify sender that delivery failed
         b.send(from_id, 0, .err, "\"[Teammux] peer message delivery failed\"") catch {};
+        return false;
     };
+    return true;
 }
 
 /// Handle /teammux-pr-ready command. Parses worker_id, title, and summary from JSON args,
 /// then delegates to tm_github_create_pr (which routes TM_MSG_PR_READY on success, TM_MSG_ERROR on failure).
-fn handlePrReadyCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
+fn handlePrReadyCommand(engine: *Engine, args_ptr: ?[*:0]const u8) bool {
     const args = std.mem.span(args_ptr orelse {
         std.log.warn("[teammux] /teammux-pr-ready: args is NULL (expected JSON body)", .{});
-        return;
+        return false;
     });
 
     // Parse worker_id
@@ -1484,36 +1502,38 @@ fn handlePrReadyCommand(engine: *Engine, args_ptr: ?[*:0]const u8) void {
         extractJsonNumber(args, "worker_id");
     if (id_str == null) {
         std.log.warn("[teammux] /teammux-pr-ready: missing worker_id", .{});
-        return;
+        return false;
     }
     const worker_id = std.fmt.parseInt(u32, id_str.?, 10) catch {
         std.log.warn("[teammux] /teammux-pr-ready: invalid worker_id", .{});
-        return;
+        return false;
     };
 
     const title_val = extractJsonStringValue(args, "title") orelse {
         std.log.warn("[teammux] /teammux-pr-ready: missing title", .{});
-        return;
+        return false;
     };
     const summary = extractJsonStringValue(args, "summary") orelse "";
 
     // Create PR via tm_github_create_pr (which also routes TM_MSG_PR_READY)
     const title_z = engine.allocator.dupeZ(u8, title_val) catch {
         std.log.warn("[teammux] /teammux-pr-ready: alloc failed", .{});
-        return;
+        return false;
     };
     defer engine.allocator.free(title_z);
     const summary_z = engine.allocator.dupeZ(u8, summary) catch {
         std.log.warn("[teammux] /teammux-pr-ready: alloc failed", .{});
-        return;
+        return false;
     };
     defer engine.allocator.free(summary_z);
 
     const result = tm_github_create_pr(engine, worker_id, title_z.ptr, summary_z.ptr);
     if (result) |pr| {
         tm_pr_free(pr);
+        return true;
     } else {
         std.log.warn("[teammux] /teammux-pr-ready: PR creation failed for worker {d}", .{worker_id});
+        return false;
     }
 }
 
@@ -5125,7 +5145,7 @@ test "command routing wrapper blocks /teammux-assign via command file (C4)" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-assign");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     // No dispatch should have been recorded — command-file assign is disabled
     const history = e.coordinator.getHistory();
@@ -5170,7 +5190,7 @@ test "command routing wrapper forwards unknown commands to Swift callback" {
     const args_z = try alloc.dupeZ(u8, "{}");
     defer alloc.free(args_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(State.forwarded);
     try std.testing.expectEqualStrings("/teammux-status", State.forwarded_cmd[0..State.forwarded_len]);
@@ -5237,7 +5257,7 @@ test "/teammux-ask routes to Team Lead PTY (worker 0), not target" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(BusState.called);
     try std.testing.expect(BusState.to_id == 0); // Team Lead
@@ -5306,7 +5326,7 @@ test "/teammux-delegate routes directly to target worker PTY" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(BusState.called);
     try std.testing.expect(BusState.to_id == 7); // target worker directly
@@ -5354,7 +5374,7 @@ test "/teammux-ask invalid target_worker_id does not send" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     // Bus should NOT have been called — target not in roster
     try std.testing.expect(!BusState.called);
@@ -5398,7 +5418,7 @@ test "/teammux-ask self-targeting does not send" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(!BusState.called);
 }
@@ -5418,7 +5438,7 @@ test "/teammux-ask null args does not crash" {
     defer alloc.free(cmd_z);
 
     // Pass null args — should log warning and return, not crash
-    commandRoutingCallback(cmd_z.ptr, null, e);
+    _ = commandRoutingCallback(cmd_z.ptr, null, e);
 }
 
 test "/teammux-delegate invalid target_worker_id does not send" {
@@ -5458,7 +5478,7 @@ test "/teammux-delegate invalid target_worker_id does not send" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(!BusState.called);
 }
@@ -5500,7 +5520,7 @@ test "/teammux-delegate self-targeting does not send" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(!BusState.called);
 }
@@ -5519,7 +5539,7 @@ test "/teammux-delegate null args does not crash" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-delegate");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, null, e);
+    _ = commandRoutingCallback(cmd_z.ptr, null, e);
 }
 
 test "tm_peer_question and tm_peer_delegate C API return correct codes" {
@@ -5612,7 +5632,7 @@ test "/teammux-ask from_id not in roster does not send" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(!BusState.called);
 }
@@ -5655,7 +5675,7 @@ test "/teammux-ask from Team Lead (worker 0) rejected" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     try std.testing.expect(!BusState.called);
 }
@@ -5714,7 +5734,7 @@ test "/teammux-ask bus send failure injects error to sender PTY" {
     const cmd_z = try alloc.dupeZ(u8, "/teammux-ask");
     defer alloc.free(cmd_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     // Error notification should have been sent to the sender (worker 2)
     try std.testing.expect(BusState.error_to == 2);
@@ -5973,7 +5993,7 @@ test "command routing wrapper routes /teammux-pr-ready" {
     const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": 1, \"title\": \"test PR\", \"summary\": \"summary\"}") catch return;
     defer std.testing.allocator.free(args_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 
     // Should NOT have been forwarded to Swift callback
     try std.testing.expect(!PrState.command_forwarded);
@@ -6000,7 +6020,7 @@ test "command routing wrapper still forwards unknown commands" {
     const args_z = std.testing.allocator.dupeZ(u8, "{}") catch return;
     defer std.testing.allocator.free(args_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
     try std.testing.expect(FwdState.forwarded);
 }
 
@@ -6125,7 +6145,7 @@ test "/teammux-pr-ready with null args does not crash" {
     defer std.testing.allocator.free(cmd_z);
 
     // Null args — should return cleanly without crashing
-    commandRoutingCallback(cmd_z.ptr, null, e);
+    _ = commandRoutingCallback(cmd_z.ptr, null, e);
 }
 
 test "/teammux-pr-ready missing worker_id does not crash" {
@@ -6137,7 +6157,7 @@ test "/teammux-pr-ready missing worker_id does not crash" {
     const args_z = std.testing.allocator.dupeZ(u8, "{\"title\": \"test\"}") catch return;
     defer std.testing.allocator.free(args_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 }
 
 test "/teammux-pr-ready non-numeric worker_id does not crash" {
@@ -6149,7 +6169,7 @@ test "/teammux-pr-ready non-numeric worker_id does not crash" {
     const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": \"abc\", \"title\": \"test\"}") catch return;
     defer std.testing.allocator.free(args_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 }
 
 test "/teammux-pr-ready missing title does not crash" {
@@ -6161,7 +6181,7 @@ test "/teammux-pr-ready missing title does not crash" {
     const args_z = std.testing.allocator.dupeZ(u8, "{\"worker_id\": 1}") catch return;
     defer std.testing.allocator.free(args_z);
 
-    commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+    _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
 }
 
 // ─── T16 integration tests: 8 cross-component scenarios ──────────
@@ -7649,7 +7669,7 @@ test "S15 integration 4: bus reliability — /teammux-assign blocked, unknown fo
         defer alloc.free(cmd_z);
         const args_z = try alloc.dupeZ(u8, "{\"task\":\"test\",\"worker_id\":1}");
         defer alloc.free(args_z);
-        commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+        _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
     }
     try std.testing.expect(!CmdState.forwarded);
 
@@ -7661,7 +7681,7 @@ test "S15 integration 4: bus reliability — /teammux-assign blocked, unknown fo
         defer alloc.free(cmd_z);
         const args_z = try alloc.dupeZ(u8, "{}");
         defer alloc.free(args_z);
-        commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
+        _ = commandRoutingCallback(cmd_z.ptr, args_z.ptr, e);
     }
     try std.testing.expect(CmdState.forwarded);
     try std.testing.expectEqualStrings("/teammux-bogus", CmdState.cmd_buf[0..CmdState.cmd_len]);
