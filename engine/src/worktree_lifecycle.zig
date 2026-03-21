@@ -259,7 +259,10 @@ pub fn recoverOrphans(
         std.fs.openDirAbsolute(root, .{ .iterate = true })
     else
         std.fs.cwd().openDir(root, .{ .iterate = true })) catch |err| {
-        if (err == error.FileNotFound) return 0; // No worktree root — nothing to recover
+        if (err == error.FileNotFound) {
+            // Root missing but orphaned branches may still exist (I10).
+            return cleanupOrphanedBranchesGlobal(allocator, project_path, root, roster);
+        }
         std.log.err("[teammux] recovery: cannot open worktree root {s}: {}", .{ root, err });
         return 0;
     };
