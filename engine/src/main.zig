@@ -58,19 +58,27 @@ const PtyMonitor = struct {
         try self.pids.put(pid, worker_id);
     }
 
-    /// Unregister monitoring for a worker (by worker ID).
+    /// Unregister all monitored PIDs for a worker (by worker ID).
+    /// Removes every entry matching worker_id, not just the first,
+    /// so stale duplicates cannot re-fire after restart.
     fn unwatch(self: *PtyMonitor, worker_id: worktree.WorkerId) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var remove_pid: ?std.posix.pid_t = null;
+        // Collect all PIDs for this worker, then remove.
+        // Fixed-size buffer: a worker realistically has 1 PID;
+        // 8 slots handle any pathological duplicate registration.
+        var remove_pids: [8]std.posix.pid_t = undefined;
+        var remove_count: usize = 0;
         var it = self.pids.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* == worker_id) {
-                remove_pid = entry.key_ptr.*;
-                break;
+                if (remove_count < remove_pids.len) {
+                    remove_pids[remove_count] = entry.key_ptr.*;
+                    remove_count += 1;
+                }
             }
         }
-        if (remove_pid) |pid| {
+        for (remove_pids[0..remove_count]) |pid| {
             _ = self.pids.remove(pid);
         }
     }
@@ -7251,6 +7259,29 @@ test "S4 - tm_worker_restart resets status + health_status and unwatches PID (I1
     }
 
     // Stale PID should be unwatched
+    try std.testing.expect(engine.pty_monitor.countWatched() == 0);
+}
+
+test "S4 - PtyMonitor.unwatch removes all PIDs for a worker" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s4-unwatch-multi");
+    defer engine.destroy();
+
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+    try engine.roster.workers.put(2, try coordinator_mod.makeTestWorker(alloc, 2));
+
+    // Register multiple PIDs for worker 1 (simulates duplicate registration)
+    try engine.pty_monitor.watch(100, 1);
+    try engine.pty_monitor.watch(200, 1);
+    try engine.pty_monitor.watch(300, 2); // different worker
+    try std.testing.expect(engine.pty_monitor.countWatched() == 3);
+
+    // Unwatch worker 1 should remove both PIDs 100 and 200
+    engine.pty_monitor.unwatch(1);
+    try std.testing.expect(engine.pty_monitor.countWatched() == 1);
+
+    // Worker 2's PID should still be watched
+    engine.pty_monitor.unwatch(2);
     try std.testing.expect(engine.pty_monitor.countWatched() == 0);
 }
 

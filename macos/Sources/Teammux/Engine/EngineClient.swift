@@ -310,6 +310,7 @@ final class EngineClient: ObservableObject {
         workerPRs.removeAll()
         autonomousDispatches.removeAll()
         workerMemory.removeAll()
+        restartGeneration.removeAll()
         lastError = nil
     }
 
