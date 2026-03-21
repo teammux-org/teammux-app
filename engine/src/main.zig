@@ -862,7 +862,7 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
     if (e.role_watchers.fetchRemove(worker_id)) |kv| {
         kv.value.destroy();
     }
-    // Remove interceptor wrapper before worktree is deleted
+    // Remove interceptor wrapper while worker is still in roster
     if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
         std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
         break :blk null;
@@ -872,7 +872,19 @@ export fn tm_worker_dismiss(engine: ?*Engine, worker_id: u32) c_int {
             std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
         };
     }
-    e.roster.dismiss(worker_id) catch { e.setError("worker dismiss failed") catch {}; return 5; };
+    // I14 fix (dismiss strands merge state): if worker has an active merge,
+    // abort it to clean up MergeCoordinator state and run git merge --abort.
+    // Must run after interceptor cleanup (needs worker in roster for
+    // copyWorkerFields). reject() also dismisses from roster.
+    if (e.merge_coordinator.active_merge) |active| {
+        if (active == worker_id) {
+            _ = e.merge_coordinator.reject(&e.roster, e.project_root, worker_id) catch |err| {
+                std.log.warn("[teammux] dismiss: merge reject for worker {d} failed: {} — proceeding with dismiss", .{ worker_id, err });
+            };
+        }
+    }
+    // Dismiss from roster — may already be done by reject() above
+    e.roster.dismiss(worker_id) catch {};
     e.ownership_registry.release(worker_id);
     // Remove lifecycle worktree AFTER roster dismiss
     worktree_lifecycle.removeWorker(&e.wt_registry, e.project_root, worker_id);
@@ -2272,20 +2284,8 @@ export fn tm_conflict_resolve(engine: ?*Engine, worker_id: u32, file_path: ?[*:0
 }
 export fn tm_conflict_finalize(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
-    // Stop and remove role watcher before finalize cleanup
-    if (e.role_watchers.fetchRemove(worker_id)) |kv| {
-        kv.value.destroy();
-    }
-    // Remove interceptor wrapper before worktree is deleted
-    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
-        std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
-        break :blk null;
-    }) |wf| {
-        defer wf.deinit(e.allocator);
-        interceptor.remove(e.allocator, wf.worktree_path) catch |err| {
-            std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
-        };
-    }
+    // C6 fix: finalize the merge FIRST — if git commit fails, leave
+    // interceptor and role watcher in place so enforcement stays active.
     const result = e.merge_coordinator.finalizeMerge(&e.roster, e.project_root, worker_id) catch |err| {
         e.setError(switch (err) {
             error.NoActiveMerge => "conflict finalize failed: no active merge for this worker",
@@ -2301,6 +2301,19 @@ export fn tm_conflict_finalize(engine: ?*Engine, worker_id: u32) c_int {
             else => 99, // TM_ERR_UNKNOWN
         };
     };
+    // Git commit succeeded — now safe to tear down enforcement
+    if (e.role_watchers.fetchRemove(worker_id)) |kv| {
+        kv.value.destroy();
+    }
+    if (e.roster.copyWorkerFields(worker_id, e.allocator) catch |err| blk: {
+        std.log.warn("[teammux] interceptor cleanup skipped for worker {d}: {}", .{ worker_id, err });
+        break :blk null;
+    }) |wf| {
+        defer wf.deinit(e.allocator);
+        interceptor.remove(e.allocator, wf.worktree_path) catch |err| {
+            std.log.warn("[teammux] interceptor remove failed for worker {d}: {}", .{ worker_id, err });
+        };
+    }
     e.ownership_registry.release(worker_id);
     if (result == .cleanup_incomplete) {
         e.setError("merge finalized but cleanup incomplete — manual worktree/branch removal may be needed") catch {};

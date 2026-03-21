@@ -408,17 +408,32 @@ pub const MergeCoordinator = struct {
             freeConflicts(self.allocator, old.value);
         }
 
-        // Look up worker for worktree/branch cleanup
-        const worker = roster.getWorker(worker_id) orelse {
+        // Thread-safe: copy fields under lock, safe to use after roster mutations.
+        // Errors here are post-commit cleanup failures — the merge already committed,
+        // so return cleanup_incomplete instead of propagating a hard error.
+        const wf = roster.copyWorkerFields(worker_id, self.allocator) catch |err| {
+            std.log.warn("[teammux] finalizeMerge: copyWorkerFields failed for worker {d}: {} — skipping cleanup", .{ worker_id, err });
+            return .cleanup_incomplete;
+        } orelse {
             std.log.warn("[teammux] finalizeMerge: worker {d} not in roster — skipping worktree/branch cleanup", .{worker_id});
             return .cleanup_incomplete;
         };
-        const branch_name = try self.allocator.dupe(u8, worker.branch_name);
+        defer wf.deinit(self.allocator);
+        const branch_name = self.allocator.dupe(u8, wf.branch_name) catch |err| {
+            std.log.warn("[teammux] finalizeMerge: branch_name dupe failed for worker {d}: {} — skipping cleanup", .{ worker_id, err });
+            return .cleanup_incomplete;
+        };
         defer self.allocator.free(branch_name);
-        const wt_path = try self.allocator.dupe(u8, worker.worktree_path);
+        const wt_path = self.allocator.dupe(u8, wf.worktree_path) catch |err| {
+            std.log.warn("[teammux] finalizeMerge: wt_path dupe failed for worker {d}: {} — skipping cleanup", .{ worker_id, err });
+            return .cleanup_incomplete;
+        };
         defer self.allocator.free(wt_path);
 
-        worker.status = .complete;
+        // Update worker status under lock — worker may be concurrently read by tm_roster_get
+        if (!roster.setWorkerStatus(worker_id, .complete)) {
+            std.log.warn("[teammux] finalizeMerge: worker {d} vanished from roster after successful merge — status not updated to complete", .{worker_id});
+        }
 
         // Remove worktree and branch
         const wt_removed = runGitLoggedWithStderr(self.allocator, project_root, &.{ "worktree", "remove", "--force", wt_path }, "finalize cleanup: worktree remove");
