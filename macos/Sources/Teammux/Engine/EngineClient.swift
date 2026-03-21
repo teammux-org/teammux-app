@@ -126,6 +126,10 @@ final class EngineClient: ObservableObject {
     /// Updated on completion signal and on session restore.
     @Published var workerMemory: [UInt32: String] = [:]
 
+    /// Monotonic generation counter per worker. Bumped on restart to force
+    /// SwiftUI to destroy and recreate the WorkerTerminalSurface (C4).
+    @Published var restartGeneration: [UInt32: UInt64] = [:]
+
     // MARK: - Private state
 
     /// Opaque handle to the C engine (`tm_engine_t*`).
@@ -500,6 +504,12 @@ final class EngineClient: ObservableObject {
         }
         refreshRoster()
         return true
+    }
+
+    /// Bump the restart generation for a worker, causing SwiftUI to destroy
+    /// the old WorkerTerminalSurface and create a fresh one (C4 PTY respawn).
+    func bumpRestartGeneration(for workerId: UInt32) {
+        restartGeneration[workerId, default: 0] += 1
     }
 
     // MARK: - Session Restore

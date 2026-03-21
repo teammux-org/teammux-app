@@ -74,8 +74,12 @@ private struct WorkerTerminalSurface: NSViewRepresentable {
         }
 
         // Send the task description as initial input so the agent
-        // starts working on it immediately.
-        if !worker.taskDescription.isEmpty {
+        // starts working on it immediately — but only on first spawn.
+        // On restart (generation > 0), the worker resumes in the same
+        // worktree with existing context; re-injecting would cause
+        // duplicate work (C4).
+        let isRestart = (engine.restartGeneration[worker.id] ?? 0) > 0
+        if !worker.taskDescription.isEmpty && !isRestart {
             config.initialInput = worker.taskDescription + "\n"
         }
 
