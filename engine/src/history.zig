@@ -1322,3 +1322,38 @@ test "history - I8 rotation before write keeps newest entry in active file" {
     try std.testing.expect(entries2.items[0].worker_id == 2);
     try std.testing.expect(entries2.items[0].timestamp == 200);
 }
+
+test "history - I8 async rotation before write keeps newest entry in active file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    {
+        // Use tiny max_size so rotation triggers on second append via async writer.
+        var logger = try HistoryLogger.initWithConfig(std.testing.allocator, root, 50);
+        try logger.startWriter();
+
+        // First entry — file empty, no rotation
+        try logger.append(.{ .entry_type = .completion, .worker_id = 1, .role_id = "", .content = "old async entry", .git_commit = null, .timestamp = 100 });
+        // Second entry — file > 50 bytes, async writer rotates before write
+        try logger.append(.{ .entry_type = .completion, .worker_id = 2, .role_id = "", .content = "newest async entry", .git_commit = null, .timestamp = 200 });
+
+        // shutdown drains queue to disk
+        logger.deinit();
+    }
+
+    // Re-open and load — newest entry must be in active file
+    {
+        var logger = try HistoryLogger.initWithConfig(std.testing.allocator, root, 50);
+        defer logger.deinit();
+        var entries = try logger.load();
+        defer {
+            for (entries.items) |e| e.deinit(std.testing.allocator);
+            entries.deinit(std.testing.allocator);
+        }
+        try std.testing.expect(entries.items.len == 1);
+        try std.testing.expectEqualStrings("newest async entry", entries.items[0].content);
+        try std.testing.expect(entries.items[0].worker_id == 2);
+    }
+}

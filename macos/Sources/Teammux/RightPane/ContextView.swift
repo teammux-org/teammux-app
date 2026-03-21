@@ -454,7 +454,7 @@ struct ContextView: View {
     /// I7: Only treat `## ` lines as entry delimiters if the text after `## `
     /// matches ISO 8601 timestamp format (YYYY-MM-DDTHH:MM:SSZ). Lines with
     /// `## ` that are not timestamps are treated as body text. This handles
-    /// both ZWS-escaped headings (Commit 3) and pre-existing unescaped files.
+    /// both ZWS-escaped headings (I7 engine-side fix) and pre-existing unescaped files.
     private func parseMemoryEntries(_ content: String?) -> [MemoryEntry] {
         guard let content, !content.isEmpty else { return [] }
 
@@ -504,11 +504,13 @@ struct ContextView: View {
     /// I7: Check if a string looks like an ISO 8601 timestamp (YYYY-MM-DDTHH:MM:SSZ).
     /// Used to distinguish real entry delimiters from markdown headings in summaries.
     private static func looksLikeTimestamp(_ s: String) -> Bool {
-        // Exact format: 2026-03-20T14:30:00Z (20 chars)
+        // Heuristic: YYYY-MM-DDTHH:MM:SSZ — 20 chars, dashes at 4/7, T at 10, Z at 19
         guard s.count == 20 else { return false }
+        let idx4 = s.index(s.startIndex, offsetBy: 4)
+        let idx7 = s.index(s.startIndex, offsetBy: 7)
         let idx10 = s.index(s.startIndex, offsetBy: 10)
         let idx19 = s.index(s.startIndex, offsetBy: 19)
-        return s[idx10] == "T" && s[idx19] == "Z"
+        return s[idx4] == "-" && s[idx7] == "-" && s[idx10] == "T" && s[idx19] == "Z"
     }
 
     // MARK: - Role TOML path resolution

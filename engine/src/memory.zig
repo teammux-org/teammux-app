@@ -35,10 +35,10 @@ pub fn append(
     const ts_str = try formatTimestamp(allocator, timestamp);
     defer allocator.free(ts_str);
 
-    // I7: Escape markdown heading markers in summary body to prevent the
-    // Swift parser (which splits on "## " at line starts) from creating
-    // fake entries. Prepend U+200B (zero-width space) before "## " at
-    // each line start.
+    // I7: Escape markdown heading markers in summary body. The Swift parser
+    // uses "## " at line starts as candidate entry delimiters (with timestamp
+    // validation as defense-in-depth). Prepend U+200B (zero-width space)
+    // before "## " at each line start to prevent false delimiter matches.
     const escaped = try escapeSummaryHeadings(allocator, summary);
     defer allocator.free(escaped);
 
@@ -96,9 +96,9 @@ fn formatTimestamp(allocator: std.mem.Allocator, timestamp: u64) ![]u8 {
 
 /// I7: Escape markdown heading markers ("## ") at line starts in memory
 /// summary bodies. Prepends U+200B (zero-width space, 3 bytes UTF-8)
-/// before "## " at each line start so the Swift parser does not split
-/// the summary into fake entries. Returns a new allocation (caller must
-/// free). If no escaping is needed, returns a dupe of the original.
+/// before "## " at each line start so the Swift parser does not treat
+/// body headings as entry delimiters. Returns a new allocation (caller
+/// must free). If no escaping is needed, returns a dupe of the original.
 fn escapeSummaryHeadings(allocator: std.mem.Allocator, summary: []const u8) ![]u8 {
     if (summary.len == 0) return allocator.dupe(u8, summary);
 
@@ -134,7 +134,8 @@ fn escapeSummaryHeadings(allocator: std.mem.Allocator, summary: []const u8) ![]u
         }
     }
 
-    return buf[0..out];
+    std.debug.assert(out == buf.len);
+    return buf;
 }
 
 // ─────────────────────────────────────────────────────────

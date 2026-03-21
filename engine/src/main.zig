@@ -313,7 +313,7 @@ pub const Engine = struct {
         };
         errdefer cfg.deinit(self.allocator);
 
-        // I9: normalize worktree_root to absolute path
+        // I9: normalize worktree_root
         try normalizeWorktreeRoot(self.allocator, &cfg, self.project_root);
 
         // C5: Orphan recovery deferred to tm_recover_orphans()
@@ -781,8 +781,12 @@ export fn tm_config_reload(engine: ?*Engine) c_int {
     defer e.allocator.free(p2);
     // Load into local first — on failure, old config remains intact
     var new_cfg = config.loadWithOverrides(e.allocator, p1, p2) catch { e.setError("config reload failed") catch {}; return 7; };
-    // I9: Normalize relative worktree_root to absolute path at config load time.
-    normalizeWorktreeRoot(e.allocator, &new_cfg, e.project_root);
+    // I9: normalize worktree_root
+    normalizeWorktreeRoot(e.allocator, &new_cfg, e.project_root) catch {
+        e.setError("config reload: worktree_root normalization failed") catch {};
+        new_cfg.deinit(e.allocator);
+        return 7;
+    };
     // Update GitHubClient repo before swapping config — on failure, discard new config
     e.github_client.updateRepo(new_cfg.project.github_repo) catch {
         e.setError("config reload: github repo update failed") catch {};
@@ -1309,14 +1313,11 @@ fn commandErrorCallback(msg: ?[*:0]const u8, userdata: ?*anyopaque) callconv(.c)
 
 /// I9: Normalize a relative worktree_root to an absolute path relative to project_root.
 /// If worktree_root is null or already absolute, this is a no-op.
-/// On allocation failure, the original value is left unchanged (logged, not fatal).
-fn normalizeWorktreeRoot(allocator: std.mem.Allocator, cfg: *config.Config, project_root: []const u8) void {
+/// On success, the old worktree_root string is freed and replaced with the resolved path.
+fn normalizeWorktreeRoot(allocator: std.mem.Allocator, cfg: *config.Config, project_root: []const u8) !void {
     const wr = cfg.worktree_root orelse return;
     if (wr.len > 0 and wr[0] == '/') return; // already absolute
-    const resolved = std.fs.path.resolve(allocator, &[_][]const u8{ project_root, wr }) catch |err| {
-        std.log.warn("[teammux] config: failed to normalize worktree_root: {}", .{err});
-        return;
-    };
+    const resolved = try std.fs.path.resolve(allocator, &[_][]const u8{ project_root, wr });
     allocator.free(wr);
     cfg.worktree_root = resolved;
 }
@@ -6735,7 +6736,7 @@ test "I9: normalizeWorktreeRoot resolves relative path to absolute" {
     };
     defer cfg.deinit(alloc);
 
-    normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
+    try normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
 
     const wr = cfg.worktree_root.?;
     // Must be absolute now
@@ -6758,7 +6759,7 @@ test "I9: normalizeWorktreeRoot leaves absolute path unchanged" {
     };
     defer cfg.deinit(alloc);
 
-    normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
+    try normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
 
     try std.testing.expectEqualStrings("/already/absolute", cfg.worktree_root.?);
 }
@@ -6775,7 +6776,7 @@ test "I9: normalizeWorktreeRoot no-op on null" {
     };
     defer cfg.deinit(alloc);
 
-    normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
+    try normalizeWorktreeRoot(alloc, &cfg, "/abs/project");
 
     try std.testing.expect(cfg.worktree_root == null);
 }

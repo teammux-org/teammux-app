@@ -370,7 +370,10 @@ fn cleanupOrphanedBranchesGlobal(
     };
     defer result.deinit(allocator);
 
-    if (result.exit_code != 0) return 0;
+    if (result.exit_code != 0) {
+        std.log.warn("[teammux] recovery: global branch list exited with code {d}", .{result.exit_code});
+        return 0;
+    }
 
     var cleaned: u32 = 0;
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
@@ -393,7 +396,10 @@ fn cleanupOrphanedBranchesGlobal(
         if (roster.hasWorker(worker_id)) continue;
 
         // Check if corresponding worktree directory exists
-        const wt_dir_path = std.fmt.allocPrint(allocator, "{s}/{d}", .{ worktree_root, worker_id }) catch continue;
+        const wt_dir_path = std.fmt.allocPrint(allocator, "{s}/{d}", .{ worktree_root, worker_id }) catch |err| {
+            std.log.warn("[teammux] recovery: cannot build path for branch '{s}': {}", .{ line, err });
+            continue;
+        };
         defer allocator.free(wt_dir_path);
 
         const dir_exists = blk: {
@@ -689,4 +695,50 @@ test "lifecycle - I10 recoverOrphans cleans up orphaned branches without directo
     defer branch_after.deinit(std.testing.allocator);
     const trimmed = std.mem.trim(u8, branch_after.stdout, &[_]u8{ ' ', '\n', '\r' });
     try std.testing.expect(trimmed.len == 0); // branch cleaned up
+}
+
+test "lifecycle - I10 recoverOrphans skips branches for roster-present workers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(project_root);
+    try initTestRepo(std.testing.allocator, project_root);
+
+    const wt_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/worktrees", .{project_root});
+    defer std.testing.allocator.free(wt_root);
+
+    // Create worktree + branch for worker 8
+    var cfg = testConfig(wt_root);
+    var reg = WorktreeRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try create(&reg, &cfg, project_root, 8, "active worker test");
+    const branch_name = try std.testing.allocator.dupe(u8, getBranch(&reg, 8).?);
+    defer std.testing.allocator.free(branch_name);
+
+    // Remove worktree directory but leave branch (simulate I10 bug)
+    _ = merge.runGitLoggedWithStderr(
+        std.testing.allocator,
+        project_root,
+        &.{ "worktree", "remove", "--force", getPath(&reg, 8).? },
+        "test worktree remove",
+    );
+
+    // Remove from registry
+    const kv = reg.entries.fetchRemove(8).?;
+    std.testing.allocator.free(kv.value.path);
+    std.testing.allocator.free(kv.value.branch);
+
+    // Create a roster with worker 8 present — recoverOrphans must NOT delete its branch
+    var roster_with_worker = worktree.Roster.init(std.testing.allocator);
+    defer roster_with_worker.deinit();
+    try roster_with_worker.spawn(8, "", .claude_code, "w8", "test", "/tmp/fake", "teammux/8-fake");
+
+    _ = recoverOrphans(std.testing.allocator, &cfg, project_root, &roster_with_worker);
+
+    // Branch must still exist — roster-present workers are protected
+    const branch_after = merge.runGitCapture(std.testing.allocator, project_root, &.{ "branch", "--list", branch_name }) catch unreachable;
+    defer branch_after.deinit(std.testing.allocator);
+    const trimmed = std.mem.trim(u8, branch_after.stdout, &[_]u8{ ' ', '\n', '\r' });
+    try std.testing.expect(trimmed.len > 0); // branch preserved
 }
