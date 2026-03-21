@@ -474,7 +474,12 @@ pub const Engine = struct {
         }
 
         b.send(to, from, msg_enum, payload_span) catch |err| {
-            self.setError(if (err == error.DeliveryFailed) "bus message delivery failed after retries exhausted" else "bus message send failed") catch {};
+            // S1: DeliveryFailed already set a specific error via error_notify_cb
+            // (e.g. "pr_ready delivery failed for worker 3 after retries").
+            // Only set a generic error for other failure types.
+            if (err != error.DeliveryFailed) {
+                self.setError("bus message send failed") catch {};
+            }
             return 8;
         };
 
