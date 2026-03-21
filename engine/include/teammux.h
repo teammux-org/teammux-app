@@ -38,6 +38,7 @@ typedef enum {
     TM_ERR_OWNERSHIP        = 14,
     TM_ERR_CLEANUP_INCOMPLETE = 15,
     TM_ERR_DELIVERY_FAILED    = 16,  /* Forward declaration — engine implementation in S4 (bus reliability) */
+    TM_ERR_GIT_FAILURE        = 19,  /* Git operation failed inside conflict resolution (I3) */
     TM_ERR_UNKNOWN          = 99,
 } tm_result_t;
 
@@ -249,6 +250,22 @@ tm_health_status_t tm_worker_health_status(tm_engine_t* engine, tm_worker_id_t w
 // Get last activity timestamp (unix epoch seconds) for a worker.
 // Returns 0 if worker not found.
 int64_t tm_worker_last_activity(tm_engine_t* engine, tm_worker_id_t worker_id);
+
+// Notify the engine that a worker's PTY process has died. Called by Swift
+// when Ghostty's SurfaceView observes process exit. This is the primary
+// notification path. Marks the worker as errored, releases ownership rules,
+// and fires TM_MSG_PTY_DIED on the message bus (best-effort).
+// Does NOT remove the worktree — preserves the worker's in-progress work.
+// Returns TM_OK on success, TM_ERR_INVALID_WORKER if worker not found.
+// Idempotent — safe to call multiple times for the same worker.
+tm_result_t tm_worker_pty_died(tm_engine_t* engine, tm_worker_id_t worker_id, int32_t exit_code);
+
+// Register a PID for background death monitoring. The engine's PtyMonitor
+// polls registered PIDs via kill(pid, 0) and fires the same handler as
+// tm_worker_pty_died on detection. This is a safety-net backup — the primary
+// path is tm_worker_pty_died called directly by Swift.
+// Returns TM_OK on success, TM_ERR_INVALID_WORKER if worker not found.
+tm_result_t tm_worker_monitor_pid(tm_engine_t* engine, tm_worker_id_t worker_id, int32_t pid);
 
 // -----------------------------------------------------------------
 // Worktree lifecycle
