@@ -195,6 +195,11 @@ pub const Engine = struct {
     pty_monitor: PtyMonitor,
     health_monitor_thread: ?std.Thread,
     health_monitor_running: std.atomic.Value(bool),
+    // C1: Snapshot of config values used by the health monitor thread.
+    // Updated under health_cfg_mutex on config reload. The monitor reads
+    // these instead of e.cfg to avoid a use-after-free race.
+    health_cfg_stall_threshold: i64,
+    health_cfg_mutex: std.Thread.Mutex,
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
         const engine = try allocator.create(Engine);
@@ -234,6 +239,8 @@ pub const Engine = struct {
             .pty_monitor = undefined, // initialized below (needs engine pointer)
             .health_monitor_thread = null,
             .health_monitor_running = std.atomic.Value(bool).init(false),
+            .health_cfg_stall_threshold = 300,
+            .health_cfg_mutex = .{},
         };
         engine.pty_monitor = PtyMonitor.init(allocator, engine);
         return engine;
@@ -353,6 +360,9 @@ pub const Engine = struct {
         self.message_bus = msg_bus;
         self.commands_watcher = cmd_watcher;
         self.history_logger = hist_logger;
+
+        // C1: Snapshot config values for the health monitor before it starts.
+        self.snapshotHealthCfg(&cfg);
 
         // Start async history writer (I15) — must be after commit to self so
         // the writer thread's self pointer targets the stable Engine-embedded logger.
@@ -513,19 +523,24 @@ pub const Engine = struct {
         self.setError(msg) catch {};
     }
 
+    /// C1: Extract stall_threshold_secs from a config into the health monitor snapshot.
+    /// Called at session start and on config reload (under health_cfg_mutex).
+    fn snapshotHealthCfg(self: *Engine, cfg: *const config.Config) void {
+        const val = config.get(cfg, "stall_threshold_secs") orelse return;
+        self.health_cfg_stall_threshold = std.fmt.parseInt(i64, val, 10) catch return;
+    }
+
     fn healthMonitorLoop(self: *Engine) void {
         const check_interval_ns: u64 = 30 * std.time.ns_per_s;
-        const threshold: i64 = blk: {
-            if (self.cfgPtr()) |cfg| {
-                const val = config.get(cfg, "stall_threshold_secs") orelse break :blk 300;
-                break :blk std.fmt.parseInt(i64, val, 10) catch 300;
-            }
-            break :blk 300;
-        };
 
         while (self.health_monitor_running.load(.acquire)) {
             std.Thread.sleep(check_interval_ns);
             if (!self.health_monitor_running.load(.acquire)) break;
+
+            // C1: Read threshold from snapshot under mutex — never from e.cfg.
+            self.health_cfg_mutex.lock();
+            const threshold = self.health_cfg_stall_threshold;
+            self.health_cfg_mutex.unlock();
 
             // Collect stalled worker IDs under lock
             var stalled_ids: [64]u32 = undefined;
@@ -732,6 +747,13 @@ export fn tm_config_reload(engine: ?*Engine) c_int {
     // All updates succeeded — swap config
     if (e.cfg) |*old| old.deinit(e.allocator);
     e.cfg = new_cfg;
+    // C1: Update health monitor snapshot under mutex so the background
+    // thread never reads the freed old config.
+    {
+        e.health_cfg_mutex.lock();
+        defer e.health_cfg_mutex.unlock();
+        e.snapshotHealthCfg(&new_cfg);
+    }
     return 0;
 }
 export fn tm_config_watch(engine: ?*Engine, callback: ?*const fn (?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
