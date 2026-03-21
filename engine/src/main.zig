@@ -369,9 +369,20 @@ pub const Engine = struct {
             };
         }
 
-        // C2: If any step after startWriter() fails, stop the writer thread.
-        // Without this, the interceptor install failure below leaves a live writer
-        // racing on an engine instance that the caller may retry or destroy.
+        // Post-commit errdefers: declared in order so that on error:
+        //   1. C2 errdefer runs first (stops writer thread while self.* is valid)
+        //   2. Defuse errdefer runs second (nulls self.* so destroy() doesn't
+        //      double-free what the pre-commit local errdefers already freed)
+
+        // Defuse self.* — prevents double-free between local errdefers and destroy().
+        errdefer {
+            self.cfg = null;
+            self.message_bus = null;
+            self.commands_watcher = null;
+            self.history_logger = null;
+        }
+
+        // C2: Stop the writer thread on post-commit failure.
         errdefer {
             if (self.history_logger) |*logger| logger.shutdown();
         }
