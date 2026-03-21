@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 // Module imports
 pub const config = @import("config.zig");
@@ -2959,7 +2960,9 @@ export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
     return null;
 }
 export fn tm_free_string(str: ?[*:0]const u8) void { if (str) |s| { std.heap.c_allocator.free(std.mem.span(s)); } }
-export fn tm_version() [*:0]const u8 { return "0.1.0"; }
+export fn tm_version() [*:0]const u8 {
+    return @ptrCast(build_options.version.ptr);
+}
 // NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_result_to_string(result: c_int) [*:0]const u8 {
     return switch (result) {
@@ -3231,7 +3234,7 @@ fn freeNullTerminatedArray(alloc: std.mem.Allocator, arr: []?[*:0]const u8, coun
 
 // ─── Tests ───────────────────────────────────────────────
 
-test "version returns 0.1.0" { try std.testing.expectEqualStrings("0.1.0", std.mem.span(tm_version())); }
+test "version returns build-time string" { try std.testing.expectEqualStrings(build_options.version, std.mem.span(tm_version())); }
 
 test "result_to_string maps all codes" {
     try std.testing.expectEqualStrings("TM_OK", std.mem.span(tm_result_to_string(0)));

@@ -14,9 +14,9 @@ trap 'rm -rf "$STAGING"' EXIT
 echo ""
 echo "[1/3] Building Zig engine (libteammux)..."
 cd engine
-zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
+zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast -Dversion=0.1.6
 cp zig-out/lib/libteammux.a "$STAGING/libteammux-arm64.a"
-zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast -Dversion=0.1.6
 cp zig-out/lib/libteammux.a "$STAGING/libteammux-x86_64.a"
 cd ..
 mkdir -p macos/Resources
