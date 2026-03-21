@@ -451,6 +451,10 @@ struct ContextView: View {
 
     /// Parse .teammux-memory.md content into individual entries.
     /// Format: each entry starts with `## {timestamp}` followed by body text.
+    /// I7: Only treat `## ` lines as entry delimiters if the text after `## `
+    /// matches ISO 8601 timestamp format (YYYY-MM-DDTHH:MM:SSZ). Lines with
+    /// `## ` that are not timestamps are treated as body text. This handles
+    /// both ZWS-escaped headings (Commit 3) and pre-existing unescaped files.
     private func parseMemoryEntries(_ content: String?) -> [MemoryEntry] {
         guard let content, !content.isEmpty else { return [] }
 
@@ -460,16 +464,22 @@ struct ContextView: View {
 
         for line in content.components(separatedBy: "\n") {
             if line.hasPrefix("## ") {
-                // Flush previous entry
-                if let ts = currentTimestamp {
-                    let body = currentBodyLines.joined(separator: "\n")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !body.isEmpty {
-                        entries.append(MemoryEntry(timestamp: ts, body: body))
+                let candidate = String(line.dropFirst(3))
+                if Self.looksLikeTimestamp(candidate) {
+                    // Flush previous entry
+                    if let ts = currentTimestamp {
+                        let body = currentBodyLines.joined(separator: "\n")
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !body.isEmpty {
+                            entries.append(MemoryEntry(timestamp: ts, body: body))
+                        }
                     }
+                    currentTimestamp = candidate
+                    currentBodyLines = []
+                } else if currentTimestamp != nil {
+                    // Not a timestamp — treat as body text
+                    currentBodyLines.append(line)
                 }
-                currentTimestamp = String(line.dropFirst(3))
-                currentBodyLines = []
             } else if line.hasPrefix("# ") {
                 // Skip the file header
                 continue
@@ -489,6 +499,16 @@ struct ContextView: View {
 
         // Newest first
         return entries.reversed()
+    }
+
+    /// I7: Check if a string looks like an ISO 8601 timestamp (YYYY-MM-DDTHH:MM:SSZ).
+    /// Used to distinguish real entry delimiters from markdown headings in summaries.
+    private static func looksLikeTimestamp(_ s: String) -> Bool {
+        // Exact format: 2026-03-20T14:30:00Z (20 chars)
+        guard s.count == 20 else { return false }
+        let idx10 = s.index(s.startIndex, offsetBy: 10)
+        let idx19 = s.index(s.startIndex, offsetBy: 19)
+        return s[idx10] == "T" && s[idx19] == "Z"
     }
 
     // MARK: - Role TOML path resolution
