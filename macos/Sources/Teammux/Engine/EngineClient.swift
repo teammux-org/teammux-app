@@ -622,6 +622,16 @@ final class EngineClient: ObservableObject {
         return skippedWorkers.count
     }
 
+    /// C5: Scan for orphaned worktrees and clean them up.
+    /// Must be called after session restore so the roster contains restored workers.
+    func recoverOrphans() {
+        guard let engine else { return }
+        let count = tm_recover_orphans(engine)
+        if count > 0 {
+            Self.logger.info("recoverOrphans: cleaned up \(count) orphaned worktree(s)")
+        }
+    }
+
     /// Refresh the published roster from the engine.
     /// Wraps `tm_roster_get()` + `tm_roster_free()`.
     func refreshRoster() {

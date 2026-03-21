@@ -195,6 +195,12 @@ pub const Engine = struct {
     pty_monitor: PtyMonitor,
     health_monitor_thread: ?std.Thread,
     health_monitor_running: std.atomic.Value(bool),
+    // C1: Snapshot of config values used by the health monitor thread.
+    // Written at session start (before monitor thread exists — no lock needed).
+    // Updated under health_cfg_mutex on config reload. The monitor reads
+    // these instead of e.cfg to avoid a use-after-free race.
+    health_cfg_stall_threshold: i64,
+    health_cfg_mutex: std.Thread.Mutex,
 
     pub fn create(allocator: std.mem.Allocator, project_root: []const u8) !*Engine {
         const engine = try allocator.create(Engine);
@@ -234,6 +240,8 @@ pub const Engine = struct {
             .pty_monitor = undefined, // initialized below (needs engine pointer)
             .health_monitor_thread = null,
             .health_monitor_running = std.atomic.Value(bool).init(false),
+            .health_cfg_stall_threshold = 300,
+            .health_cfg_mutex = .{},
         };
         engine.pty_monitor = PtyMonitor.init(allocator, engine);
         return engine;
@@ -296,13 +304,8 @@ pub const Engine = struct {
         };
         errdefer cfg.deinit(self.allocator);
 
-        // TD21: Scan for orphaned worktrees left by a previous engine crash.
-        // Must run after config load (needs worktree_root) and while roster is
-        // still empty (so all leftover directories are correctly identified as orphans).
-        const orphan_count = worktree_lifecycle.recoverOrphans(self.allocator, &cfg, self.project_root, &self.roster);
-        if (orphan_count > 0) {
-            self.setError("recovered orphaned worktree(s) from previous crash") catch {};
-        }
+        // C5: Orphan recovery moved to tm_recover_orphans() — called by Swift AFTER
+        // restoreSession() populates the roster, so restored workers are not deleted.
 
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
@@ -347,11 +350,15 @@ pub const Engine = struct {
             return err;
         };
 
-        // All subsystems initialized — commit to self (no more errors possible)
+        // All subsystems initialized — commit to self. The interceptor install
+        // below can still fail, so errdefers guard post-commit cleanup.
         self.cfg = cfg;
         self.message_bus = msg_bus;
         self.commands_watcher = cmd_watcher;
         self.history_logger = hist_logger;
+
+        // C1: Snapshot config values for the health monitor before it starts.
+        self.snapshotHealthCfg(&cfg);
 
         // Start async history writer (I15) — must be after commit to self so
         // the writer thread's self pointer targets the stable Engine-embedded logger.
@@ -360,6 +367,24 @@ pub const Engine = struct {
                 std.log.warn("[teammux] history: async writer start failed, writes will be synchronous: {}", .{err});
                 self.setError("history: async writer unavailable — history writes will block the event loop") catch {};
             };
+        }
+
+        // Post-commit errdefers: declared in order so that on error:
+        //   1. C2 errdefer runs first (stops writer thread while self.* is valid)
+        //   2. Defuse errdefer runs second (nulls self.* so destroy() doesn't
+        //      double-free what the pre-commit local errdefers already freed)
+
+        // Defuse self.* — prevents double-free between local errdefers and destroy().
+        errdefer {
+            self.cfg = null;
+            self.message_bus = null;
+            self.commands_watcher = null;
+            self.history_logger = null;
+        }
+
+        // C2: Stop the writer thread on post-commit failure.
+        errdefer {
+            if (self.history_logger) |*logger| logger.shutdown();
         }
 
         // Wire bus routing for PR status events from GitHub polling
@@ -505,19 +530,28 @@ pub const Engine = struct {
         self.setError(msg) catch {};
     }
 
+    /// C1: Extract stall_threshold_secs from a config into the health monitor snapshot.
+    /// Called at session start (before the monitor thread is spawned — no lock needed)
+    /// and on config reload (under health_cfg_mutex).
+    fn snapshotHealthCfg(self: *Engine, cfg: *const config.Config) void {
+        // Reset to default first — if the key was removed or is unparseable,
+        // the monitor reverts to the default instead of keeping a stale value.
+        self.health_cfg_stall_threshold = 300;
+        const val = config.get(cfg, "stall_threshold_secs") orelse return;
+        self.health_cfg_stall_threshold = std.fmt.parseInt(i64, val, 10) catch 300;
+    }
+
     fn healthMonitorLoop(self: *Engine) void {
         const check_interval_ns: u64 = 30 * std.time.ns_per_s;
-        const threshold: i64 = blk: {
-            if (self.cfgPtr()) |cfg| {
-                const val = config.get(cfg, "stall_threshold_secs") orelse break :blk 300;
-                break :blk std.fmt.parseInt(i64, val, 10) catch 300;
-            }
-            break :blk 300;
-        };
 
         while (self.health_monitor_running.load(.acquire)) {
             std.Thread.sleep(check_interval_ns);
             if (!self.health_monitor_running.load(.acquire)) break;
+
+            // C1: Read threshold from snapshot under mutex — never from e.cfg.
+            self.health_cfg_mutex.lock();
+            const threshold = self.health_cfg_stall_threshold;
+            self.health_cfg_mutex.unlock();
 
             // Collect stalled worker IDs under lock
             var stalled_ids: [64]u32 = undefined;
@@ -691,6 +725,15 @@ export fn tm_session_start(engine: ?*Engine) c_int {
 
     return 0;
 }
+/// C5: Scan for orphaned worktrees and clean them up. Call AFTER session
+/// restore completes (roster populated with restored workers). Worktree
+/// directories whose numeric IDs are present in the roster are preserved.
+/// Returns the count of orphans cleaned up (0 if none).
+export fn tm_recover_orphans(engine: ?*Engine) u32 {
+    const e = engine orelse return 0;
+    const cfg = e.cfgPtr() orelse return 0;
+    return worktree_lifecycle.recoverOrphans(e.allocator, cfg, e.project_root, &e.roster);
+}
 export fn tm_session_stop(engine: ?*Engine) void { if (engine) |e| e.sessionStop(); }
 export fn tm_engine_last_error(engine: ?*Engine) [*:0]const u8 {
     const e = engine orelse return last_create_error;
@@ -724,6 +767,13 @@ export fn tm_config_reload(engine: ?*Engine) c_int {
     // All updates succeeded — swap config
     if (e.cfg) |*old| old.deinit(e.allocator);
     e.cfg = new_cfg;
+    // C1: Update health monitor snapshot under mutex so the background
+    // thread never reads the freed old config.
+    {
+        e.health_cfg_mutex.lock();
+        defer e.health_cfg_mutex.unlock();
+        e.snapshotHealthCfg(&new_cfg);
+    }
     return 0;
 }
 export fn tm_config_watch(engine: ?*Engine, callback: ?*const fn (?*anyopaque) callconv(.c) void, userdata: ?*anyopaque) u32 {
@@ -7345,30 +7395,27 @@ test "S15 integration 2: crash recovery — orphaned worktree cleaned on init" {
     try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
     const e = engine_ptr.?;
 
-    // sessionStart loads config which resolves worktree_root, then calls recoverOrphans
+    // C5: sessionStart no longer runs recoverOrphans inline. The caller
+    // (Swift) invokes tm_recover_orphans after restoring the session roster.
+    // In this test the roster is empty, so the orphan should still be cleaned.
     e.sessionStart() catch {
         // sessionStart may fail on bus/history init in minimal env — that's OK,
-        // recovery runs before those steps. Still assert orphan was cleaned.
-        e.sessionStop();
-        tm_engine_destroy(engine_ptr);
-
-        // Verify orphan directory was removed even if sessionStart failed partway
-        _ = std.fs.openDirAbsolute(orphan_path, .{}) catch |err| {
-            try std.testing.expect(err == error.FileNotFound);
-            return; // Success — orphan cleaned despite session start failure
-        };
-        return error.OrphanNotCleaned;
+        // config is still loaded so tm_recover_orphans can work.
     };
+
+    // Call tm_recover_orphans — simulates the Swift post-restore call
+    const orphan_count = tm_recover_orphans(engine_ptr);
+    try std.testing.expect(orphan_count > 0);
 
     e.sessionStop();
     tm_engine_destroy(engine_ptr);
 
-    // Verify orphan directory was removed — hard assertion on success path
+    // Verify orphan directory was removed
     _ = std.fs.openDirAbsolute(orphan_path, .{}) catch |err| {
         try std.testing.expect(err == error.FileNotFound);
         return; // Success — orphan cleaned
     };
-    // If directory still exists after successful sessionStart, recovery failed
+    // If directory still exists after tm_recover_orphans, recovery failed
     return error.OrphanNotCleaned;
 }
 

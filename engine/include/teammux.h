@@ -203,6 +203,12 @@ void         tm_engine_destroy(tm_engine_t* engine);
 tm_result_t  tm_session_start(tm_engine_t* engine);
 void         tm_session_stop(tm_engine_t* engine);
 
+// Scan for orphaned worktrees left by a previous engine crash and clean them up.
+// Call AFTER session restore completes (roster populated with restored workers).
+// Worktree directories whose numeric IDs are present in the roster are preserved.
+// Returns the count of orphans cleaned up (0 if none).
+uint32_t     tm_recover_orphans(tm_engine_t* engine);
+
 // Get last error message. Valid until next API call on the same engine.
 // Can be called with NULL engine to get the last creation error.
 const char*  tm_engine_last_error(tm_engine_t* engine);

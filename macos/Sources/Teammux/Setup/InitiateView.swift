@@ -202,6 +202,10 @@ struct InitiateView: View {
                 return
             }
 
+            // C5: Clean up orphaned worktrees from any previous crash.
+            // Safe on fresh start — roster is empty so all orphans are removed.
+            engine.recoverOrphans()
+
             isInitiating = false
 
         } catch {
