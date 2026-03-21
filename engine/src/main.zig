@@ -196,6 +196,7 @@ pub const Engine = struct {
     health_monitor_thread: ?std.Thread,
     health_monitor_running: std.atomic.Value(bool),
     // C1: Snapshot of config values used by the health monitor thread.
+    // Written at session start (before monitor thread exists — no lock needed).
     // Updated under health_cfg_mutex on config reload. The monitor reads
     // these instead of e.cfg to avoid a use-after-free race.
     health_cfg_stall_threshold: i64,
@@ -519,7 +520,8 @@ pub const Engine = struct {
     }
 
     /// C1: Extract stall_threshold_secs from a config into the health monitor snapshot.
-    /// Called at session start and on config reload (under health_cfg_mutex).
+    /// Called at session start (before the monitor thread is spawned — no lock needed)
+    /// and on config reload (under health_cfg_mutex).
     fn snapshotHealthCfg(self: *Engine, cfg: *const config.Config) void {
         const val = config.get(cfg, "stall_threshold_secs") orelse return;
         self.health_cfg_stall_threshold = std.fmt.parseInt(i64, val, 10) catch return;

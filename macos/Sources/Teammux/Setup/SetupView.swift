@@ -348,6 +348,10 @@ struct RestoreCardView: View {
         // Restore workers and state from snapshot
         let skippedCount = engine.restoreSession(snapshot)
 
+        // C5: Clean up orphaned worktrees AFTER restore populates the roster.
+        // Restored workers are preserved; only true orphans are removed.
+        engine.recoverOrphans()
+
         if skippedCount > 0 {
             // Partial restore — keep session file so user can retry.
             // Show warning but proceed (some workers were restored).

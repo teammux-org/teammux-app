@@ -618,10 +618,6 @@ final class EngineClient: ObservableObject {
         // Load agent memory files for all restored workers (S13)
         loadAllWorkerMemory()
 
-        // C5: Run orphan recovery AFTER roster is populated with restored workers.
-        // This ensures restored worktrees are not mistakenly deleted as orphans.
-        recoverOrphans()
-
         Self.logger.info("restoreSession: restored \(snapshot.workers.count - skippedWorkers.count)/\(snapshot.workers.count) workers")
         return skippedWorkers.count
     }
