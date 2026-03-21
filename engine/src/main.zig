@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 // Module imports
 pub const config = @import("config.zig");
@@ -1054,8 +1055,12 @@ export fn tm_roster_unwatch(engine: ?*Engine, sub: u32) void {
 
 export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_int, payload: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
+    const mt = std.meta.intToEnum(bus.MessageType, msg_type) catch {
+        e.setError("tm_message_send: invalid message type") catch {};
+        return 12; // TM_ERR_INVALID_WORKER (no dedicated invalid-arg code)
+    };
     var b = &(e.message_bus orelse return 8);
-    b.send(target_worker_id, 0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8)) catch |err| {
+    b.send(target_worker_id, 0, mt, std.mem.span(payload orelse return 8)) catch |err| {
         e.setError(if (err == error.DeliveryFailed) "message delivery failed after 4 attempts" else "message send failed") catch {};
         return 8;
     };
@@ -1073,8 +1078,12 @@ export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_i
 }
 export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
+    const mt = std.meta.intToEnum(bus.MessageType, msg_type) catch {
+        e.setError("tm_message_broadcast: invalid message type") catch {};
+        return 12; // TM_ERR_INVALID_WORKER (no dedicated invalid-arg code)
+    };
     var b = &(e.message_bus orelse return 8);
-    b.broadcast(0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8), &e.roster) catch { e.setError("message broadcast failed") catch {}; return 8; };
+    b.broadcast(0, mt, std.mem.span(payload orelse return 8), &e.roster) catch { e.setError("message broadcast failed") catch {}; return 8; };
     return 0;
 }
 export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int, userdata: ?*anyopaque) u32 {
@@ -1150,7 +1159,11 @@ export fn tm_pr_free(pr: ?*CPr) void {
 }
 export fn tm_github_merge_pr(engine: ?*Engine, pr_number: u64, strategy: c_int) c_int {
     const e = engine orelse return 99;
-    e.github_client.mergePr(e.allocator, pr_number, @enumFromInt(strategy)) catch {
+    const strat = std.meta.intToEnum(github.MergeStrategy, strategy) catch {
+        e.setError("tm_github_merge_pr: invalid merge strategy") catch {};
+        return 12; // TM_ERR_INVALID_WORKER (no dedicated invalid-arg code)
+    };
+    e.github_client.mergePr(e.allocator, pr_number, strat) catch {
         e.setError("PR merge failed: gh CLI error") catch {};
         return 9; // TM_ERR_GITHUB
     };
@@ -2246,9 +2259,14 @@ export fn tm_conflict_resolve(engine: ?*Engine, worker_id: u32, file_path: ?[*:0
             error.FileNotInConflicts => "conflict resolve failed: file not in conflict list",
             error.InvalidResolution => "conflict resolve failed: invalid resolution",
             error.GitFailed => "conflict resolve failed: git operation failed",
-            else => "conflict resolve failed",
+            error.OutOfMemory => "conflict resolve failed: out of memory",
+            else => "conflict resolve failed: unexpected internal error",
         }) catch {};
-        return 12; // TM_ERR_INVALID_WORKER
+        return switch (err) {
+            error.GitFailed => 19, // TM_ERR_GIT_FAILURE
+            error.NoActiveMerge, error.NoConflicts, error.FileNotInConflicts, error.InvalidResolution => 12, // TM_ERR_INVALID_WORKER
+            else => 99, // TM_ERR_UNKNOWN
+        };
     };
     return 0;
 }
@@ -2274,9 +2292,14 @@ export fn tm_conflict_finalize(engine: ?*Engine, worker_id: u32) c_int {
             error.NoConflicts => "conflict finalize failed: no conflicts for this worker",
             error.UnresolvedConflicts => "conflict finalize failed: unresolved files remain",
             error.GitFailed => "conflict finalize failed: git commit failed",
-            else => "conflict finalize failed",
+            error.OutOfMemory => "conflict finalize failed: out of memory",
+            else => "conflict finalize failed: unexpected internal error",
         }) catch {};
-        return 12; // TM_ERR_INVALID_WORKER
+        return switch (err) {
+            error.GitFailed => 19, // TM_ERR_GIT_FAILURE
+            error.NoActiveMerge, error.NoConflicts, error.UnresolvedConflicts => 12, // TM_ERR_INVALID_WORKER
+            else => 99, // TM_ERR_UNKNOWN
+        };
     };
     e.ownership_registry.release(worker_id);
     if (result == .cleanup_incomplete) {
@@ -2997,7 +3020,12 @@ export fn tm_agent_resolve(agent_name: ?[*:0]const u8) ?[*:0]const u8 {
     return null;
 }
 export fn tm_free_string(str: ?[*:0]const u8) void { if (str) |s| { std.heap.c_allocator.free(std.mem.span(s)); } }
-export fn tm_version() [*:0]const u8 { return "0.1.0"; }
+export fn tm_version() [*:0]const u8 {
+    // Comptime sentinel coercion — asserts null terminator exists at compile time.
+    // Safe because build_options embeds string literals which are always null-terminated.
+    const v: [:0]const u8 = build_options.version[0..build_options.version.len :0];
+    return v.ptr;
+}
 // NO SWIFT CALLER — candidate for removal in v0.2
 export fn tm_result_to_string(result: c_int) [*:0]const u8 {
     return switch (result) {
@@ -3008,6 +3036,7 @@ export fn tm_result_to_string(result: c_int) [*:0]const u8 {
         14 => "TM_ERR_OWNERSHIP",
         15 => "TM_ERR_CLEANUP_INCOMPLETE",
         16 => "TM_ERR_DELIVERY_FAILED",
+        19 => "TM_ERR_GIT_FAILURE",
         else => "TM_ERR_UNKNOWN",
     };
 }
@@ -3269,14 +3298,48 @@ fn freeNullTerminatedArray(alloc: std.mem.Allocator, arr: []?[*:0]const u8, coun
 
 // ─── Tests ───────────────────────────────────────────────
 
-test "version returns 0.1.0" { try std.testing.expectEqualStrings("0.1.0", std.mem.span(tm_version())); }
+test "version returns build-time string" { try std.testing.expectEqualStrings(build_options.version, std.mem.span(tm_version())); }
 
 test "result_to_string maps all codes" {
     try std.testing.expectEqualStrings("TM_OK", std.mem.span(tm_result_to_string(0)));
     try std.testing.expectEqualStrings("TM_ERR_CONFIG", std.mem.span(tm_result_to_string(7)));
     try std.testing.expectEqualStrings("TM_ERR_NOT_IMPLEMENTED", std.mem.span(tm_result_to_string(10)));
     try std.testing.expectEqualStrings("TM_ERR_ROLE", std.mem.span(tm_result_to_string(13)));
+    try std.testing.expectEqualStrings("TM_ERR_GIT_FAILURE", std.mem.span(tm_result_to_string(19)));
     try std.testing.expectEqualStrings("TM_ERR_UNKNOWN", std.mem.span(tm_result_to_string(99)));
+}
+
+// ─── C3: safe enum conversion tests ─────────────────────
+
+test "tm_message_send rejects invalid message type" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/c3-test-send");
+    defer engine.destroy();
+    // 999 is not a valid MessageType enum value
+    const result = tm_message_send(engine, 1, 999, "test");
+    try std.testing.expect(result == 12); // TM_ERR_INVALID_ARG
+    const err = std.mem.span(tm_engine_last_error(engine));
+    try std.testing.expect(std.mem.indexOf(u8, err, "invalid message type") != null);
+}
+
+test "tm_message_broadcast rejects invalid message type" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/c3-test-bcast");
+    defer engine.destroy();
+    const result = tm_message_broadcast(engine, 999, "test");
+    try std.testing.expect(result == 12);
+    const err = std.mem.span(tm_engine_last_error(engine));
+    try std.testing.expect(std.mem.indexOf(u8, err, "invalid message type") != null);
+}
+
+test "tm_github_merge_pr rejects invalid strategy" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/c3-test-merge");
+    defer engine.destroy();
+    const result = tm_github_merge_pr(engine, 1, 999);
+    try std.testing.expect(result == 12);
+    const err = std.mem.span(tm_engine_last_error(engine));
+    try std.testing.expect(std.mem.indexOf(u8, err, "invalid merge strategy") != null);
 }
 
 test "engine create and destroy via C API" {
