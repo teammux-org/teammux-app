@@ -21,7 +21,7 @@ pub const CommandWatcher = struct {
     commands_dir: []const u8,
     kq: i32,
     dir_fd: std.posix.fd_t,
-    callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
+    callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) bool,
     userdata: ?*anyopaque,
     bus_send_fn: ?BusSendFn,
     bus_send_userdata: ?*anyopaque,
@@ -51,7 +51,7 @@ pub const CommandWatcher = struct {
 
     pub fn start(
         self: *CommandWatcher,
-        callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) void,
+        callback: ?*const fn (?[*:0]const u8, ?[*:0]const u8, ?*anyopaque) callconv(.c) bool,
         userdata: ?*anyopaque,
     ) !void {
         self.callback = callback;
@@ -94,6 +94,14 @@ pub const CommandWatcher = struct {
             self.dir_fd = -1;
         }
         self.allocator.free(self.commands_dir);
+    }
+
+    /// I13: Delete stale .teammux-error files from previous sessions.
+    /// Called at sessionStart to prevent error bleed across sessions.
+    pub fn clearStaleErrors(self: *CommandWatcher) void {
+        var dir = std.fs.openDirAbsolute(self.commands_dir, .{}) catch return;
+        defer dir.close();
+        dir.deleteFile(".teammux-error") catch {};
     }
 
     /// Write a .teammux-error JSON file to the commands directory (I6).
@@ -246,19 +254,30 @@ pub const CommandWatcher = struct {
             }
         }
 
-        // All other commands: fire generic callback
+        // All other commands: fire generic callback (I11: check return value)
         if (self.callback) |cb| {
-            cb(parsed.command.ptr, parsed.args.ptr, self.userdata);
+            const ok = cb(parsed.command.ptr, parsed.args.ptr, self.userdata);
+            if (!ok) {
+                // I11: Handler failed — write .teammux-error before deleting command file
+                _ = self.writeErrorResponse(dir, cmd_slice, "command handler failed");
+                self.notifyError("command handler failed");
+                dir.deleteFile(filename) catch {};
+                return;
+            }
         } else {
             // I6: No handler registered — write error response
             _ = self.writeErrorResponse(dir, cmd_slice, "no handler registered for command");
             self.notifyError("command received but no handler registered");
+            dir.deleteFile(filename) catch {};
+            return;
         }
 
         // Delete file only after successful processing
         dir.deleteFile(filename) catch |err| {
             std.log.warn("[teammux] command file delete failed {s}: {}", .{ filename, err });
         };
+        // I13: Clear stale .teammux-error on successful command processing
+        dir.deleteFile(".teammux-error") catch {};
     }
 
     /// Route a /teammux-complete command to the bus as TM_MSG_COMPLETION.
@@ -448,13 +467,14 @@ test "commands - command file is processed and deleted" {
     };
 
     const callback = struct {
-        fn cb(cmd: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+        fn cb(cmd: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) bool {
             if (cmd) |c| {
                 const slice = std.mem.span(c);
                 TestState.command_received = true;
                 @memcpy(TestState.received_command[0..slice.len], slice);
                 TestState.received_len = slice.len;
             }
+            return true;
         }
     }.cb;
 
@@ -481,8 +501,9 @@ test "commands - kqueue watcher detects file changes (integration)" {
     };
 
     const callback2 = struct {
-        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) bool {
             TestState2.detected = true;
+            return true;
         }
     }.cb;
 
@@ -548,8 +569,9 @@ test "commands - /teammux-complete routed to bus, generic callback not fired" {
     State.bus_payload_len = 0;
 
     const generic_cb = struct {
-        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) bool {
             State.generic_called = true;
+            return true;
         }
     }.cb;
 
@@ -615,8 +637,9 @@ test "commands - /teammux-question routed to bus, generic callback not fired" {
     State.bus_from = 99;
 
     const generic_cb = struct {
-        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) bool {
             State.generic_called = true;
+            return true;
         }
     }.cb;
 
@@ -664,8 +687,9 @@ test "commands - other commands still fire generic callback" {
     State.bus_called = false;
 
     const generic_cb = struct {
-        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+        fn cb(_: ?[*:0]const u8, _: ?[*:0]const u8, _: ?*anyopaque) callconv(.c) bool {
             State.generic_called = true;
+            return true;
         }
     }.cb;
 
