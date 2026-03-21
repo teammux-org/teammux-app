@@ -146,18 +146,23 @@ struct ConflictView: View {
         isActionInFlight = true
         actionError = nil
         cleanupWarning = nil
-        Task { @MainActor in
-            let success = engine.finalizeMerge(workerId: worker.id)
-            if success {
-                if let warning = engine.lastError {
-                    cleanupWarning = warning
+        let engine = self.engine
+        let workerId = worker.id
+        Task.detached {
+            let success = engine.finalizeMerge(workerId: workerId)
+            let error = engine.lastError
+            await MainActor.run {
+                if success {
+                    if let warning = error {
+                        self.cleanupWarning = warning
+                    } else {
+                        self.dismiss()
+                    }
                 } else {
-                    dismiss()
+                    self.actionError = error ?? "Finalize merge failed"
                 }
-            } else {
-                actionError = engine.lastError ?? "Finalize merge failed"
+                self.isActionInFlight = false
             }
-            isActionInFlight = false
         }
     }
 
@@ -165,18 +170,23 @@ struct ConflictView: View {
         isActionInFlight = true
         actionError = nil
         cleanupWarning = nil
-        Task { @MainActor in
-            let success = engine.rejectMerge(workerId: worker.id)
-            if success {
-                if let warning = engine.lastError {
-                    cleanupWarning = warning
+        let engine = self.engine
+        let workerId = worker.id
+        Task.detached {
+            let success = engine.rejectMerge(workerId: workerId)
+            let error = engine.lastError
+            await MainActor.run {
+                if success {
+                    if let warning = error {
+                        self.cleanupWarning = warning
+                    } else {
+                        self.dismiss()
+                    }
                 } else {
-                    dismiss()
+                    self.actionError = error ?? "Reject failed"
                 }
-            } else {
-                actionError = engine.lastError ?? "Reject failed"
+                self.isActionInFlight = false
             }
-            isActionInFlight = false
         }
     }
 }
@@ -288,16 +298,22 @@ struct ConflictFileRow: View {
     private func resolve(_ resolution: ConflictResolution) {
         isResolving = true
         resolveError = nil
-        Task { @MainActor in
+        let engine = self.engine
+        let workerId = self.workerId
+        let filePath = conflict.filePath
+        Task.detached {
             let success = engine.resolveConflict(
                 workerId: workerId,
-                filePath: conflict.filePath,
+                filePath: filePath,
                 resolution: resolution
             )
-            if !success {
-                resolveError = engine.lastError ?? "Resolution failed"
+            let error = engine.lastError
+            await MainActor.run {
+                if !success {
+                    self.resolveError = error ?? "Resolution failed"
+                }
+                self.isResolving = false
             }
-            isResolving = false
         }
     }
 
