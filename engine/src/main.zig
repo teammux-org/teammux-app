@@ -862,10 +862,16 @@ export fn tm_worker_monitor_pid(engine: ?*Engine, worker_id: u32, pid: c_int) c_
 
 export fn tm_worker_restart(engine: ?*Engine, worker_id: u32) c_int {
     const e = engine orelse return 99;
+    // I1: Unwatch stale PID before resetting health state.
+    // Prevents late death notification from re-erroring the restarted worker.
+    // New PTY will register its PID via tm_worker_monitor_pid after spawn.
+    e.pty_monitor.unwatch(worker_id);
     const found = blk: {
         e.roster.mutex.lock();
         defer e.roster.mutex.unlock();
         const w = e.roster.workers.getPtr(worker_id) orelse break :blk false;
+        // I12: Reset both status and health_status atomically under lock.
+        w.status = .idle;
         w.health_status = .healthy;
         w.last_activity_ts = std.time.timestamp();
         break :blk true;
@@ -7210,6 +7216,41 @@ test "S11 - tm_worker_restart returns INVALID_WORKER for missing worker" {
 
     // Non-existent worker should return TM_ERR_INVALID_WORKER (12)
     try std.testing.expect(tm_worker_restart(engine_ptr, 99) == 12);
+}
+
+test "S4 - tm_worker_restart resets status + health_status and unwatches PID (I1/I12)" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/s4-restart-test");
+    defer engine.destroy();
+
+    // Spawn a worker and simulate PTY death
+    try engine.roster.workers.put(1, try coordinator_mod.makeTestWorker(alloc, 1));
+    {
+        engine.roster.mutex.lock();
+        defer engine.roster.mutex.unlock();
+        const w = engine.roster.workers.getPtr(1).?;
+        w.status = .err;
+        w.health_status = .errored;
+    }
+
+    // Register a stale PID
+    try engine.pty_monitor.watch(12345, 1);
+    try std.testing.expect(engine.pty_monitor.countWatched() == 1);
+
+    // Restart should reset both fields and unwatch stale PID
+    const rc = tm_worker_restart(engine, 1);
+    try std.testing.expect(rc == 0);
+
+    {
+        engine.roster.mutex.lock();
+        defer engine.roster.mutex.unlock();
+        const w = engine.roster.workers.getPtr(1).?;
+        try std.testing.expect(w.status == .idle);
+        try std.testing.expect(w.health_status == .healthy);
+    }
+
+    // Stale PID should be unwatched
+    try std.testing.expect(engine.pty_monitor.countWatched() == 0);
 }
 
 test "S11 - tm_worker_health_status returns healthy for missing worker" {
