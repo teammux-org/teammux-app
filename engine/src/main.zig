@@ -303,13 +303,8 @@ pub const Engine = struct {
         };
         errdefer cfg.deinit(self.allocator);
 
-        // TD21: Scan for orphaned worktrees left by a previous engine crash.
-        // Must run after config load (needs worktree_root) and while roster is
-        // still empty (so all leftover directories are correctly identified as orphans).
-        const orphan_count = worktree_lifecycle.recoverOrphans(self.allocator, &cfg, self.project_root, &self.roster);
-        if (orphan_count > 0) {
-            self.setError("recovered orphaned worktree(s) from previous crash") catch {};
-        }
+        // C5: Orphan recovery moved to tm_recover_orphans() — called by Swift AFTER
+        // restoreSession() populates the roster, so restored workers are not deleted.
 
         const log_dir = try std.fmt.allocPrint(self.allocator, "{s}/.teammux/logs", .{self.project_root});
         defer self.allocator.free(log_dir);
@@ -713,6 +708,15 @@ export fn tm_session_start(engine: ?*Engine) c_int {
     };
 
     return 0;
+}
+/// C5: Scan for orphaned worktrees and clean them up. Call AFTER session
+/// restore completes (roster populated with restored workers). Worktree
+/// directories whose numeric IDs are present in the roster are preserved.
+/// Returns the count of orphans cleaned up (0 if none).
+export fn tm_recover_orphans(engine: ?*Engine) u32 {
+    const e = engine orelse return 0;
+    const cfg = e.cfgPtr() orelse return 0;
+    return worktree_lifecycle.recoverOrphans(e.allocator, cfg, e.project_root, &e.roster);
 }
 export fn tm_session_stop(engine: ?*Engine) void { if (engine) |e| e.sessionStop(); }
 export fn tm_engine_last_error(engine: ?*Engine) [*:0]const u8 {
@@ -7375,30 +7379,27 @@ test "S15 integration 2: crash recovery — orphaned worktree cleaned on init" {
     try std.testing.expect(tm_engine_create(root_z.ptr, &engine_ptr) == 0);
     const e = engine_ptr.?;
 
-    // sessionStart loads config which resolves worktree_root, then calls recoverOrphans
+    // C5: sessionStart no longer runs recoverOrphans inline. The caller
+    // (Swift) invokes tm_recover_orphans after restoring the session roster.
+    // In this test the roster is empty, so the orphan should still be cleaned.
     e.sessionStart() catch {
         // sessionStart may fail on bus/history init in minimal env — that's OK,
-        // recovery runs before those steps. Still assert orphan was cleaned.
-        e.sessionStop();
-        tm_engine_destroy(engine_ptr);
-
-        // Verify orphan directory was removed even if sessionStart failed partway
-        _ = std.fs.openDirAbsolute(orphan_path, .{}) catch |err| {
-            try std.testing.expect(err == error.FileNotFound);
-            return; // Success — orphan cleaned despite session start failure
-        };
-        return error.OrphanNotCleaned;
+        // config is still loaded so tm_recover_orphans can work.
     };
+
+    // Call tm_recover_orphans — simulates the Swift post-restore call
+    const orphan_count = tm_recover_orphans(engine_ptr);
+    try std.testing.expect(orphan_count > 0);
 
     e.sessionStop();
     tm_engine_destroy(engine_ptr);
 
-    // Verify orphan directory was removed — hard assertion on success path
+    // Verify orphan directory was removed
     _ = std.fs.openDirAbsolute(orphan_path, .{}) catch |err| {
         try std.testing.expect(err == error.FileNotFound);
         return; // Success — orphan cleaned
     };
-    // If directory still exists after successful sessionStart, recovery failed
+    // If directory still exists after tm_recover_orphans, recovery failed
     return error.OrphanNotCleaned;
 }
 
