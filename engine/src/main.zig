@@ -1004,8 +1004,12 @@ export fn tm_roster_unwatch(engine: ?*Engine, sub: u32) void {
 
 export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_int, payload: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
+    const mt = std.meta.intToEnum(bus.MessageType, msg_type) catch {
+        e.setError("tm_message_send: invalid message type") catch {};
+        return 12; // TM_ERR_INVALID_ARG
+    };
     var b = &(e.message_bus orelse return 8);
-    b.send(target_worker_id, 0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8)) catch |err| {
+    b.send(target_worker_id, 0, mt, std.mem.span(payload orelse return 8)) catch |err| {
         e.setError(if (err == error.DeliveryFailed) "message delivery failed after 4 attempts" else "message send failed") catch {};
         return 8;
     };
@@ -1023,8 +1027,12 @@ export fn tm_message_send(engine: ?*Engine, target_worker_id: u32, msg_type: c_i
 }
 export fn tm_message_broadcast(engine: ?*Engine, msg_type: c_int, payload: ?[*:0]const u8) c_int {
     const e = engine orelse return 99;
+    const mt = std.meta.intToEnum(bus.MessageType, msg_type) catch {
+        e.setError("tm_message_broadcast: invalid message type") catch {};
+        return 12; // TM_ERR_INVALID_ARG
+    };
     var b = &(e.message_bus orelse return 8);
-    b.broadcast(0, @enumFromInt(msg_type), std.mem.span(payload orelse return 8), &e.roster) catch { e.setError("message broadcast failed") catch {}; return 8; };
+    b.broadcast(0, mt, std.mem.span(payload orelse return 8), &e.roster) catch { e.setError("message broadcast failed") catch {}; return 8; };
     return 0;
 }
 export fn tm_message_subscribe(engine: ?*Engine, callback: ?*const fn (?*const bus.CMessage, ?*anyopaque) callconv(.c) c_int, userdata: ?*anyopaque) u32 {
@@ -1100,7 +1108,11 @@ export fn tm_pr_free(pr: ?*CPr) void {
 }
 export fn tm_github_merge_pr(engine: ?*Engine, pr_number: u64, strategy: c_int) c_int {
     const e = engine orelse return 99;
-    e.github_client.mergePr(e.allocator, pr_number, @enumFromInt(strategy)) catch {
+    const strat = std.meta.intToEnum(github.MergeStrategy, strategy) catch {
+        e.setError("tm_github_merge_pr: invalid merge strategy") catch {};
+        return 12; // TM_ERR_INVALID_ARG
+    };
+    e.github_client.mergePr(e.allocator, pr_number, strat) catch {
         e.setError("PR merge failed: gh CLI error") catch {};
         return 9; // TM_ERR_GITHUB
     };
@@ -3227,6 +3239,39 @@ test "result_to_string maps all codes" {
     try std.testing.expectEqualStrings("TM_ERR_NOT_IMPLEMENTED", std.mem.span(tm_result_to_string(10)));
     try std.testing.expectEqualStrings("TM_ERR_ROLE", std.mem.span(tm_result_to_string(13)));
     try std.testing.expectEqualStrings("TM_ERR_UNKNOWN", std.mem.span(tm_result_to_string(99)));
+}
+
+// ─── C3: safe enum conversion tests ─────────────────────
+
+test "tm_message_send rejects invalid message type" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/c3-test-send");
+    defer engine.destroy();
+    // 999 is not a valid MessageType enum value
+    const result = tm_message_send(engine, 1, 999, "test");
+    try std.testing.expect(result == 12); // TM_ERR_INVALID_ARG
+    const err = std.mem.span(tm_engine_last_error(engine));
+    try std.testing.expect(std.mem.indexOf(u8, err, "invalid message type") != null);
+}
+
+test "tm_message_broadcast rejects invalid message type" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/c3-test-bcast");
+    defer engine.destroy();
+    const result = tm_message_broadcast(engine, 999, "test");
+    try std.testing.expect(result == 12);
+    const err = std.mem.span(tm_engine_last_error(engine));
+    try std.testing.expect(std.mem.indexOf(u8, err, "invalid message type") != null);
+}
+
+test "tm_github_merge_pr rejects invalid strategy" {
+    const alloc = std.testing.allocator;
+    const engine = try Engine.create(alloc, "/tmp/c3-test-merge");
+    defer engine.destroy();
+    const result = tm_github_merge_pr(engine, 1, 999);
+    try std.testing.expect(result == 12);
+    const err = std.mem.span(tm_engine_last_error(engine));
+    try std.testing.expect(std.mem.indexOf(u8, err, "invalid merge strategy") != null);
 }
 
 test "engine create and destroy via C API" {
